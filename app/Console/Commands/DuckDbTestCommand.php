@@ -48,7 +48,23 @@ class DuckDbTestCommand extends Command
 
         try {
             $db->query("CREATE TABLE IF NOT EXISTS {$alias}.duckdb_smoke_test (id INTEGER, checked_at TIMESTAMP)");
-            $db->query("INSERT INTO {$alias}.duckdb_smoke_test VALUES (1, now())");
+
+            // DuckLake inlines small inserts (default threshold: 10 rows)
+            // straight into the catalog database rather than writing a
+            // Parquet file — by design, so tiny transactional writes don't
+            // each force a round trip to GCS. A single-row INSERT is exactly
+            // this case: it lands in the catalog, but no Parquet file
+            // appears in the bucket until enough data accumulates or
+            // ducklake_flush_inlined_data() is called.
+            //
+            // 20 rows in ONE insert deliberately clears that threshold, so
+            // this write bypasses inlining and goes straight to a real
+            // Parquet file — this is what actually confirms end-to-end GCS
+            // writes are working, not just the catalog.
+            $db->query(<<<SQL
+                INSERT INTO {$alias}.duckdb_smoke_test (id, checked_at)
+                SELECT i, now() FROM range(1, 21) AS t(i)
+                SQL);
 
             $rows = iterator_to_array($db->query(
                 "SELECT count(*) AS n FROM {$alias}.duckdb_smoke_test"
@@ -62,6 +78,10 @@ class DuckDbTestCommand extends Command
         }
 
         $this->info("✔ Round trip succeeded — duckdb_smoke_test now has {$count} row(s).");
+        $this->line('');
+        $this->info('This insert (20 rows in one statement) should bypass DuckLake\'s inline-data');
+        $this->info('threshold and write a real Parquet file. Check your DATA_PATH now —');
+        $this->info('locally: storage/ducklake/data/ — or in GCS: gs://<bucket>/<prefix>/.');
         $this->line('');
         $this->info('DuckDB + DuckLake + GCS stack is working end to end.');
 
