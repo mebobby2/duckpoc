@@ -117,6 +117,85 @@ independently readable back via `read_parquet()`.
    file in them — both were completely empty. `duckdb:test` now verifies the
    real thing (see above) instead of relying on catalog row count alone.
 
+8. **DuckLake does not support `PRIMARY KEY`/`UNIQUE` constraints at all** —
+   `CREATE TABLE ... account_id VARCHAR PRIMARY KEY` fails with "Not
+   implemented Error: PRIMARY KEY/UNIQUE constraints are not supported in
+   DuckLake". Consistent with other lakehouse table formats (Iceberg/Delta):
+   uniqueness is not server-enforced. Seed/query code is responsible for not
+   producing duplicate ids — see `CashFlowSchema.php`.
+
+9. **Partitioning is set via `ALTER TABLE ... SET PARTITIONED BY (...)`
+   after `CREATE TABLE`, not as a table-creation clause** — and it only
+   applies to data written *after* that statement runs; existing rows are
+   not retroactively repartitioned. `CashFlowSchema::recreate()` always
+   creates the table and sets partitioning before any seed command has a
+   chance to insert rows.
+
+10. **Default Parquet row group size is 122,880 rows** — confirmed
+    empirically (see below), not assumed. Matters because row-group-level
+    min/max statistics (not partitioning) are what makes farm_id sort-order
+    pruning work — see partitioning strategy below.
+
+## Partitioning strategy: `(farm_type, region, year)`, not `farm_id`
+
+Originally partitioned by `(farm_id, year)` — correct for DuckDB's
+single-farm report queries, but gives BigQuery's cross-farm cohort queries
+(which filter by `farm_type`/`region`, never an individual `farm_id`) zero
+pruning benefit, and creates an operational tax of thousands of small
+partition directories at real scale.
+
+**Revised to `(farm_type, region, year(date))`.** `farm_type`/`region` are
+denormalized directly onto every `transaction_lines` row (DuckLake can only
+partition a table by its own columns, not a joined dimension table's) — the
+`farms` table is what application code resolves `farm_id -> (farm_type,
+region)` from, before building a query with explicit predicates on all
+three so partition pruning engages.
+
+This is a deliberate trade, not a free win:
+- **BigQuery** gets real, direct partition pruning on exactly what its
+  cohort queries filter by.
+- **DuckDB** loses farm-level partition pruning — a single-farm query now
+  scans its whole cohort partition (~20-30 farms), not just its own
+  directory. Judged an acceptable trade given real per-farm data (Figured's
+  largest farms run ~180K-800K total journal rows) — even a full cohort
+  partition is only single-digit millions of rows, trivial for DuckDB to
+  scan-then-filter.
+- To recover some of that lost precision, seed/insert code is expected to
+  **sort rows by `farm_id` within each insert** — DuckLake has no separate
+  "cluster by"/sort-key concept distinct from `PARTITIONED BY`, so this has
+  to be enforced by insert order, not declared.
+
+**Verified empirically, not assumed:**
+- Partition paths: inserted 4,000 rows across 2 farm_types × 2 regions (5
+  farms each) and confirmed via `ducklake_list_files()` that GCS produced
+  exactly 4 files — one per cohort
+  (`farm_type=dairy/region=waikato/year=2024/...parquet`, etc.) — proving
+  BigQuery-style cohort filtering would touch only the relevant file(s).
+- Sort-order-based row-group pruning: a first attempt at 4,000 rows (1,000
+  rows/cohort) produced only a *single* Parquet row group per file — far
+  below the 122,880-row default threshold — so no row-group pruning could
+  even be observed at that volume. Re-tested with 150,000 rows for one
+  cohort (3 farms × 50,000 rows, inserted `ORDER BY farm_id`): this produced
+  **2 row groups**, with `farm_id` min/max of `(farm-1, farm-3)` for the
+  first (122,880 rows) and `(farm-3, farm-3)` for the second (27,120 rows) —
+  i.e. a query for `farm-1` or `farm-2` alone could skip the second row
+  group entirely. `farm-3` straddled both groups (its rows spanned the
+  122,880-row boundary), so a query for it specifically would still touch
+  both — real, working pruning, but not as clean as true partition-level
+  isolation.
+
+**Known, unsolved gap** (flagged honestly, not glossed over): this
+sort-order benefit only holds as long as data is written in `farm_id`
+order. Real incremental writes (new transactions arriving farm-by-farm, not
+in bulk sorted batches) will not naturally stay `farm_id`-sorted over time —
+a real system would need periodic compaction with an explicit re-sort to
+maintain this. Not solved here; a known gap for Phase 5+.
+
+**Not yet tested**: this was verified with synthetic data at a scale large
+enough to force multiple row groups, but not yet at the real Phase 1 target
+(one ~800K-row "hero" farm alongside several smaller farms across multiple
+cohorts) — that's the actual stress test this design still needs.
+
 ## Catalog backend choice
 
 Defaults to **SQLite** (`DUCKLAKE_CATALOG_DRIVER=sqlite`), per DuckLake's own
