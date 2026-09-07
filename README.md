@@ -38,11 +38,7 @@ docker compose run --rm app php artisan duckdb:test
 With `GCS_BUCKET` left empty in `.env`, this runs entirely locally (SQLite
 catalog under `storage/ducklake/`, Parquet data under
 `storage/ducklake/data/`) — **zero cloud setup required** to confirm the
-mechanics work. This has been verified to pass end-to-end, including a
-second run reusing the same catalog (row count correctly persists and
-increments across separate container invocations — i.e. DuckLake's
-transactional write path is genuinely durable across process restarts, not
-just within one).
+mechanics work.
 
 To point it at real GCS, set in `.env`:
 
@@ -52,6 +48,27 @@ GCS_DATA_PATH_PREFIX=duckpoc/
 GCS_KEY_ID=...
 GCS_SECRET=...
 ```
+
+**Important gotcha if you switch between local and GCS**: DuckLake ties a
+catalog file to the data path it was first attached with, and refuses to
+reattach it against a different path ("DATA_PATH parameter ... does not
+match existing data path in the catalog"). If you've already run
+`duckdb:test` locally and now want to point at GCS (or vice versa), delete
+the stale catalog first: `rm -rf storage/ducklake/catalog.sqlite`.
+
+The command does more than check a row count — DuckLake inlines small
+inserts (default threshold: 10 rows) directly into the catalog database
+rather than writing a Parquet file, so a naive `SELECT count(*)` can report
+success without a single real file ever having been written to the
+`DATA_PATH`. `duckdb:test` inserts 20 rows in one statement (clearing that
+threshold), then calls `ducklake_list_files()` to find the real Parquet
+file(s) DuckLake registered, and reads each one back directly with
+`read_parquet('gs://...')` or the local path — bypassing the catalog
+entirely — to prove actual file I/O against local disk or GCS happened, not
+just a catalog-level row count. This has been verified end-to-end against a
+real GCS bucket: two separate runs each produced their own real Parquet
+file, correctly persisted across process invocations, with both files
+independently readable back via `read_parquet()`.
 
 ## Real gotchas hit while building this (all fixed, documented here so they don't get rediscovered)
 
@@ -85,9 +102,20 @@ GCS_SECRET=...
 
 6. **GCS auth is HMAC keys via the S3-compatibility layer, not a
    service-account JSON.** Generate them under Cloud Storage → Settings →
-   Interoperability in the GCP console. Some org policies disable HMAC key
-   creation by default — if `GCS_KEY_ID`/`GCS_SECRET` auth fails outright,
-   that's the first thing to check.
+   Interoperability in the GCP console (or `gcloud storage hmac create`).
+   Some org policies disable HMAC key creation by default — if
+   `GCS_KEY_ID`/`GCS_SECRET` auth fails outright, that's the first thing to
+   check.
+
+7. **A `SELECT count(*)` against the DuckLake table is not proof a Parquet
+   file was written.** DuckLake inlines small inserts (≤10 rows by default)
+   straight into the catalog database — the row count is genuinely correct,
+   but it can be satisfied with zero files ever touching the `DATA_PATH`.
+   Confirmed by hand: after running the original 1-row version of this test
+   twice, the catalog correctly reported 2 rows, but neither
+   `storage/ducklake/data/` (local) nor the GCS bucket had a single Parquet
+   file in them — both were completely empty. `duckdb:test` now verifies the
+   real thing (see above) instead of relying on catalog row count alone.
 
 ## Catalog backend choice
 
@@ -106,21 +134,44 @@ if either errors.
 
 ## What's verified vs. not
 
-**Verified by actually running it, in this environment:**
+**Verified by actually running it, against a real GCS bucket:**
 - FFI extension loads, native DuckDB library installs and runs a query (`SELECT version()`)
 - `ducklake` and `httpfs` extensions install and load
-- SQLite-catalog DuckLake attach, `CREATE TABLE` / `INSERT` / `SELECT count(*)` round trip
-- Catalog persistence and correct row accumulation across two separate `docker compose run` invocations (proves durable, transactional small-write behavior, not just in-memory)
+- DuckLake catalog attach with a real `gs://` `DATA_PATH`, real HMAC-authenticated writes
+- DuckLake's inline-vs-Parquet-file behavior (default 10-row threshold), confirmed empirically — not just from docs — including the failure mode where a naive row-count check would have reported false success
+- Real Parquet files landing in GCS at the expected `<DATA_PATH>/<schema>/<table>/` layout, confirmed two independent ways: `ducklake_list_files()` metadata, and reading each file back directly with `read_parquet('gs://...')`, bypassing the catalog entirely
+- Catalog + data persistence across separate `docker compose run` invocations — a second run produced its own separate, independently-readable Parquet file, proving durable transactional write behavior across process restarts, not just in-memory
 - MySQL connectivity and `php artisan migrate`
 
-**Not yet verified (needs real credentials/infra to test):**
-- GCS auth and a real `gs://` `DATA_PATH` (no bucket/HMAC keys available in this environment)
-- Postgres or MySQL as the DuckLake catalog backend
-- Anything at actual data volume — this only proves the plumbing works, not that it performs
+**Not yet verified (needs real infra to test):**
+- Postgres or MySQL as the DuckLake catalog backend (SQLite remains the default per DuckLake's own PoC guidance)
+- Anything at actual data volume — this only proves the plumbing works correctly, not that it performs at scale (though real per-farm row counts gathered separately — Figured's largest farms run ~180K–800K total journal rows — suggest single-farm query volume is not a meaningful performance risk for DuckDB regardless)
 
 ## Next steps
 
-1. Wire up real GCS credentials and confirm the same smoke test passes against `gs://`.
-2. Build the synthetic data generator (farm/accounts schema, `farm_id=X/year=Y` Hive partitioning) discussed in the architecture conversation this PoC came out of.
-3. Port the Cash Flow report's aggregation + running-balance logic to DuckDB SQL.
-4. Only then: Overdraft interest, built on top of the Cash Flow output.
+Phased per the architecture conversation this PoC came out of — Phase 0
+(this scaffold) is done; the rest is not yet started:
+
+1. **Phase 1 — Cash Flow.** Build the synthetic data generator (farm/accounts
+   schema, `farm_id=X/year=Y` Hive partitioning), then port Cash Flow's
+   aggregation + running-balance logic to DuckDB SQL. No VJ derivation of its
+   own, so this proves the basic plumbing and query pattern — not yet the
+   hard part.
+2. **Phase 2 — Livestock valuation.** Research the actual virtual-journal
+   handler (methodology, data dependencies, existing tests) first, then port
+   it to DuckDB SQL against real synthetic tracker data. This is the
+   genuinely hard, multi-dimensional case (account × type × basis ×
+   tracking/mob × horizon, self-referential) — the step that actually tests
+   whether this architecture avoids repeating a past internal ClickHouse
+   evaluation's failure mode (swapping engines without solving the
+   underlying multi-dimensional derivation problem). Sequenced after Cash
+   Flow, not before — Cash Flow proves the plumbing works before spending
+   effort on the hard case.
+3. **Phase 3 — Overdraft interest**, built on top of the now-real Cash Flow
+   output instead of stubbed test values.
+4. **Phase 4 — Scale/latency test**, only once 1–3 are correct at small
+   scale, on the hardest real report shape (not Cash Flow, which real
+   per-farm row counts already suggest isn't a meaningful performance risk).
+5. **Phase 5 — The additive derived-facts Parquet layer for BigQuery** /
+   practice-wide benchmarking, built on report logic now proven correct on
+   the hard case, not just the easy one.

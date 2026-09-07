@@ -43,11 +43,12 @@ class DuckDbTestCommand extends Command
         $this->line("  DuckDB version: {$version}");
 
         $alias = config('duckdb.attached_alias');
+        $table = 'duckdb_smoke_test';
 
         $this->info('Running a write + read round trip through the attached DuckLake catalog...');
 
         try {
-            $db->query("CREATE TABLE IF NOT EXISTS {$alias}.duckdb_smoke_test (id INTEGER, checked_at TIMESTAMP)");
+            $db->query("CREATE TABLE IF NOT EXISTS {$alias}.{$table} (id INTEGER, checked_at TIMESTAMP)");
 
             // DuckLake inlines small inserts (default threshold: 10 rows)
             // straight into the catalog database rather than writing a
@@ -59,31 +60,91 @@ class DuckDbTestCommand extends Command
             //
             // 20 rows in ONE insert deliberately clears that threshold, so
             // this write bypasses inlining and goes straight to a real
-            // Parquet file — this is what actually confirms end-to-end GCS
-            // writes are working, not just the catalog.
+            // Parquet file.
             $db->query(<<<SQL
-                INSERT INTO {$alias}.duckdb_smoke_test (id, checked_at)
+                INSERT INTO {$alias}.{$table} (id, checked_at)
                 SELECT i, now() FROM range(1, 21) AS t(i)
                 SQL);
 
-            $rows = iterator_to_array($db->query(
-                "SELECT count(*) AS n FROM {$alias}.duckdb_smoke_test"
+            $catalogRows = iterator_to_array($db->query(
+                "SELECT count(*) AS n FROM {$alias}.{$table}"
             )->rows(true));
 
-            $count = $rows[0]['n'] ?? null;
+            $catalogCount = $catalogRows[0]['n'] ?? null;
         } catch (Throwable $e) {
             $this->error('Failed during write/read round trip: '.$e->getMessage());
 
             return self::FAILURE;
         }
 
-        $this->info("✔ Round trip succeeded — duckdb_smoke_test now has {$count} row(s).");
+        $this->info("✔ Catalog reports {$catalogCount} row(s) in {$table}.");
+        $this->line('  (This alone does NOT prove a real Parquet file was written — DuckLake');
+        $this->line('   inlining could satisfy this count from the catalog database alone.)');
         $this->line('');
-        $this->info('This insert (20 rows in one statement) should bypass DuckLake\'s inline-data');
-        $this->info('threshold and write a real Parquet file. Check your DATA_PATH now —');
-        $this->info('locally: storage/ducklake/data/ — or in GCS: gs://<bucket>/<prefix>/.');
+
+        // The actual proof: ask DuckLake which physical data files it has
+        // registered for this table, then read each one back directly with
+        // read_parquet() — bypassing the catalog entirely — to confirm real
+        // file I/O against the configured DATA_PATH (local disk or GCS)
+        // actually happened, not just a catalog-level row count.
+        $this->info('Verifying real Parquet file(s) exist at the configured DATA_PATH...');
+
+        try {
+            $files = iterator_to_array($db->query(
+                "SELECT data_file FROM ducklake_list_files('{$alias}', '{$table}')"
+            )->rows(true));
+        } catch (Throwable $e) {
+            $this->error('Failed to query ducklake_list_files(): '.$e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        if (empty($files)) {
+            $this->error('✘ No Parquet files are registered for this table.');
+            $this->line('  All rows are still inlined in the catalog database — nothing has been');
+            $this->line('  written to the DATA_PATH yet. This does NOT confirm GCS/local file writes');
+            $this->line('  are working. Either insert more rows in one statement (>10, the default');
+            $this->line('  inline threshold) or call ducklake_flush_inlined_data(\''.$alias.'\').');
+
+            return self::FAILURE;
+        }
+
+        $this->info('✔ Found '.count($files)." real Parquet file(s) registered for {$table}:");
+        foreach ($files as $file) {
+            $this->line("    {$file['data_file']}");
+        }
+
+        $parquetRowCount = 0;
+
+        try {
+            foreach ($files as $file) {
+                $escapedPath = str_replace("'", "''", $file['data_file']);
+
+                $result = iterator_to_array($db->query(
+                    "SELECT count(*) AS n FROM read_parquet('{$escapedPath}')"
+                )->rows(true));
+
+                $parquetRowCount += (int) ($result[0]['n'] ?? 0);
+            }
+        } catch (Throwable $e) {
+            $this->error('Failed reading a Parquet file back directly: '.$e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        $inlinedCount = (int) $catalogCount - $parquetRowCount;
+
         $this->line('');
-        $this->info('DuckDB + DuckLake + GCS stack is working end to end.');
+        $this->info("✔ Read {$parquetRowCount} row(s) directly back from those Parquet file(s),");
+        $this->info('  bypassing the DuckLake catalog entirely — this is the real proof.');
+
+        if ($inlinedCount > 0) {
+            $this->line("  ({$inlinedCount} additional row(s) still sitting inlined in the catalog —");
+            $this->line('   expected if earlier runs inserted fewer than the inline threshold.)');
+        }
+
+        $this->line('');
+        $this->info('DuckDB + DuckLake + '.(empty(config('duckdb.gcs.bucket')) ? 'local storage' : 'GCS').' stack is verified end to end.');
 
         return self::SUCCESS;
     }
