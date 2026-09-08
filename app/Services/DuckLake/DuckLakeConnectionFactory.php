@@ -117,6 +117,27 @@ final class DuckLakeConnectionFactory
         $db->query('LOAD ducklake');
         $db->query('INSTALL httpfs');
         $db->query('LOAD httpfs');
+
+        $this->tuneRemoteReads($db);
+    }
+
+    /**
+     * Off by default, and worth ~20% on a cold read against a remote bucket:
+     * measured 2,504 ms -> 1,941 ms on the oracle report.
+     *
+     * Cost here is round trips, not bytes — a 1 KB object and a 100 KB object
+     * fetch in the same time, so the win comes from asking for larger ranges
+     * in fewer requests rather than several small ones.
+     *
+     * Deliberately just this one setting. `httpfs_connection_caching`,
+     * `parquet_metadata_cache` and `enable_http_metadata_cache` were each
+     * measured individually and showed no improvement on a single cold read —
+     * they only help on repeated reads within one process, so they belong with
+     * a persistent-instance setup rather than being switched on speculatively.
+     */
+    private function tuneRemoteReads(DuckDB $db): void
+    {
+        $db->query('SET prefetch_all_parquet_files = true');
     }
 
     private function createGcsSecret(DuckDB $db): void
