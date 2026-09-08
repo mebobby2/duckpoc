@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\CashFlow;
 
+use Illuminate\Support\Facades\DB;
 use Saturio\DuckDB\DuckDB;
 
 /**
@@ -82,6 +83,7 @@ final class CashFlowScaleSeeder
     public function __construct(
         private readonly DuckDB $db,
         private readonly string $alias,
+        private readonly string $appAlias,
     ) {
     }
 
@@ -116,49 +118,49 @@ final class CashFlowScaleSeeder
         return array_sum(array_column(self::FARMS, 2));
     }
 
+    /**
+     * Fact rows come out of the lake; dimension rows out of MySQL. Scoped to
+     * this seeder's own `scale-` ids so the Cash Flow oracle farm — which
+     * shares a cohort with the hero farm — survives untouched.
+     */
     private function clearExisting(): void
     {
-        // Scoped to this seeder's own ids so the Cash Flow oracle farm — which
-        // shares a cohort with the hero farm — survives untouched.
         $this->db->query("DELETE FROM {$this->alias}.transaction_lines WHERE farm_id LIKE 'scale-%'");
-        $this->db->query("DELETE FROM {$this->alias}.farms WHERE farm_id LIKE 'scale-%'");
-        $this->db->query("DELETE FROM {$this->alias}.accounts WHERE account_id LIKE 'scale-%'");
+
+        DB::table('farms')->where('farm_id', 'like', 'scale-%')->delete();
+        DB::table('accounts')->where('account_id', 'like', 'scale-%')->delete();
     }
 
     private function seedAccounts(): void
     {
-        $values = [];
+        $rows = [];
         foreach (self::ACCOUNTS as [$suffix, $class, $category]) {
-            $values[] = sprintf(
-                "('scale-%s', '%s', '%s', '%s', false, false)",
-                $suffix,
-                ucwords(str_replace('-', ' ', $suffix)),
-                $class,
-                $category,
-            );
+            $rows[] = [
+                'account_id' => 'scale-'.$suffix,
+                'account_name' => ucwords(str_replace('-', ' ', $suffix)),
+                'account_class' => $class,
+                'account_category' => $category,
+                'is_gst_account' => false,
+                'is_default_bank_account' => false,
+            ];
         }
 
-        $this->db->query(sprintf(
-            'INSERT INTO %s.accounts'
-            .' (account_id, account_name, account_class, account_category, is_gst_account, is_default_bank_account)'
-            .' VALUES %s',
-            $this->alias,
-            implode(', ', $values),
-        ));
+        DB::table('accounts')->insert($rows);
     }
 
     private function seedFarms(): void
     {
-        $values = [];
+        $rows = [];
         foreach (self::FARMS as $farmId => [$farmType, $region]) {
-            $values[] = sprintf("('%s', '%s', '%s', 0)", $farmId, $farmType, $region);
+            $rows[] = [
+                'farm_id' => $farmId,
+                'farm_type' => $farmType,
+                'region' => $region,
+                'opening_balance' => 0,
+            ];
         }
 
-        $this->db->query(sprintf(
-            'INSERT INTO %s.farms (farm_id, farm_type, region, opening_balance) VALUES %s',
-            $this->alias,
-            implode(', ', $values),
-        ));
+        DB::table('farms')->insert($rows);
     }
 
     /**
@@ -204,12 +206,15 @@ final class CashFlowScaleSeeder
                     CAST(i % {$accountCount} AS INTEGER) AS acc_idx
                 FROM range(0, {$rowTarget}) AS t(i)
             ) g
+            -- Accounts come from MySQL, so even the seed write is a federated
+            -- join: synthetic fact rows generated in DuckDB against live
+            -- relational dimension rows.
             JOIN (
                 SELECT
                     account_id,
                     account_class,
                     CAST(row_number() OVER (ORDER BY account_id) - 1 AS INTEGER) AS idx
-                FROM {$this->alias}.accounts
+                FROM {$this->appAlias}.accounts
                 WHERE account_id LIKE 'scale-%'
             ) a ON a.idx = g.acc_idx
             -- farm_id is the physical sort key inside each cohort partition;

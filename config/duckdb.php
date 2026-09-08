@@ -91,4 +91,32 @@ return [
     */
     'attached_alias' => env('DUCKLAKE_ALIAS', 'lake'),
 
+    /*
+    |--------------------------------------------------------------------------
+    | The application database, attached alongside the lake
+    |--------------------------------------------------------------------------
+    |
+    | Dimension tables (accounts, farms) live in MySQL, mirroring Figured's
+    | own placement — only the financial line data belongs in the lake. DuckDB
+    | attaches MySQL through its `mysql` extension, so one query can join live
+    | relational rows against Parquet. That federated join is the mechanism the
+    | whole hybrid design rests on, so the PoC should exercise it rather than
+    | sidestep it by putting everything in the lake.
+    |
+    | Attached READ_ONLY: reads come through DuckDB, writes go through Eloquent.
+    |
+    | Credentials are reused from Laravel's own mysql connection so there is
+    | one place to change them.
+    |
+    */
+    'app_database' => [
+        'alias' => env('DUCKDB_APP_DB_ALIAS', 'appdb'),
+        'enabled' => env('DUCKDB_APP_DB_ENABLED', true),
+        'host' => env('DB_HOST', 'mysql'),
+        'port' => env('DB_PORT', 3306),
+        'database' => env('DB_DATABASE', 'duckpoc'),
+        'username' => env('DB_USERNAME', 'duckpoc'),
+        'password' => env('DB_PASSWORD', 'password'),
+    ],
+
 ];

@@ -7,9 +7,12 @@ namespace App\Services\CashFlow;
 use Saturio\DuckDB\DuckDB;
 
 /**
- * Creates the DuckLake tables Cash Flow needs: transaction lines (the bulk of
- * report data), an accounts dimension (drives section assignment), and a
- * farms dimension (cohort attributes + per-farm opening balance config).
+ * Creates the one DuckLake table Cash Flow needs: `transaction_lines`, the
+ * financial line data.
+ *
+ * The `accounts` and `farms` dimensions live in MySQL instead — see
+ * `database/migrations/..._create_cashflow_dimension_tables.php` for why. Only
+ * fact data belongs in the lake, mirroring how Figured places its own data.
  *
  * Partitioning strategy: `(farm_type, region, year(date))` — NOT `farm_id`.
  * This is a deliberate choice to serve both consumers of this same physical
@@ -70,57 +73,14 @@ final class CashFlowSchema
     public function recreate(): void
     {
         $this->db->query("DROP TABLE IF EXISTS {$this->alias}.transaction_lines");
+
+        // Dimension tables moved to MySQL (see the migration). Dropped here so
+        // a lake left over from before the move doesn't keep serving stale
+        // copies that shadow the real ones.
         $this->db->query("DROP TABLE IF EXISTS {$this->alias}.accounts");
         $this->db->query("DROP TABLE IF EXISTS {$this->alias}.farms");
 
-        $this->createAccounts();
-        $this->createFarms();
         $this->createTransactionLines();
-    }
-
-    private function createAccounts(): void
-    {
-        // No PRIMARY KEY — DuckLake does not support PRIMARY KEY/UNIQUE
-        // constraints at all (confirmed by actually running this: "Not
-        // implemented Error: PRIMARY KEY/UNIQUE constraints are not
-        // supported in DuckLake"). Consistent with other lakehouse table
-        // formats (Iceberg/Delta) — uniqueness isn't server-enforced;
-        // seed/query code is responsible for not producing duplicate ids.
-        // account_class mirrors Figured's Xero account class. It exists
-        // separately from account_category because it drives a different
-        // decision: `XeroAccount::isAccountInversedForUser()` returns true for
-        // REVENUE and only REVENUE, and that is what makes the report flip
-        // revenue's stored credit (negative) into the positive figure a reader
-        // expects. account_category drives which report SECTION a line lands
-        // in; account_class drives the display sign.
-        $this->db->query(<<<SQL
-            CREATE TABLE {$this->alias}.accounts (
-                account_id VARCHAR NOT NULL,
-                account_name VARCHAR NOT NULL,
-                account_class VARCHAR NOT NULL,
-                account_category VARCHAR NOT NULL,
-                is_gst_account BOOLEAN NOT NULL DEFAULT false,
-                is_default_bank_account BOOLEAN NOT NULL DEFAULT false
-            )
-            SQL);
-    }
-
-    private function createFarms(): void
-    {
-        // farm_type/region here are the source of truth the application
-        // layer resolves farm_id -> cohort from, before building a
-        // DuckDB query with explicit farm_type/region/farm_id predicates
-        // that let partition pruning engage. Also denormalized onto every
-        // transaction_lines row (see createTransactionLines) since that's
-        // what's actually partitioned on.
-        $this->db->query(<<<SQL
-            CREATE TABLE {$this->alias}.farms (
-                farm_id VARCHAR NOT NULL,
-                farm_type VARCHAR NOT NULL,
-                region VARCHAR NOT NULL,
-                opening_balance BIGINT NOT NULL
-            )
-            SQL);
     }
 
     private function createTransactionLines(): void

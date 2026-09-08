@@ -34,8 +34,44 @@ final class DuckLakeConnectionFactory
         $this->loadExtensions($db);
         $this->createGcsSecret($db);
         $this->attachCatalog($db);
+        $this->attachAppDatabase($db);
 
         return $db;
+    }
+
+    /**
+     * Attaches the application MySQL database alongside the lake, so one query
+     * can join live dimension rows (accounts, farms) against Parquet fact data.
+     *
+     * READ_ONLY on purpose: reads come through DuckDB, writes go through
+     * Eloquent. Without it a stray DuckDB write could bypass every model
+     * event, validation and constraint the app relies on.
+     */
+    private function attachAppDatabase(DuckDB $db): void
+    {
+        $app = $this->config['app_database'] ?? null;
+
+        if ($app === null || !$app['enabled']) {
+            return;
+        }
+
+        $db->query('INSTALL mysql');
+        $db->query('LOAD mysql');
+
+        $dsn = sprintf(
+            'host=%s port=%s user=%s password=%s database=%s',
+            $app['host'],
+            $app['port'],
+            $app['username'],
+            $app['password'],
+            $app['database'],
+        );
+
+        $db->query(sprintf(
+            "ATTACH IF NOT EXISTS '%s' AS %s (TYPE mysql, READ_ONLY)",
+            $this->escape($dsn),
+            $app['alias'],
+        ));
     }
 
     /**

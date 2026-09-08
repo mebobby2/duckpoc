@@ -30,7 +30,7 @@ class DuckDbCashFlowFlushCommand extends Command
     protected $description = 'Flush DuckLake inlined data to Parquet and report the resulting files';
 
     /** Tables this PoC writes; flushed individually so the output is legible. */
-    private const array TABLES = ['transaction_lines', 'accounts', 'farms'];
+    private const array TABLES = ['transaction_lines'];
 
     public function handle(DuckDB $db): int
     {

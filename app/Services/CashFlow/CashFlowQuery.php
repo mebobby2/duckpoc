@@ -140,7 +140,11 @@ final class CashFlowQuery
 
     private function builder(): ReportSqlBuilder
     {
-        return new ReportSqlBuilder($this->definition, $this->alias);
+        return new ReportSqlBuilder(
+            $this->definition,
+            $this->alias,
+            config('duckdb.app_database.alias'),
+        );
     }
 
     /**

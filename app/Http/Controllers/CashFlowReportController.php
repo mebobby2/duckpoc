@@ -7,6 +7,7 @@ namespace App\Http\Controllers;
 use App\Services\CashFlow\CashFlowOracleSeeder;
 use App\Services\CashFlow\CashFlowQuery;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\View\View;
 use Saturio\DuckDB\DuckDB;
 use Throwable;
@@ -29,7 +30,7 @@ class CashFlowReportController extends Controller
     {
         $alias = config('duckdb.attached_alias');
 
-        $farms = $this->availableFarms($db, $alias);
+        $farms = $this->availableFarms();
 
         $farmId = (string) $request->query('farm_id', CashFlowOracleSeeder::FARM_ID);
         $periodFrom = (string) $request->query('period_from', '2024-01-01');
@@ -144,7 +145,9 @@ class CashFlowReportController extends Controller
 
         $files = [];
 
-        foreach (['transaction_lines', 'accounts', 'farms'] as $table) {
+        // transaction_lines only — accounts and farms are MySQL tables now, so
+        // they have no Parquet footprint at all.
+        foreach (['transaction_lines'] as $table) {
             try {
                 $listed = $db->query(
                     "SELECT data_file, data_file_size_bytes, delete_file
@@ -190,17 +193,23 @@ class CashFlowReportController extends Controller
     }
 
     /**
+     * Straight out of MySQL via Eloquent — no reason to route a dimension
+     * lookup through DuckDB. This was previously a lake read costing ~1s from
+     * a remote bucket; as a MySQL query it is sub-millisecond.
+     *
      * @return list<array<string, mixed>>
      */
-    private function availableFarms(DuckDB $db, string $alias): array
+    private function availableFarms(): array
     {
         try {
-            return iterator_to_array(
-                $db->query("SELECT farm_id, farm_type, region, opening_balance FROM {$alias}.farms ORDER BY farm_id")
-                    ->rows(true)
-            );
+            return DB::table('farms')
+                ->select('farm_id', 'farm_type', 'region', 'opening_balance')
+                ->orderBy('farm_id')
+                ->get()
+                ->map(static fn (object $row): array => (array) $row)
+                ->all();
         } catch (Throwable) {
-            // Schema not created yet — the view surfaces this as guidance.
+            // Migrations not run yet — the view surfaces this as guidance.
             return [];
         }
     }

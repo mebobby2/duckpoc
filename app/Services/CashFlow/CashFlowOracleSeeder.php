@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\CashFlow;
 
+use Illuminate\Support\Facades\DB;
 use Saturio\DuckDB\DuckDB;
 
 /**
@@ -36,6 +37,9 @@ final class CashFlowOracleSeeder
      */
     private const array LEGACY_FARM_IDS = ['oracle-farm'];
 
+    /** Dimension rows this seeder owns, so it clears only its own. */
+    private const array ACCOUNT_IDS = ['acc-sales', 'acc-wages'];
+
     /** Fixed-point multiplier — matches Figured's TEN_THOUSAND convention. */
     private const int FIXED_POINT = 10000;
 
@@ -53,39 +57,59 @@ final class CashFlowOracleSeeder
         $this->seedTransactionLines();
     }
 
+    /**
+     * Fact rows come out of the lake; dimension rows out of MySQL. Two stores,
+     * because that is where each kind of data actually lives.
+     */
     private function clearExisting(): void
     {
-        $farmIds = implode(
+        $farmIds = [self::FARM_ID, ...self::LEGACY_FARM_IDS];
+
+        $quoted = implode(
             ', ',
             array_map(
                 static fn (string $id): string => "'".str_replace("'", "''", $id)."'",
-                [self::FARM_ID, ...self::LEGACY_FARM_IDS],
+                $farmIds,
             ),
         );
 
-        $this->db->query("DELETE FROM {$this->alias}.transaction_lines WHERE farm_id IN ({$farmIds})");
-        $this->db->query("DELETE FROM {$this->alias}.farms WHERE farm_id IN ({$farmIds})");
-        $this->db->query("DELETE FROM {$this->alias}.accounts WHERE account_id IN ('acc-sales', 'acc-wages')");
+        $this->db->query("DELETE FROM {$this->alias}.transaction_lines WHERE farm_id IN ({$quoted})");
+
+        DB::table('farms')->whereIn('farm_id', $farmIds)->delete();
+        DB::table('accounts')->whereIn('account_id', self::ACCOUNT_IDS)->delete();
     }
 
     private function seedFarm(): void
     {
         // opening_balance 0 — the oracle's first interval opens at zero.
-        $this->db->query(<<<SQL
-            INSERT INTO {$this->alias}.farms (farm_id, farm_type, region, opening_balance)
-            VALUES ('{$this->farmId()}', '{$this->farmType()}', '{$this->region()}', 0)
-            SQL);
+        DB::table('farms')->insert([
+            'farm_id' => self::FARM_ID,
+            'farm_type' => self::FARM_TYPE,
+            'region' => self::REGION,
+            'opening_balance' => 0,
+        ]);
     }
 
     private function seedAccounts(): void
     {
-        $this->db->query(<<<SQL
-            INSERT INTO {$this->alias}.accounts
-                (account_id, account_name, account_class, account_category, is_gst_account, is_default_bank_account)
-            VALUES
-                ('acc-sales', 'DuckPoc Sales', 'REVENUE', 'other_income',       false, false),
-                ('acc-wages', 'DuckPoc Wages', 'EXPENSE', 'operating_expenses', false, false)
-            SQL);
+        DB::table('accounts')->insert([
+            [
+                'account_id' => 'acc-sales',
+                'account_name' => 'DuckPoc Sales',
+                'account_class' => 'REVENUE',
+                'account_category' => 'other_income',
+                'is_gst_account' => false,
+                'is_default_bank_account' => false,
+            ],
+            [
+                'account_id' => 'acc-wages',
+                'account_name' => 'DuckPoc Wages',
+                'account_class' => 'EXPENSE',
+                'account_category' => 'operating_expenses',
+                'is_gst_account' => false,
+                'is_default_bank_account' => false,
+            ],
+        ]);
     }
 
     private function seedTransactionLines(): void

@@ -32,7 +32,10 @@ final class ReportSqlBuilder
 
     public function __construct(
         private readonly CashFlowReportDefinition $definition,
+        /** The DuckLake catalog — fact data. */
         private readonly string $alias,
+        /** The attached MySQL database — dimension data. */
+        private readonly string $appAlias,
     ) {
     }
 
@@ -104,7 +107,7 @@ final class ReportSqlBuilder
                     a.account_category,
                     tl.amount
                 FROM {$this->alias}.transaction_lines tl
-                JOIN {$this->alias}.accounts a ON a.account_id = tl.account_id
+                JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
                 {$this->inScopePredicate()}
             SQL;
     }
@@ -153,7 +156,7 @@ final class ReportSqlBuilder
                 tl.amount AS amount_raw,
                 tl.amount / {$this->fixedPoint()}.0 AS amount_dollars
             FROM {$this->alias}.transaction_lines tl
-            JOIN {$this->alias}.accounts a ON a.account_id = tl.account_id
+            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
             {$this->inScopePredicate()}
             ORDER BY tl.date, tl.line_id
             LIMIT \$row_limit
@@ -165,7 +168,7 @@ final class ReportSqlBuilder
         return <<<SQL
             SELECT count(*) AS n, sum(tl.amount) / {$this->fixedPoint()}.0 AS net_dollars
             FROM {$this->alias}.transaction_lines tl
-            JOIN {$this->alias}.accounts a ON a.account_id = tl.account_id
+            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
             {$this->inScopePredicate()}
             SQL;
     }
@@ -231,7 +234,7 @@ final class ReportSqlBuilder
                     f.opening_balance / {$fp}.0
                         + SUM(c.{$source}) OVER months_through AS closing
                 FROM {$from} c
-                CROSS JOIN {$this->alias}.farms f
+                CROSS JOIN {$this->appAlias}.farms f
                 WHERE f.farm_id = \$farm_id
                 WINDOW
                     months_before  AS (ORDER BY c.interval_index

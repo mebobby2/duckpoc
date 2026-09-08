@@ -50,7 +50,7 @@ class DuckDbCashFlowSeedScaleCommand extends Command
         $startedAt = microtime(true);
 
         try {
-            (new CashFlowScaleSeeder($db, $alias))->seed(
+            (new CashFlowScaleSeeder($db, $alias, config('duckdb.app_database.alias')))->seed(
                 onFarmSeeded: function (string $farmId, int $rows) use ($startedAt): void {
                     $this->line(sprintf(
                         '    ✔ %-18s %10s rows   (%s elapsed)',

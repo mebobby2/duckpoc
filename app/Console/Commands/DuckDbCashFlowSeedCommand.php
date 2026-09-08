@@ -6,6 +6,7 @@ namespace App\Console\Commands;
 
 use App\Services\CashFlow\CashFlowOracleSeeder;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 use Saturio\DuckDB\DuckDB;
 use Throwable;
 
@@ -32,17 +33,23 @@ class DuckDbCashFlowSeedCommand extends Command
             return self::FAILURE;
         }
 
-        foreach (['farms', 'accounts', 'transaction_lines'] as $table) {
-            $rows = iterator_to_array($db->query("SELECT count(*) AS n FROM {$alias}.{$table}")->rows(true));
-            $this->line(sprintf('    %-18s %d row(s)', $table, $rows[0]['n'] ?? 0));
-        }
+        $appAlias = config('duckdb.app_database.alias');
+
+        $this->line(sprintf('    %-28s %d row(s)', 'farms (mysql)', DB::table('farms')->count()));
+        $this->line(sprintf('    %-28s %d row(s)', 'accounts (mysql)', DB::table('accounts')->count()));
+
+        $lakeRows = iterator_to_array($db->query("SELECT count(*) AS n FROM {$alias}.transaction_lines")->rows(true));
+        $this->line(sprintf('    %-28s %d row(s)', 'transaction_lines (ducklake)', $lakeRows[0]['n'] ?? 0));
 
         $this->line('');
-        $this->info('Seeded transaction lines:');
+        $this->info('Seeded transaction lines (Parquet fact rows joined to MySQL dimensions):');
+
+        // A federated join: fact data from the lake, dimension data from the
+        // attached MySQL database, resolved in one DuckDB statement.
         $lines = $db->query(<<<SQL
             SELECT tl.date, a.account_name, a.account_class, tl.type, tl.amount
             FROM {$alias}.transaction_lines tl
-            JOIN {$alias}.accounts a ON a.account_id = tl.account_id
+            JOIN {$appAlias}.accounts a ON a.account_id = tl.account_id
             ORDER BY tl.date
             SQL);
 
