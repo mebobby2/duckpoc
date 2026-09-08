@@ -62,7 +62,6 @@ final class TrackerCashFlowQuery
         $statement = $this->db->preparedStatement($this->sql());
 
         $this->bindScope($statement, $farmId, $farmType, $region, $periodFrom, $periodTo, $horizon, $basis);
-        $this->bindMonthSpineBound($statement, $periodTo);
 
         return iterator_to_array($statement->execute()->rows(true));
     }
@@ -84,7 +83,6 @@ final class TrackerCashFlowQuery
         $statement = $this->db->preparedStatement($this->builder()->buildTrackerDetailSql());
 
         $this->bindScope($statement, $farmId, $farmType, $region, $periodFrom, $periodTo, $horizon, $basis);
-        $this->bindMonthSpineBound($statement, $periodTo);
 
         return iterator_to_array($statement->execute()->rows(true));
     }
@@ -159,19 +157,6 @@ final class TrackerCashFlowQuery
             $this->definition,
             $this->alias,
             config('duckdb.app_database.alias'),
-        );
-    }
-
-    /**
-     * generate_series' upper bound is inclusive and steps by month, so it
-     * needs the first of the final month rather than the period end date.
-     */
-    private function bindMonthSpineBound(object $statement, string $periodTo): void
-    {
-        $statement->bindParam(
-            'last_month_start',
-            date('Y-m-01', strtotime($periodTo)),
-            Type::DUCKDB_TYPE_VARCHAR,
         );
     }
 

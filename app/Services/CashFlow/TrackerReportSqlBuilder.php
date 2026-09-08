@@ -44,6 +44,7 @@ final class TrackerReportSqlBuilder
         $ctes = [
             'months' => $this->monthSpineCte(),
             'report_lines' => $this->reportLinesCte(),
+            'tracker_agg' => $this->trackerAggCte(),
             'tracker_months' => $this->trackerMonthsCte(),
         ];
 
@@ -64,6 +65,7 @@ final class TrackerReportSqlBuilder
         }
 
         $ctes['tracker_rollup'] = $this->trackerRollupCte($previous);
+        $ctes['farm_agg'] = $this->farmAggCte();
         $ctes['farm_months'] = $this->farmMonthsCte();
         $ctes['sections'] = $this->sectionsCte();
 
@@ -93,6 +95,16 @@ final class TrackerReportSqlBuilder
             ."\n\nSELECT *\nFROM with_balances\nORDER BY interval_index";
     }
 
+    /**
+     * Calendar months covering the period.
+     *
+     * Anchored with `date_trunc` rather than starting at `$period_from`
+     * verbatim, so a bucket here is always a calendar month. That is what lets
+     * the aggregates below bucket rows with `date_trunc(date)` and join this
+     * spine on equality instead of on a range — see `trackerAggCte()`. A spine
+     * anchored on the period's day-of-month would not line up with
+     * `date_trunc` when a period starts mid-month.
+     */
     private function monthSpineCte(): string
     {
         return <<<SQL
@@ -101,8 +113,8 @@ final class TrackerReportSqlBuilder
                     (m.month_start + INTERVAL 1 MONTH - INTERVAL 1 DAY)::DATE AS month_end,
                     row_number() OVER (ORDER BY m.month_start) AS interval_index
                 FROM generate_series(
-                    CAST(\$period_from AS DATE),
-                    CAST(\$last_month_start AS DATE),
+                    date_trunc('month', CAST(\$period_from AS DATE)),
+                    date_trunc('month', CAST(\$period_to AS DATE)),
                     INTERVAL 1 MONTH
                 ) AS m(month_start)
             SQL;
@@ -144,11 +156,20 @@ final class TrackerReportSqlBuilder
 
     /**
      * One row per (month, tracker) — the replacement for Figured's per-tracker
-     * loop. An inner join, not a left join: a tracker with no lines in a month
-     * contributes nothing to the rollup, and `COALESCE` on the consolidated
-     * side covers months with no tracker activity at all.
+     * loop.
+     *
+     * Buckets by `date_trunc('month', date)` and hash-aggregates, rather than
+     * joining each row to a month spine on `date BETWEEN month_start AND
+     * month_end`. That range join is what this originally did, and it does not
+     * scale: `BETWEEN` cannot be hashed, so DuckDB falls back to a piecewise
+     * join and materialises very large intermediates. On the billion-row farm
+     * it sat at 13.65 GB of RAM and never finished; at 200K rows it was
+     * invisible. Bucketing is a scalar function plus a hash aggregate, which
+     * is the operation a columnar engine is actually built for.
+     *
+     * The 24-row spine is then joined on equality to attach `interval_index`.
      */
-    private function trackerMonthsCte(): string
+    private function trackerAggCte(): string
     {
         $expressions = [];
         foreach ($this->definition->trackerSections() as $section) {
@@ -156,14 +177,35 @@ final class TrackerReportSqlBuilder
         }
 
         return "        SELECT\n"
-            ."            m.interval_index,\n"
+            ."            date_trunc('month', l.date)::DATE AS month_start,\n"
             ."            l.tracker_id,\n"
             .implode(",\n", $expressions)."\n"
-            ."        FROM months m\n"
-            ."        JOIN report_lines l\n"
-            ."             ON l.date BETWEEN m.month_start AND m.month_end\n"
-            ."            AND l.tracker_id IS NOT NULL\n"
-            .'        GROUP BY m.interval_index, l.tracker_id';
+            ."        FROM report_lines l\n"
+            ."        WHERE l.tracker_id IS NOT NULL\n"
+            ."        GROUP BY 1, 2";
+    }
+
+    /**
+     * Attaches `interval_index` from the month spine. An equijoin against 24
+     * rows, so its cost does not depend on the fact-table size.
+     */
+    private function trackerMonthsCte(): string
+    {
+        $fields = ['tracker_id'];
+        foreach ($this->definition->trackerSections() as $section) {
+            $fields[] = $section->field;
+        }
+
+        $selected = implode(",\n", array_map(
+            static fn (string $field): string => "            t.{$field}",
+            $fields,
+        ));
+
+        return "        SELECT\n"
+            ."            m.interval_index,\n"
+            .$selected."\n"
+            ."        FROM tracker_agg t\n"
+            .'        JOIN months m ON m.month_start = t.month_start';
     }
 
     /**
@@ -187,10 +229,11 @@ final class TrackerReportSqlBuilder
     }
 
     /**
-     * Farm-level sections, over lines belonging to no tracker. LEFT JOIN so
-     * empty months survive for the running balance to carry through.
+     * Farm-level sections, over lines belonging to no tracker.
+     *
+     * Same bucket-then-join shape as the tracker side, for the same reason.
      */
-    private function farmMonthsCte(): string
+    private function farmAggCte(): string
     {
         $expressions = [];
         foreach ($this->definition->farmSections() as $section) {
@@ -198,14 +241,30 @@ final class TrackerReportSqlBuilder
         }
 
         return "        SELECT\n"
+            ."            date_trunc('month', l.date)::DATE AS month_start,\n"
+            .implode(",\n", $expressions)."\n"
+            ."        FROM report_lines l\n"
+            ."        WHERE l.tracker_id IS NULL\n"
+            ."        GROUP BY 1";
+    }
+
+    /**
+     * LEFT JOIN from the spine, so a month with no farm-level activity still
+     * produces a row for the running balance to carry through.
+     */
+    private function farmMonthsCte(): string
+    {
+        $selected = [];
+        foreach ($this->definition->farmSections() as $section) {
+            $selected[] = "            COALESCE(f.{$section->field}, 0) AS {$section->field}";
+        }
+
+        return "        SELECT\n"
             ."            m.interval_index,\n"
             ."            strftime(m.month_start, '%Y-%m') AS month,\n"
-            .implode(",\n", $expressions)."\n"
+            .implode(",\n", $selected)."\n"
             ."        FROM months m\n"
-            ."        LEFT JOIN report_lines l\n"
-            ."               ON l.date BETWEEN m.month_start AND m.month_end\n"
-            ."              AND l.tracker_id IS NULL\n"
-            .'        GROUP BY m.interval_index, m.month_start';
+            .'        LEFT JOIN farm_agg f ON f.month_start = m.month_start';
     }
 
     private function sectionsCte(): string
@@ -351,8 +410,25 @@ final class TrackerReportSqlBuilder
 
         $rollup = $this->definition->trackerCalculationRows()[0];
 
+        // Aggregate first, then build the grid from the result.
+        //
+        // The earlier shape cross-joined months x trackers (24 x 50 = 1,200
+        // rows) and LEFT JOINed the fact table on `date BETWEEN ...` — a range
+        // join against every row in scope, which does not scale for the reason
+        // described on `trackerAggCte()`. Here the fact table is touched once,
+        // by a hash aggregate, and the 1,200-row grid is joined to that small
+        // result on equality.
         return "WITH\nmonths AS (\n".$this->monthSpineCte()."\n),\n\n"
             ."report_lines AS (\n".$this->reportLinesCte()."\n),\n\n"
+            ."agg AS (\n"
+            ."    SELECT\n"
+            ."        date_trunc('month', l.date)::DATE AS month_start,\n"
+            ."        l.tracker_id,\n"
+            .implode(",\n", $sections)."\n"
+            ."    FROM report_lines l\n"
+            ."    WHERE l.tracker_id IS NOT NULL\n"
+            ."    GROUP BY 1, 2\n"
+            ."),\n\n"
             ."grid AS (\n"
             ."    SELECT\n"
             ."        m.interval_index,\n"
@@ -360,17 +436,33 @@ final class TrackerReportSqlBuilder
             ."        t.tracker_id,\n"
             ."        t.tracker_name,\n"
             ."        t.stock_type,\n"
-            .implode(",\n", $sections)."\n"
+            ."        t.display_order,\n"
+            .implode(",\n", $this->coalescedTrackerSections())."\n"
             ."    FROM months m\n"
+            // Every tracker in every month, so the grid is complete rather
+            // than ragged — the trackers table is 50 rows, not fact data.
             ."    CROSS JOIN {$this->appAlias}.trackers t\n"
-            ."    LEFT JOIN report_lines l\n"
-            ."           ON l.date BETWEEN m.month_start AND m.month_end\n"
-            ."          AND l.tracker_id = t.tracker_id\n"
+            ."    LEFT JOIN agg a\n"
+            ."           ON a.month_start = m.month_start\n"
+            ."          AND a.tracker_id = t.tracker_id\n"
             ."    WHERE t.farm_id = \$farm_id\n"
-            ."    GROUP BY m.interval_index, m.month_start, t.tracker_id, t.tracker_name, t.stock_type, t.display_order\n"
             .")\n\n"
             ."SELECT *, {$rollup->formula} AS {$rollup->field}\n"
             ."FROM grid\n"
-            .'ORDER BY tracker_id, interval_index';
+            .'ORDER BY display_order, interval_index';
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function coalescedTrackerSections(): array
+    {
+        $columns = [];
+
+        foreach ($this->definition->trackerSections() as $section) {
+            $columns[] = "        COALESCE(a.{$section->field}, 0) AS {$section->field}";
+        }
+
+        return $columns;
     }
 }
