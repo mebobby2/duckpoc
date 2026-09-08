@@ -439,6 +439,128 @@
         </details>
     @endif
 
+    {{-- Query profile (EXPLAIN ANALYZE) --}}
+    @if ($profile === null)
+        <div class="mb-4 rounded-lg border border-slate-200 bg-white p-4 text-xs text-slate-600 shadow-sm">
+            <span class="font-medium text-slate-900">Query profile:</span>
+            not run. <code class="rounded bg-slate-100 px-1">EXPLAIN ANALYZE</code> executes the query, so it
+            costs a second full run and is opt-in.
+            <a class="font-medium text-blue-700 underline"
+               href="{{ request()->fullUrlWithQuery(['explain' => 1]) }}">Profile this query</a>
+        </div>
+    @elseif (!$profile['ok'])
+        <div class="mb-4 rounded-lg border border-red-200 bg-red-50 p-4">
+            <p class="text-sm font-medium text-red-800">Profiling failed</p>
+            <pre class="mt-2 overflow-x-auto whitespace-pre-wrap text-xs text-red-700">{{ $profile['error'] }}</pre>
+        </div>
+    @else
+        @php
+            $total = $profile['total_seconds'];
+            $sqlSecs = $profile['sql_seconds'];
+            $storage = ($total !== null && $sqlSecs !== null) ? max(0, $total - $sqlSecs) : null;
+        @endphp
+        <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm" open>
+            <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
+                Query profile
+                <span class="ml-2 font-normal text-slate-500">
+                    {{ $total !== null ? number_format($total, 2) . 's total' : '' }}
+                    @if ($profile['http_gets'] !== null)
+                        · {{ number_format($profile['http_gets']) }} HTTP GETs
+                    @endif
+                    @if ($profile['bytes_in'])
+                        · {{ $profile['bytes_in'] }} transferred
+                    @endif
+                </span>
+            </summary>
+
+            <div class="border-t border-slate-200 px-5 py-4">
+                <div class="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-4">
+                    <div class="rounded border border-slate-200 p-3">
+                        <p class="text-xs uppercase tracking-wide text-slate-500">SQL engine</p>
+                        <p class="mt-1 text-lg font-semibold tabular-nums">
+                            {{ $sqlSecs !== null ? number_format($sqlSecs, 2) . 's' : '—' }}
+                        </p>
+                        <p class="mt-1 text-xs text-slate-500">sum of operator times</p>
+                    </div>
+                    <div class="rounded border border-slate-200 p-3">
+                        <p class="text-xs uppercase tracking-wide text-slate-500">Storage / waiting</p>
+                        <p class="mt-1 text-lg font-semibold tabular-nums">
+                            {{ $storage !== null ? number_format($storage, 2) . 's' : '—' }}
+                        </p>
+                        <p class="mt-1 text-xs text-slate-500">total minus SQL</p>
+                    </div>
+                    <div class="rounded border border-slate-200 p-3">
+                        <p class="text-xs uppercase tracking-wide text-slate-500">HTTP GETs</p>
+                        <p class="mt-1 text-lg font-semibold tabular-nums">
+                            {{ $profile['http_gets'] !== null ? number_format($profile['http_gets']) : '—' }}
+                        </p>
+                        <p class="mt-1 text-xs text-slate-500">one per row group x column</p>
+                    </div>
+                    <div class="rounded border border-slate-200 p-3">
+                        <p class="text-xs uppercase tracking-wide text-slate-500">Transferred</p>
+                        <p class="mt-1 text-lg font-semibold tabular-nums">{{ $profile['bytes_in'] ?? '—' }}</p>
+                        <p class="mt-1 text-xs text-slate-500">only the columns read</p>
+                    </div>
+                </div>
+
+                <p class="mb-3 text-xs text-slate-500">
+                    Read the two left-hand numbers together. If <strong>SQL engine</strong> is small and
+                    <strong>Storage / waiting</strong> is large, the query logic is not the problem — the
+                    time is going on fetching data, and the levers are partition pruning, row-group sizing
+                    and how many columns the query touches. If SQL engine dominates, the plan below is where
+                    to look.
+                    <br>
+                    On the billion-row farm, profiled cold from the CLI, this read 4,248 GETs for 26.5 MiB
+                    with ~1.7s of SQL out of 56.6s total — which is what ruled out both the query plan and
+                    MySQL as the cause.
+                </p>
+
+                <p class="mb-3 rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                    <strong>Warm cache.</strong> Profiling runs after the report has already executed in this
+                    same process, so httpfs has cached what the report read. The GET count and transferred
+                    bytes above therefore describe a <em>second</em> read, not a cold one, and will often show
+                    0 — which is why they can look implausibly good here. For cold numbers, profile in a fresh
+                    process:
+                    <code class="mt-1 block rounded bg-amber-100 px-1 py-0.5">php artisan duckdb:tracker:profile --farm=&lt;id&gt;</code>
+                    The SQL-vs-storage split stays meaningful either way, since both halves are measured the
+                    same run.
+                </p>
+
+                @if (!empty($profile['operators']))
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full text-xs">
+                            <thead>
+                                <tr class="border-b border-slate-200 text-left text-slate-600">
+                                    <th class="py-1.5 pr-4 font-medium">Slowest operators</th>
+                                    <th class="py-1.5 pr-4 text-right font-medium">Time</th>
+                                    <th class="py-1.5 pr-4 text-right font-medium">Share of total</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach ($profile['operators'] as $op)
+                                    <tr class="border-b border-slate-100">
+                                        <td class="py-1 pr-4 font-mono whitespace-nowrap">{{ $op['name'] }}</td>
+                                        <td class="py-1 pr-4 text-right tabular-nums whitespace-nowrap">
+                                            {{ number_format($op['seconds'], 2) }}s
+                                        </td>
+                                        <td class="py-1 pr-4 text-right tabular-nums whitespace-nowrap text-slate-500">
+                                            {{ $total ? number_format($op['seconds'] / $total * 100, 1) . '%' : '—' }}
+                                        </td>
+                                    </tr>
+                                @endforeach
+                            </tbody>
+                        </table>
+                    </div>
+                @endif
+
+                <details class="mt-4">
+                    <summary class="cursor-pointer text-xs font-medium text-slate-600">Full EXPLAIN ANALYZE output</summary>
+                    <pre class="mt-2 max-h-96 overflow-auto rounded bg-slate-900 p-3 text-xs leading-relaxed text-slate-100">{{ $profile['raw'] }}</pre>
+                </details>
+            </div>
+        </details>
+    @endif
+
     {{-- Generated SQL --}}
     @if ($sql)
         <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm">

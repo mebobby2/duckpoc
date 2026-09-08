@@ -18,6 +18,13 @@ with 1** — same journal volume, same SQL text. Start at
 [Tracker scaling](#tracker-scaling--the-axis-that-actually-hurts-today) for
 that, including an explicit note on what it does not yet show.
 
+The biggest single win, though, was neither SQL nor architecture but **physical
+layout**: DuckDB's default Parquet row group size (122,880) is tuned for local
+disk, and over object storage it dominated everything. Raising it to 1,000,000
+made the same billion-row report **5.9x faster** (54.8s -> 9.3s) and writes
+**1.55x faster**. See
+[Row group size](#row-group-size-the-single-biggest-win-measured-in-this-poc).
+
 ## Stack
 
 | Piece | What | Why |
@@ -204,6 +211,99 @@ pays a full round trip on each, and unlike the read path there is no connection
 reuse hiding the distance. So "the move bought less than expected" is true of
 report latency specifically, and false of ingest. Worth separating the two
 whenever a placement decision comes up — they have different cost structures.
+
+## Row group size: the single biggest win measured in this PoC
+
+**DuckDB's default Parquet row group size is 122,880 rows. Over object storage
+that default is the dominant cost of a query.** Changing it to 1,000,000 made
+the same report **5.9x faster** and, unexpectedly, writes **1.55x faster**.
+
+### Why it matters
+
+DuckDB issues **one HTTP range request per (row group x column)**. Row group
+count therefore sets the request count, and each request pays a full network
+round trip. Bytes barely matter; requests do.
+
+The billion-row hero farm, same 2-month report, profiled cold both times:
+
+| | 122,880 (default) | 1,000,000 | Change |
+|---|---|---|---|
+| **Total** | 54.80 s | **9.26 s** | **5.9x faster** |
+| Storage / waiting | 53.06 s | 8.03 s | 6.6x less |
+| SQL engine | 1.74 s | 1.23 s | ~unchanged |
+| **HTTP GETs** | 4,247 | **1,014** | 4.2x fewer |
+| Transferred | 26.5 MiB | 36.3 MiB | **+37%** |
+| Per request | 12.5 ms | 7.9 ms | |
+
+Note the direction of the bytes column: the faster configuration **reads more
+data**. Coarser row groups mean a filter pulls slightly more than it needs, and
+that trade is overwhelmingly worth it. Any explanation of this report's cost in
+terms of download volume is wrong — that was the first two theories, and both
+were wrong.
+
+### Writes got faster too
+
+Not predicted. Fewer column chunks to encode, smaller footers, and fewer
+catalog rows for DuckLake to track:
+
+| | Row groups | Seed time (1e9 rows) | Throughput |
+|---|---|---|---|
+| Default | 122,880 | 1,190 s | 840,584 rows/s |
+| Tuned | 1,000,000 | **768 s** | **1,302,188 rows/s** |
+
+### How to set it
+
+It is a **DuckLake catalog option**, not a DuckDB setting — `SET
+parquet_row_group_size` does not exist and errors as an unrecognised parameter:
+
+```sql
+CALL lake.set_option('parquet_row_group_size', '1000000');
+```
+
+It persists in the catalog and applies to every subsequent write. Captured in
+code as `CashFlowSchema::ensureWriteOptions()`, called by every seed command so
+a rebuilt catalog cannot silently revert to the default.
+
+**It does not rewrite existing files.** Parquet row groups are fixed at write
+time, so changing it only affects new writes. Benefiting from it means
+rewriting the data — and for synthetic data **re-seeding is faster than
+rewriting in place**, because seeding generates rows locally at >1M/s while a
+rewrite has to read them back from GCS first, which is the slow path being
+fixed.
+
+### 1,000,000 is a request, not a guarantee
+
+The setting is an upper bound that interacts with
+`write_buffer_row_group_memory_limit` (default 250 MiB). Actual result on this
+data: **47-48 row groups per 25M-row file at 653K-958K rows each**, not the
+25 groups of exactly 1M that the setting alone implies. Pushing closer to 1M+
+per group would need that memory limit raised too.
+
+### The diagnostic that found it
+
+Three wrong diagnoses preceded this, each a theory fitted to one elapsed-time
+number: "it is downloading gigabytes" (wrong — column pruning means it reads a
+fraction), "it is request latency x count" (right mechanism, wrong magnitude,
+asserted before isolating anything), and "it is the SQL" (wrong — SQL was 3%).
+
+What settled it was `EXPLAIN ANALYZE`, which reports HTTPFS request counts and
+per-operator timings directly. That is now built in:
+
+- `QueryProfiler` — parses total time, HTTP GETs, bytes, operator timings
+- The report page's **Query profile** panel (`?explain=1`), showing **SQL engine
+  vs storage/waiting** side by side — the one split that answers "is it my
+  SQL?" without guessing
+- `duckdb:tracker:profile` — the same profile from a fresh process, for cold
+  numbers
+
+The panel's caveat is stated in the UI: it profiles *after* the report has run
+in the same request, so httpfs is warm and its GET count understates a cold
+read (it showed 0 on a small farm). Use the command for cold figures.
+
+**The general lesson worth carrying into the real system:** the storage layer's
+physical layout — row group size, partition granularity, file count — dominated
+every SQL-level concern in this PoC, by roughly an order of magnitude. And
+elapsed time alone never once identified the cause correctly.
 
 ## Tracker scaling — the axis that actually hurts today
 

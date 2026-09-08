@@ -39,7 +39,9 @@ class DuckDbHeroSeedCommand extends Command
         $alias = config('duckdb.attached_alias');
         $appAlias = config('duckdb.app_database.alias');
 
-        (new CashFlowSchema($db, $alias))->addTrackerColumn();
+        $schema = new CashFlowSchema($db, $alias);
+        $schema->ensureWriteOptions();
+        $schema->addTrackerColumn();
 
         $seeder = new HeroTrackerSeeder($db, $alias, $appAlias);
         $seeder->ensureAccounts();

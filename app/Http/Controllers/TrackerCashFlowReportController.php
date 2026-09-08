@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Http\Controllers;
 
 use App\Services\CashFlow\ParquetFileLister;
+use App\Services\CashFlow\QueryProfiler;
 use App\Services\CashFlow\TrackerCashFlowQuery;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -42,8 +43,13 @@ class TrackerCashFlowReportController extends Controller
      * If the report itself took longer than this, the diagnostic scans are
      * skipped unless `?force_diagnostics=1` — the report's own elapsed time is
      * a free proxy for how much data is in scope.
+     *
+     * Raised from 2s once row group tuning cut the billion-row report from
+     * ~55s to ~9s: at 2s the guard fired on that farm and hid the diagnostics
+     * exactly where they are most interesting, while a farm slow enough to
+     * matter now sits well above 10s.
      */
-    private const float DIAGNOSTICS_BUDGET_MS = 2000.0;
+    private const float DIAGNOSTICS_BUDGET_MS = 10000.0;
 
     /**
      * Spans the actuals/forecast boundary the seeder creates (actuals through
@@ -83,6 +89,7 @@ class TrackerCashFlowReportController extends Controller
         $sourceRowsMs = null;
         $sourceRowsSkipped = false;
         $diagnosticsAffordable = true;
+        $profile = null;
 
         if ($farm === null) {
             $error = 'No tracker farms found. Run: php artisan duckdb:tracker:seed';
@@ -142,6 +149,20 @@ class TrackerCashFlowReportController extends Controller
                 // scale, since it shows which partitions were skippable.
                 $files = (new ParquetFileLister($db, $alias))
                     ->forQuery($farm, $periodFrom, $periodTo);
+
+                // Opt-in: EXPLAIN ANALYZE executes the query, so profiling
+                // costs a second full run.
+                if ($request->boolean('explain')) {
+                    $profile = (new QueryProfiler($db))->profile($query->sql(), [
+                        'farm_id' => $farm['farm_id'],
+                        'farm_type' => $farm['farm_type'],
+                        'region' => $farm['region'],
+                        'basis' => $basis,
+                        'period_from' => $periodFrom,
+                        'period_to' => $periodTo,
+                        'horizon' => $horizon,
+                    ]);
+                }
             } catch (Throwable $e) {
                 $error = $e->getMessage();
             }
@@ -173,6 +194,7 @@ class TrackerCashFlowReportController extends Controller
             'sourceRowsMs' => $sourceRowsMs,
             'diagnosticsAffordable' => $diagnosticsAffordable,
             'diagnosticsBudgetMs' => self::DIAGNOSTICS_BUDGET_MS,
+            'profile' => $profile,
             'files' => $files,
             'trackerCount' => $farm === null ? 0 : $this->trackerCount($farm['farm_id']),
         ]);

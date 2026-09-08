@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Services\CashFlow\CashFlowScaleSeeder;
+use App\Services\CashFlow\CashFlowSchema;
 use Illuminate\Console\Command;
 use Saturio\DuckDB\DuckDB;
 use Throwable;
@@ -50,6 +51,8 @@ class DuckDbCashFlowSeedScaleCommand extends Command
         $startedAt = microtime(true);
 
         try {
+            (new CashFlowSchema($db, $alias))->ensureWriteOptions();
+
             (new CashFlowScaleSeeder($db, $alias, config('duckdb.app_database.alias')))->seed(
                 onFarmSeeded: function (string $farmId, int $rows) use ($startedAt): void {
                     $this->line(sprintf(

@@ -84,6 +84,44 @@ final class CashFlowSchema
     }
 
     /**
+     * Rows per Parquet row group for everything this lake writes.
+     *
+     * DuckDB's default is 122,880, which is tuned for local disk where a read
+     * per row group is nearly free. Over object storage it is the dominant
+     * cost, because DuckDB issues one HTTP range request per
+     * (row group x column): the tracker report on the billion-row farm made
+     * **4,247 GETs to transfer 26.5 MiB**, and at ~12.5 ms per request that
+     * was 53 of its 55 seconds — against 1.7 s of actual SQL.
+     *
+     * 1,000,000 is within DuckDB's own recommended 1-5M range for remote
+     * storage. Larger row groups mean fewer, fatter requests, so the
+     * per-request latency is amortised over far more rows.
+     */
+    private const int PARQUET_ROW_GROUP_SIZE = 1_000_000;
+
+    /**
+     * Persists the lake's write options in the catalog.
+     *
+     * A DuckLake option set this way is stored in the catalog and applies to
+     * every subsequent write, so this only needs to run when the lake is
+     * created or a setting changes — not per connection, which would make
+     * every read a catalog write.
+     *
+     * It does NOT rewrite existing files. Parquet row groups are fixed when a
+     * file is written, so data already in the lake keeps whatever row group
+     * size was in force at the time. Benefiting from a change means rewriting
+     * that data.
+     */
+    public function ensureWriteOptions(): void
+    {
+        $this->db->query(sprintf(
+            "CALL %s.set_option('parquet_row_group_size', '%d')",
+            $this->alias,
+            self::PARQUET_ROW_GROUP_SIZE,
+        ));
+    }
+
+    /**
      * Adds `tracker_id` to an existing table without dropping it.
      *
      * Journal lines carry a tracker tag so per-tracker report sections can be

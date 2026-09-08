@@ -28,7 +28,9 @@ class DuckDbTrackerSeedCommand extends Command
 
         // Additive, idempotent — existing rows read back NULL rather than
         // being dropped and re-seeded.
-        (new CashFlowSchema($db, $alias))->addTrackerColumn();
+        $schema = new CashFlowSchema($db, $alias);
+        $schema->ensureWriteOptions();
+        $schema->addTrackerColumn();
 
         $rowsPer = TrackerScaleSeeder::rowsPerFarm();
 
