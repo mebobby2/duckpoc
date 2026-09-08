@@ -41,20 +41,12 @@ class CashFlowReportController extends Controller
         $error = null;
         $elapsedMs = null;
 
+        $query = new CashFlowQuery($db, $alias);
+
         if ($farm === null) {
             $error = 'No farms found in DuckLake. Run: php artisan duckdb:cashflow:seed';
         } else {
-            $query = new CashFlowQuery($db, $alias);
-
-            $sql = $query->sql(
-                farmId: $farm['farm_id'],
-                farmType: $farm['farm_type'],
-                region: $farm['region'],
-                periodFrom: $periodFrom,
-                periodTo: $periodTo,
-                horizon: $horizon,
-                basis: $basis,
-            );
+            $sql = $query->sql();
 
             try {
                 $startedAt = microtime(true);
@@ -84,7 +76,7 @@ class CashFlowReportController extends Controller
             'horizon' => $horizon,
             'basis' => $basis,
             'rows' => $rows,
-            'reportRows' => $this->reportRowDefinitions(),
+            'reportRows' => $query->definition()->displayRows(),
             'sql' => $sql,
             'error' => $error,
             'elapsedMs' => $elapsedMs,
@@ -107,24 +99,4 @@ class CashFlowReportController extends Controller
         }
     }
 
-    /**
-     * Report line order and emphasis, mirroring the section order
-     * CashFlowStructureBuilder declares.
-     *
-     * @return list<array{field: string, label: string, strong: bool}>
-     */
-    private function reportRowDefinitions(): array
-    {
-        return [
-            ['field' => 'income', 'label' => 'Income', 'strong' => false],
-            ['field' => 'direct_costs', 'label' => 'Direct Costs', 'strong' => false],
-            ['field' => 'gross_profit', 'label' => 'Gross Profit', 'strong' => true],
-            ['field' => 'operating_expenses', 'label' => 'Operating Expenses', 'strong' => false],
-            ['field' => 'operating_surplus', 'label' => 'Operating Surplus', 'strong' => true],
-            ['field' => 'total_surplus', 'label' => 'Total Surplus', 'strong' => true],
-            ['field' => 'net_cash_movement', 'label' => 'Net Cash Movement', 'strong' => true],
-            ['field' => 'opening', 'label' => 'Opening Balance', 'strong' => false],
-            ['field' => 'closing', 'label' => 'Closing Balance', 'strong' => true],
-        ];
-    }
 }

@@ -112,7 +112,7 @@
                 </thead>
                 <tbody>
                     @foreach ($reportRows as $definition)
-                        <tr class="border-b border-slate-100 {{ $definition['strong'] ? 'bg-slate-50 font-semibold' : '' }}">
+                        <tr class="border-b border-slate-100 {{ $definition['isSubtotal'] ? 'bg-slate-50 font-semibold' : '' }}">
                             <td class="px-4 py-1.5 whitespace-nowrap">{{ $definition['label'] }}</td>
                             @foreach ($rows as $row)
                                 @php
