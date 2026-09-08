@@ -222,6 +222,87 @@
         </div>
     @endif
 
+    {{-- Storage range requests — the measured cost driver --}}
+    @if ($storage !== null)
+        <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm" open>
+            <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
+                Storage requests
+                <span class="ml-2 font-normal text-slate-500">
+                    @if ($storage['connection_events'] !== null)
+                        {{ number_format($storage['connection_events']) }} range requests
+                    @endif
+                    @if ($storage['row_groups'] !== null)
+                        · {{ number_format($storage['row_groups']) }} row groups
+                        across {{ number_format($storage['files_in_scope']) }} file(s)
+                    @endif
+                </span>
+            </summary>
+
+            <div class="border-t border-slate-200 px-5 py-4">
+                <div class="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-4">
+                    <div class="rounded border border-slate-200 p-3">
+                        <p class="text-xs uppercase tracking-wide text-slate-500">Range requests</p>
+                        <p class="mt-1 text-lg font-semibold tabular-nums">
+                            {{ $storage['connection_events'] !== null ? number_format($storage['connection_events']) : '—' }}
+                        </p>
+                        <p class="mt-1 text-xs text-slate-500">measured, this request</p>
+                    </div>
+                    <div class="rounded border border-slate-200 p-3">
+                        <p class="text-xs uppercase tracking-wide text-slate-500">New TLS connections</p>
+                        <p class="mt-1 text-lg font-semibold tabular-nums">
+                            {{ $storage['connection_misses'] !== null ? number_format($storage['connection_misses']) : '—' }}
+                        </p>
+                        <p class="mt-1 text-xs text-slate-500">rest reused the cache</p>
+                    </div>
+                    <div class="rounded border border-slate-200 p-3">
+                        <p class="text-xs uppercase tracking-wide text-slate-500">Row groups read</p>
+                        <p class="mt-1 text-lg font-semibold tabular-nums">
+                            {{ $storage['row_groups'] !== null ? number_format($storage['row_groups']) : '—' }}
+                        </p>
+                        <p class="mt-1 text-xs text-slate-500">
+                            in {{ number_format($storage['files_in_scope']) }} in-scope file(s)
+                        </p>
+                    </div>
+                    <div class="rounded border border-slate-200 p-3">
+                        <p class="text-xs uppercase tracking-wide text-slate-500">Upper bound</p>
+                        <p class="mt-1 text-lg font-semibold tabular-nums">
+                            {{ $storage['predicted_requests'] !== null ? number_format($storage['predicted_requests']) : '—' }}
+                        </p>
+                        <p class="mt-1 text-xs text-slate-500">
+                            {{ number_format($storage['row_groups'] ?? 0) }} × {{ $storage['columns_read'] }} columns
+                        </p>
+                    </div>
+                </div>
+
+                <p class="text-xs text-slate-500">
+                    <strong>This is the number that decides how long the report takes.</strong>
+                    DuckDB issues one HTTP range request per (row group × column), and each pays a network
+                    round trip — so cost tracks request count, not data volume. Row group size is the lever:
+                    raising it from DuckDB's disk-oriented default of 122,880 to 1,000,000 took the
+                    billion-row report from 4,247 requests / 54.8s to 1,014 / 9.3s, while
+                    <em>increasing</em> bytes read by 37%.
+                    <br>
+                    <strong>Range requests</strong> is measured from DuckDB's <code class="rounded bg-slate-100 px-1">HTTPFSInfo</code>
+                    log for the queries this page just ran — validated within 1% of
+                    <code class="rounded bg-slate-100 px-1">EXPLAIN ANALYZE</code>'s own counter on two
+                    windows (1,014 vs 1,024 and 1,104 vs 1,115), and unlike EXPLAIN ANALYZE it costs nothing
+                    because the report has already run. It covers every lake read in this request, so the
+                    tracker-detail query and the diagnostics below are included, not just the report.
+                    <br>
+                    <strong>Upper bound</strong> assumes one request per column chunk; DuckDB coalesces
+                    adjacent chunks when prefetching, so the real figure comes in lower — ~1.7× lower on the
+                    hero farm. Treat it as the ceiling a layout change moves, not a prediction.
+                </p>
+
+                @if ($storage['note'])
+                    <p class="mt-2 rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                        {{ $storage['note'] }}
+                    </p>
+                @endif
+            </div>
+        </details>
+    @endif
+
     {{-- Parquet files DuckLake holds for the tables this report reads --}}
     @if (!empty($files))
         @php

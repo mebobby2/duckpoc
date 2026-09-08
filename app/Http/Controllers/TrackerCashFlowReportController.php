@@ -6,6 +6,7 @@ namespace App\Http\Controllers;
 
 use App\Services\CashFlow\ParquetFileLister;
 use App\Services\CashFlow\QueryProfiler;
+use App\Services\CashFlow\StorageRequestProfile;
 use App\Services\CashFlow\TrackerCashFlowQuery;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -46,10 +47,12 @@ class TrackerCashFlowReportController extends Controller
      *
      * Raised from 2s once row group tuning cut the billion-row report from
      * ~55s to ~9s: at 2s the guard fired on that farm and hid the diagnostics
-     * exactly where they are most interesting, while a farm slow enough to
-     * matter now sits well above 10s.
+     * exactly where they are most interesting. 30s keeps it out of the way for
+     * anything this PoC currently produces — the diagnostic scans measured at
+     * ~93ms even on the billion-row farm, so the guard is really only there to
+     * stop a pathological case from compounding a slow report.
      */
-    private const float DIAGNOSTICS_BUDGET_MS = 10000.0;
+    private const float DIAGNOSTICS_BUDGET_MS = 30000.0;
 
     /**
      * Spans the actuals/forecast boundary the seeder creates (actuals through
@@ -90,6 +93,7 @@ class TrackerCashFlowReportController extends Controller
         $sourceRowsSkipped = false;
         $diagnosticsAffordable = true;
         $profile = null;
+        $storage = null;
 
         if ($farm === null) {
             $error = 'No tracker farms found. Run: php artisan duckdb:tracker:seed';
@@ -104,6 +108,11 @@ class TrackerCashFlowReportController extends Controller
                     'horizon' => $horizon,
                     'basis' => $basis,
                 ];
+
+                // Armed before any lake read, so its counters cover the
+                // report's own queries rather than a re-run.
+                $requests = new StorageRequestProfile($db);
+                $requests->startLogging();
 
                 $startedAt = microtime(true);
                 $rows = $query->run(...$scope);
@@ -150,6 +159,8 @@ class TrackerCashFlowReportController extends Controller
                 $files = (new ParquetFileLister($db, $alias))
                     ->forQuery($farm, $periodFrom, $periodTo);
 
+                $storage = $requests->summarise($files);
+
                 // Opt-in: EXPLAIN ANALYZE executes the query, so profiling
                 // costs a second full run.
                 if ($request->boolean('explain')) {
@@ -195,6 +206,7 @@ class TrackerCashFlowReportController extends Controller
             'diagnosticsAffordable' => $diagnosticsAffordable,
             'diagnosticsBudgetMs' => self::DIAGNOSTICS_BUDGET_MS,
             'profile' => $profile,
+            'storage' => $storage,
             'files' => $files,
             'trackerCount' => $farm === null ? 0 : $this->trackerCount($farm['farm_id']),
         ]);
