@@ -107,6 +107,77 @@ enough volume for multiple row groups, i.e. the 800K scale test.
 | `duckdb:cashflow:run` | Runs the report as DuckDB SQL and diffs it against the oracle |
 | `duckdb:cashflow:flush` | Writes DuckLake's inlined rows out to Parquet and lists the resulting partition paths |
 
+## Why this PoC uses an Australian bucket
+
+The PoC bucket is **`bobby-poc-au` in `australia-southeast1` (Sydney)**. That
+is deliberately *not* a recommendation about where Figured's data should live —
+production data and production compute are both in `us-central1`, co-located,
+and that is correct.
+
+The bucket region here is about **measurement validity, not speed**.
+
+Development happens from Auckland. Measuring against `us-central1` from there
+means every number carries ~13,000 km of round trip that production never
+pays, since production's compute sits next to its data. That conflates
+"is this architecture viable" with "how far is my laptop from Iowa", and the
+second question is not the one the PoC exists to answer.
+
+Three options, and why Sydney is the least bad:
+
+| Option | Exercises the real GCS path? | Latency realistic vs production? |
+|---|---|---|
+| Local Parquet (`GCS_BUCKET=` empty) | **No** — bypasses httpfs, auth, network entirely | n/a |
+| `us-central1` bucket | Yes | No — models a distance production does not have |
+| **`australia-southeast1`** | **Yes** | **Closest available proxy** |
+
+Sydney is ~2,150 km from Auckland (~25–30 ms RTT). There is no New Zealand
+region — GCP has only `australia-southeast1` (Sydney) and
+`australia-southeast2` (Melbourne) in Oceania. So this keeps the full real
+code path — `httpfs`, HMAC auth, DuckLake over object storage — at a latency
+in the same order as an in-region production fetch.
+
+The local-Parquet fallback is still the right choice when iterating on report
+*logic*, because it is instant and free. Use this bucket when the thing under
+test is the storage layer.
+
+### What the move actually bought — less than expected
+
+Recorded because the reasoning was wrong in an instructive way. Raw single
+object GETs did improve:
+
+```
+Sydney:  tcp 35ms -> tls 234ms -> ttfb 300ms   (data fetch only ~66ms)
+Iowa:    tcp 35ms -> tls 240ms -> ttfb 500ms   (data fetch ~260ms)
+```
+
+But the Cash Flow report time did **not** change at all: 2,504 ms against
+Iowa, 2,535 ms against Sydney.
+
+The reason is visible above. **The TLS handshake is ~200 ms and identical in
+both regions** — it terminates at a nearby anycast frontend either way, so
+bucket distance never touches it. Repeated handshakes, not distance, dominated
+the report. Enabling `httpfs_connection_caching` (see
+`DuckLakeConnectionFactory::tuneRemoteReads`) cut ~40%, which the region move
+could not.
+
+Lesson worth keeping: the TLS breakdown was already sitting in the curl probe
+output before the bucket was created. Reading it properly would have found the
+cheaper fix first.
+
+**But the read path was only half the story — the write path improved ~5×.**
+Re-seeding the same 880,004-row scale dataset:
+
+| Target bucket | Seed time |
+|---|---|
+| `bobby-poc` (us-central1, Iowa) | 47.1 s |
+| `bobby-poc-au` (australia-southeast1) | **9.3 s** |
+
+Writes benefit where reads did not because a bulk seed issues *many* PUTs and
+pays a full round trip on each, and unlike the read path there is no connection
+reuse hiding the distance. So "the move bought less than expected" is true of
+report latency specifically, and false of ingest. Worth separating the two
+whenever a placement decision comes up — they have different cost structures.
+
 ## Scale test results — the headline finding
 
 Seeded 880,000 transaction lines across 5 farms in 3 `(farm_type, region)`
@@ -198,18 +269,53 @@ The wider query was *faster*. No pruning effect.
 
 Identical results, no improvement — the difference is noise.
 
-**Conclusion: DuckLake is not pruning on the `year(date)` transform**, from
-either a date range or an explicit predicate on the expression. Cohort
-pruning does appear to work — the isolated `sheep/otago` cohort (8 files) read
-cold in 3,766 ms versus 6,082 ms for `dairy/waikato` (17 files) — which is
-consistent with plain-column partition keys pruning while transform keys do
-not.
+**Re-measured on the Australian bucket, and the earlier conclusion was only
+half right.** Test 2 above couldn't distinguish two hypotheses, because its
+*baseline already contained* the `date BETWEEN` predicate. Comparing each
+predicate form on its own — `SUM(amount)` to force real Parquet reads, a
+**fresh process per probe** so no metadata cache carries over — separates them:
 
-**Design implication, and it is a real one:** if `year(date)` does not prune,
-partitioning by it multiplies file count 8× for no read benefit — and since
-cost is per-file, that is actively harmful. Worth testing before Phase 2:
-store an explicit `year` INTEGER column and partition on that plain column
-instead of the transform, or drop year from the partition key entirely.
+| Predicate (same partition cohort) | Time | Rows |
+|---|---|---|
+| `year(date) = 2024` | 1,310 ms | 102,504 |
+| `date BETWEEN '2024-01-01' AND '2024-12-31'` | **817 ms** | 102,504 |
+
+Identical results, 38% apart. So the sharper finding is:
+
+> **The raw `date` range predicate is what prunes; the `year(date)` transform
+> does not.** DuckDB maps a range on `date` onto per-file min/max statistics
+> and skips files. It cannot map an opaque function call onto those same
+> statistics, so `year(date)` is evaluated as a row filter *after* the file
+> is read.
+
+That also explains test 2's null result: the baseline was already pruning, so
+adding `year(date)` on top had nothing left to contribute.
+
+**Cost tracks file count, not row count.** Across the cohort probes:
+
+| Cohort | Files | Rows | Time |
+|---|---|---|---|
+| `sheep/otago` | 8 | 20,000 | 639 ms |
+| `dairy/waikato` | 17 | 820,004 | 1,252 ms |
+| all | 41 | 880,004 | 1,348 ms |
+
+41× fewer rows buys only ~2× less time, and time rises roughly with files.
+Compute is not the variable here — remote round trips are. (Resisting the urge
+to fit per-file and fixed-cost coefficients to these: two different pairs of
+points give two incompatible models, so the honest claim is the direction, not
+a formula.)
+
+**Design implication:** partitioning by `year(date)` multiplies file count ~8×
+while the transform itself never prunes, and cost is per-file — so the year key
+earns its keep *only* because queries filter on raw `date` ranges, which prune
+via statistics whether or not year is a partition key. Before Phase 2, worth
+testing an explicit `year` INTEGER column as a plain partition key, and testing
+dropping year from the key entirely; fewer, larger files may simply win.
+
+**No code change needed today:** `ReportSqlBuilder::inScopePredicate()` already
+filters on `tl.date BETWEEN … AND …`, the form that prunes. `year(date)` appears
+only in the partition DDL, which is where it belongs. The rule to keep is:
+**never filter on `year(date)` in query predicates — always a raw date range.**
 
 ### A seeder bug worth recording
 

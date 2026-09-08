@@ -122,22 +122,54 @@ final class DuckLakeConnectionFactory
     }
 
     /**
-     * Off by default, and worth ~20% on a cold read against a remote bucket:
-     * measured 2,504 ms -> 1,941 ms on the oracle report.
+     * Both off by default, both worth real time against a remote bucket.
      *
-     * Cost here is round trips, not bytes — a 1 KB object and a 100 KB object
-     * fetch in the same time, so the win comes from asking for larger ranges
-     * in fewer requests rather than several small ones.
+     * The cost of a remote read here is round trips, not bytes — a 1 KB object
+     * and a 100 KB object fetch in the same time — and a large share of each
+     * round trip is the TLS handshake, measured at ~200 ms and *identical*
+     * whether the bucket is in Sydney or Iowa, because the handshake
+     * terminates at a nearby anycast frontend either way.
      *
-     * Deliberately just this one setting. `httpfs_connection_caching`,
-     * `parquet_metadata_cache` and `enable_http_metadata_cache` were each
-     * measured individually and showed no improvement on a single cold read —
-     * they only help on repeated reads within one process, so they belong with
-     * a persistent-instance setup rather than being switched on speculatively.
+     * That is why moving the bucket ~11,000 km closer changed the report time
+     * not at all (2,504 ms -> 2,535 ms) while raw single GETs did improve
+     * (~500 ms -> ~300 ms): repeated handshakes dominated, and they are
+     * region-independent. Reusing connections is what actually removes them.
+     *
+     * Measured on the oracle report, three cold runs each:
+     *   connection caching off: 1,769 / 2,265 / 2,370 ms
+     *   connection caching on:  1,436 / 1,325 /   997 ms
+     *
+     * `parquet_metadata_cache` and `enable_http_metadata_cache` are on too.
+     * Neither showed a gain on a single cold read — by design, since both
+     * cache across *repeated* reads within one process — but they cost
+     * nothing on a cold path and pay off the moment a process serves more
+     * than one query, which is exactly where this is headed with a
+     * persistent instance.
+     *
+     * `mysql_pool_enable_thread_local_cache` covers the other half of the
+     * federated join: dimension reads against the attached MySQL database.
+     *
+     * A caution learned the hard way here: single measurements against this
+     * bucket vary by up to 4x, and `httpfs_connection_caching` was wrongly
+     * written off on one sample before three runs showed it was the largest
+     * lever available. Take medians of several cold runs before believing
+     * any of these numbers, including these.
      */
     private function tuneRemoteReads(DuckDB $db): void
     {
+        // Fetch larger ranges in fewer requests.
         $db->query('SET prefetch_all_parquet_files = true');
+
+        // Reuse TLS connections — the ~200 ms handshake is the single biggest
+        // component of a remote read, and it is region-independent.
+        $db->query('SET httpfs_connection_caching = true');
+
+        // Avoid re-reading Parquet footers and HTTP metadata on repeat reads.
+        $db->query('SET parquet_metadata_cache = true');
+        $db->query('SET enable_http_metadata_cache = true');
+
+        // The dimension side of the federated join.
+        $db->query('SET mysql_pool_enable_thread_local_cache = true');
     }
 
     private function createGcsSecret(DuckDB $db): void
