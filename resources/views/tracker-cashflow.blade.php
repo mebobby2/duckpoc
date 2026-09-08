@@ -222,6 +222,173 @@
         </div>
     @endif
 
+    {{-- Parquet files DuckLake holds for the tables this report reads --}}
+    @if (!empty($files))
+        @php
+            $inScope = array_values(array_filter($files, fn ($f) => $f['in_scope']));
+            $outOfScope = array_values(array_filter($files, fn ($f) => !$f['in_scope']));
+            $inScopeBytes = array_sum(array_column($inScope, 'bytes'));
+        @endphp
+
+        <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm">
+            <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
+                Parquet files
+                <span class="ml-2 font-normal text-slate-500">
+                    {{ count($inScope) }} in scope
+                    ({{ number_format($inScopeBytes / 1024, 1) }} KB)
+                    @if (!empty($outOfScope))
+                        · {{ count($outOfScope) }} out of scope
+                    @endif
+                </span>
+            </summary>
+
+            <div class="border-t border-slate-200 px-5 py-4">
+                <p class="mb-3 text-xs text-slate-500">
+                    "In scope" is derived from each file's <em>partition path</em> against this
+                    query's farm cohort and year range — it is what the partition predicate
+                    <em>should</em> let DuckDB skip, not a readout of the query plan.
+                    Measurement in this PoC found <code class="rounded bg-slate-100 px-1">farm_type</code>/<code class="rounded bg-slate-100 px-1">region</code>
+                    pruning working but the <code class="rounded bg-slate-100 px-1">year(date)</code> transform
+                    <strong>not</strong> pruning — only a raw <code class="rounded bg-slate-100 px-1">date BETWEEN</code>
+                    range does, via row-group statistics — so DuckDB likely opens more year
+                    partitions than the count above implies.
+                    <br>
+                    Note that <code class="rounded bg-slate-100 px-1">tracker_id</code> is deliberately
+                    <strong>not</strong> a partition key: it is high-cardinality, and partitioning on it
+                    would multiply file count, which is the measured dominant cost here.
+                </p>
+
+                <div class="overflow-x-auto">
+                    <table class="min-w-full text-xs">
+                        <thead>
+                            <tr class="border-b border-slate-200 text-left text-slate-600">
+                                <th class="py-1.5 pr-4 font-medium">Scope</th>
+                                <th class="py-1.5 pr-4 font-medium">Table</th>
+                                <th class="py-1.5 pr-4 font-medium">Partition</th>
+                                <th class="py-1.5 pr-4 font-medium">File</th>
+                                <th class="py-1.5 pr-4 text-right font-medium">Size</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach ($files as $file)
+                                <tr class="border-b border-slate-100 {{ $file['in_scope'] ? '' : 'text-slate-400' }}">
+                                    <td class="py-1 pr-4 whitespace-nowrap">
+                                        @if ($file['in_scope'])
+                                            <span class="rounded bg-emerald-100 px-1.5 py-0.5 text-emerald-800">read</span>
+                                        @else
+                                            <span class="rounded bg-slate-100 px-1.5 py-0.5">skippable</span>
+                                        @endif
+                                    </td>
+                                    <td class="py-1 pr-4 font-mono whitespace-nowrap">{{ $file['table'] }}</td>
+                                    <td class="py-1 pr-4 font-mono whitespace-nowrap">
+                                        {{ $file['partition'] ?? '—' }}
+                                    </td>
+                                    <td class="py-1 pr-4 font-mono whitespace-nowrap">
+                                        {{ \Illuminate\Support\Str::limit($file['name'], 34) }}
+                                        @if ($file['has_delete_file'])
+                                            <span class="ml-1 rounded bg-amber-100 px-1 py-0.5 text-amber-800"
+                                                  title="Has a delete-file tombstone, which must also be read and reconciled">
+                                                +delete
+                                            </span>
+                                        @endif
+                                    </td>
+                                    <td class="py-1 pr-4 text-right tabular-nums whitespace-nowrap">
+                                        {{ number_format($file['bytes'] / 1024, 1) }} KB
+                                    </td>
+                                </tr>
+                            @endforeach
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </details>
+    @endif
+
+    {{-- The transaction lines the report actually consumed --}}
+    @if (!empty($sourceRows) || $sourceSummary['n'] > 0)
+        <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm">
+            <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
+                Source transactions
+                <span class="ml-2 font-normal text-slate-500">
+                    {{ number_format($sourceSummary['n']) }} row(s) in scope
+                    · {{ number_format($sourceSummary['n_tracker_tagged']) }} tracker-tagged
+                    across {{ number_format($sourceSummary['n_trackers']) }} tracker(s)
+                    · net {{ number_format($sourceSummary['net_dollars'], 2) }}
+                </span>
+            </summary>
+
+            <div class="border-t border-slate-200 px-5 py-4">
+                <p class="mb-3 text-xs text-slate-500">
+                    These are the lines the report consumed — same in-scope predicate as the
+                    report itself (farm, cohort, basis, period, and the actuals/forecast
+                    horizon split), so this is not a re-derived approximation.
+                    <strong>Amount (raw)</strong> is the stored fixed-point integer:
+                    revenue is a credit and therefore negative, expenses positive.
+                    <br>
+                    The <strong>Tracker</strong> column is the division this report turns on — a
+                    tagged line feeds its tracker's own section, an untagged one feeds the
+                    farm-level <code class="rounded bg-slate-100 px-1">other_income</code> /
+                    <code class="rounded bg-slate-100 px-1">direct_costs</code> /
+                    <code class="rounded bg-slate-100 px-1">operating_expenses</code> /
+                    <code class="rounded bg-slate-100 px-1">gst</code> sections.
+                    @if ($sourceSummary['n'] > count($sourceRows))
+                        <br>Showing the first {{ number_format(count($sourceRows)) }}
+                        of {{ number_format($sourceSummary['n']) }} rows.
+                    @endif
+                </p>
+
+                <div class="max-h-96 overflow-auto">
+                    <table class="min-w-full text-xs">
+                        <thead class="sticky top-0 bg-white">
+                            <tr class="border-b border-slate-200 text-left text-slate-600">
+                                <th class="py-1.5 pr-4 font-medium">Date</th>
+                                <th class="py-1.5 pr-4 font-medium">Type</th>
+                                <th class="py-1.5 pr-4 font-medium">Account</th>
+                                <th class="py-1.5 pr-4 font-medium">Category</th>
+                                <th class="py-1.5 pr-4 font-medium">Tracker</th>
+                                <th class="py-1.5 pr-4 text-right font-medium">Amount (raw)</th>
+                                <th class="py-1.5 pr-4 text-right font-medium">Dollars</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach ($sourceRows as $row)
+                                @php $dollars = (float) (string) $row['amount_dollars']; @endphp
+                                <tr class="border-b border-slate-100">
+                                    <td class="py-1 pr-4 font-mono whitespace-nowrap">{{ $row['date'] }}</td>
+                                    <td class="py-1 pr-4 whitespace-nowrap">
+                                        <span class="rounded px-1.5 py-0.5
+                                            {{ $row['type'] === 'actuals' ? 'bg-sky-100 text-sky-800' : 'bg-violet-100 text-violet-800' }}">
+                                            {{ $row['type'] }}
+                                        </span>
+                                    </td>
+                                    <td class="py-1 pr-4 whitespace-nowrap">{{ $row['account_name'] }}</td>
+                                    <td class="py-1 pr-4 font-mono whitespace-nowrap">{{ $row['account_category'] }}</td>
+                                    <td class="py-1 pr-4 whitespace-nowrap">
+                                        @if (empty($row['tracker_id']))
+                                            <span class="text-slate-400">farm-level</span>
+                                        @else
+                                            <span class="rounded bg-indigo-100 px-1.5 py-0.5 text-indigo-800">
+                                                {{ $row['tracker_name'] ?? $row['tracker_id'] }}
+                                            </span>
+                                        @endif
+                                    </td>
+                                    <td class="py-1 pr-4 text-right tabular-nums whitespace-nowrap
+                                               {{ $dollars < 0 ? 'text-red-700' : '' }}">
+                                        {{ number_format((int) (string) $row['amount_raw']) }}
+                                    </td>
+                                    <td class="py-1 pr-4 text-right tabular-nums whitespace-nowrap
+                                               {{ $dollars < 0 ? 'text-red-700' : '' }}">
+                                        {{ number_format($dollars, 2) }}
+                                    </td>
+                                </tr>
+                            @endforeach
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </details>
+    @endif
+
     {{-- Generated SQL --}}
     @if ($sql)
         <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm">

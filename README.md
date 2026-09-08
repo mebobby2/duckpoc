@@ -7,7 +7,7 @@ concept, ahead of a possible rewrite of Figured's reporting engine.
 Phase 1 is done: Figured's **Cash Flow report runs as a single DuckDB query**
 over DuckLake/Parquet in GCS, and its output matches the real Figured report
 cell for cell (see the oracle section below). There's a browser viewer for it
-on `http://localhost:8080`.
+at `/cashflow`.
 
 Phase 1b is done too, and it is the more interesting result. The volume test
 (880K journals, ~1.7s) turned out to measure the axis that was never the
@@ -119,7 +119,9 @@ enough volume for multiple row groups, i.e. the 800K scale test.
 | `duckdb:tracker:seed` | Seeds 3 farms x 200K journals differing only in tracker count (1/10/50) |
 | `duckdb:tracker:curve` | Measures report time against tracker count, volume held constant |
 
-Two report viewers, both at `http://localhost:8080`:
+The root URL (`/`) is an index of the reports below.
+
+Two report viewers:
 
 | Page | What |
 |---|---|

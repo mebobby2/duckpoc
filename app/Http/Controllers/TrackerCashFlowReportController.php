@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
+use App\Services\CashFlow\ParquetFileLister;
 use App\Services\CashFlow\TrackerCashFlowQuery;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -27,6 +28,9 @@ use Throwable;
 class TrackerCashFlowReportController extends Controller
 {
     private const string DEFAULT_FARM_ID = 'tracker-farm-50';
+
+    /** Source rows shown in the viewer before truncating. */
+    private const int SOURCE_ROW_LIMIT = 500;
 
     /**
      * Spans the actuals/forecast boundary the seeder creates (actuals through
@@ -56,6 +60,9 @@ class TrackerCashFlowReportController extends Controller
 
         $rows = [];
         $trackerRows = [];
+        $sourceRows = [];
+        $sourceSummary = ['n' => 0, 'n_tracker_tagged' => 0, 'n_trackers' => 0, 'net_dollars' => 0.0];
+        $files = [];
         $error = null;
         $reportMs = null;
         $detailMs = null;
@@ -81,6 +88,14 @@ class TrackerCashFlowReportController extends Controller
                 $startedAt = microtime(true);
                 $trackerRows = $query->trackerDetail(...$scope);
                 $detailMs = (microtime(true) - $startedAt) * 1000;
+
+                // Diagnostics, measured separately so they cannot inflate the
+                // two timings above — those are the numbers under test.
+                $sourceSummary = $query->sourceRowSummary(...$scope);
+                $sourceRows = $query->sourceRows(...$scope, limit: self::SOURCE_ROW_LIMIT);
+
+                $files = (new ParquetFileLister($db, $alias))
+                    ->forQuery($farm, $periodFrom, $periodTo);
             } catch (Throwable $e) {
                 $error = $e->getMessage();
             }
@@ -103,6 +118,10 @@ class TrackerCashFlowReportController extends Controller
             'error' => $error,
             'reportMs' => $reportMs,
             'detailMs' => $detailMs,
+            'sourceRows' => $sourceRows,
+            'sourceSummary' => $sourceSummary,
+            'sourceRowLimit' => self::SOURCE_ROW_LIMIT,
+            'files' => $files,
             'trackerCount' => $farm === null ? 0 : $this->trackerCount($farm['farm_id']),
         ]);
     }

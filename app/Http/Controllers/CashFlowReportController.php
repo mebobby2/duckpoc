@@ -6,6 +6,7 @@ namespace App\Http\Controllers;
 
 use App\Services\CashFlow\CashFlowOracleSeeder;
 use App\Services\CashFlow\CashFlowQuery;
+use App\Services\CashFlow\ParquetFileLister;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\View\View;
@@ -92,7 +93,8 @@ class CashFlowReportController extends Controller
                     limit: self::SOURCE_ROW_LIMIT,
                 );
 
-                $files = $this->parquetFiles($db, $alias, $farm, $periodFrom, $periodTo);
+                $files = (new ParquetFileLister($db, $alias))
+                    ->forQuery($farm, $periodFrom, $periodTo);
             } catch (Throwable $e) {
                 $error = $e->getMessage();
             }
@@ -116,80 +118,6 @@ class CashFlowReportController extends Controller
             'sourceRowLimit' => self::SOURCE_ROW_LIMIT,
             'files' => $files,
         ]);
-    }
-
-    /**
-     * Parquet files DuckLake holds for the tables this report reads, annotated
-     * with whether each one's partition is in scope for the current query.
-     *
-     * "In scope" is derived from the partition path, not from DuckDB's query
-     * plan — so it says which files the partition predicate *should* let it
-     * skip, which is not a promise about what it physically opened. Worth
-     * knowing when reading this: measurement in this PoC showed
-     * `farm_type`/`region` pruning working but the `year(date)` transform not
-     * pruning at all, so DuckDB likely reads more year partitions than the
-     * in-scope flag suggests.
-     *
-     * @param array<string, mixed> $farm
-     * @return list<array<string, mixed>>
-     */
-    private function parquetFiles(
-        DuckDB $db,
-        string $alias,
-        array $farm,
-        string $periodFrom,
-        string $periodTo,
-    ): array {
-        $fromYear = (int) date('Y', strtotime($periodFrom));
-        $toYear = (int) date('Y', strtotime($periodTo));
-
-        $files = [];
-
-        // transaction_lines only — accounts and farms are MySQL tables now, so
-        // they have no Parquet footprint at all.
-        foreach (['transaction_lines'] as $table) {
-            try {
-                $listed = $db->query(
-                    "SELECT data_file, data_file_size_bytes, delete_file
-                     FROM ducklake_list_files('{$alias}', '{$table}')"
-                )->rows(true);
-            } catch (Throwable) {
-                continue;
-            }
-
-            foreach ($listed as $row) {
-                $path = (string) $row['data_file'];
-
-                $partition = null;
-                $inScope = true;
-
-                if (preg_match('~/(farm_type=[^/]+)/(region=[^/]+)/(year=[^/]+)/~', $path, $m)) {
-                    $partition = "{$m[1]}/{$m[2]}/{$m[3]}";
-
-                    $year = (int) substr($m[3], strlen('year='));
-
-                    $inScope = $m[1] === 'farm_type='.$farm['farm_type']
-                        && $m[2] === 'region='.$farm['region']
-                        && $year >= $fromYear
-                        && $year <= $toYear;
-                }
-
-                $files[] = [
-                    'table' => $table,
-                    'partition' => $partition,
-                    'name' => basename($path),
-                    'path' => $path,
-                    'bytes' => (int) $row['data_file_size_bytes'],
-                    'has_delete_file' => !empty($row['delete_file']),
-                    'in_scope' => $inScope,
-                ];
-            }
-        }
-
-        usort($files, static fn (array $a, array $b): int => [$b['in_scope'], $a['table'], (string) $a['partition']]
-            <=> [$a['in_scope'], $b['table'], (string) $b['partition']]);
-
-        return $files;
     }
 
     /**

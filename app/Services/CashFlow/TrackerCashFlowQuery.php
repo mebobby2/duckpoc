@@ -89,6 +89,60 @@ final class TrackerCashFlowQuery
         return iterator_to_array($statement->execute()->rows(true));
     }
 
+    /**
+     * The individual transaction lines the report consumed.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function sourceRows(
+        string $farmId,
+        string $farmType,
+        string $region,
+        string $periodFrom,
+        string $periodTo,
+        string $horizon,
+        string $basis = 'cash',
+        int $limit = 500,
+    ): array {
+        $statement = $this->db->preparedStatement($this->builder()->buildSourceRowsSql());
+
+        $this->bindScope($statement, $farmId, $farmType, $region, $periodFrom, $periodTo, $horizon, $basis);
+
+        // Type left to inference, unlike the scope params: DuckDB infers an
+        // integer for LIMIT and forcing VARCHAR fails outright.
+        $statement->bindParam('row_limit', $limit);
+
+        return iterator_to_array($statement->execute()->rows(true));
+    }
+
+    /**
+     * @return array{n: int, n_tracker_tagged: int, n_trackers: int, net_dollars: float}
+     */
+    public function sourceRowSummary(
+        string $farmId,
+        string $farmType,
+        string $region,
+        string $periodFrom,
+        string $periodTo,
+        string $horizon,
+        string $basis = 'cash',
+    ): array {
+        $statement = $this->db->preparedStatement($this->builder()->buildSourceRowCountSql());
+
+        $this->bindScope($statement, $farmId, $farmType, $region, $periodFrom, $periodTo, $horizon, $basis);
+
+        $row = iterator_to_array($statement->execute()->rows(true))[0] ?? [];
+
+        // Cast via string: DuckDB's aggregate types come back as LongInteger
+        // objects the driver will not cast to int directly.
+        return [
+            'n' => (int) (string) ($row['n'] ?? 0),
+            'n_tracker_tagged' => (int) (string) ($row['n_tracker_tagged'] ?? 0),
+            'n_trackers' => (int) (string) ($row['n_trackers'] ?? 0),
+            'net_dollars' => (float) (string) ($row['net_dollars'] ?? 0),
+        ];
+    }
+
     public function sql(): string
     {
         return $this->builder()->build();

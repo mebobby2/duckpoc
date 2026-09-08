@@ -259,6 +259,69 @@ final class TrackerReportSqlBuilder
     }
 
     /**
+     * The individual transaction lines the report consumed, for display.
+     *
+     * Same in-scope predicate as the report, so this is genuinely what fed the
+     * numbers rather than a re-derived approximation. Carries `tracker_id` and
+     * the tracker name from MySQL — on this page the interesting question is
+     * which lines are tracker-attributed and which are farm-level, since that
+     * split is what decides whether a line lands in a per-tracker section or
+     * the consolidated one.
+     *
+     * A LEFT JOIN to `trackers`, not an inner one: most lines legitimately
+     * have no tracker, and an inner join would silently hide exactly the
+     * farm-level rows this listing exists to make visible.
+     */
+    public function buildSourceRowsSql(): string
+    {
+        $fp = self::FIXED_POINT;
+
+        return <<<SQL
+            SELECT
+                tl.line_id,
+                tl.date,
+                tl.type,
+                tl.basis,
+                a.account_id,
+                a.account_name,
+                a.account_class,
+                a.account_category,
+                tl.tracker_id,
+                t.tracker_name,
+                t.stock_type,
+                tl.amount AS amount_raw,
+                tl.amount / {$fp}.0 AS amount_dollars
+            FROM {$this->alias}.transaction_lines tl
+            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
+            LEFT JOIN {$this->appAlias}.trackers t ON t.tracker_id = tl.tracker_id
+            {$this->inScopePredicate()}
+            ORDER BY tl.date, tl.line_id
+            LIMIT \$row_limit
+            SQL;
+    }
+
+    /**
+     * Totals across everything in scope, so the viewer can say how much it is
+     * not showing when the listing truncates — split by tracker-attributed vs
+     * farm-level, which is the division this report turns on.
+     */
+    public function buildSourceRowCountSql(): string
+    {
+        $fp = self::FIXED_POINT;
+
+        return <<<SQL
+            SELECT
+                count(*) AS n,
+                count(tl.tracker_id) AS n_tracker_tagged,
+                count(DISTINCT tl.tracker_id) AS n_trackers,
+                sum(tl.amount) / {$fp}.0 AS net_dollars
+            FROM {$this->alias}.transaction_lines tl
+            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
+            {$this->inScopePredicate()}
+            SQL;
+    }
+
+    /**
      * The per-tracker breakdown, for display under the consolidated report.
      *
      * A second query, and deliberately so: it returns months x trackers rows
