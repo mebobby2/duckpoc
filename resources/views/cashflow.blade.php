@@ -3,14 +3,14 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Cash Flow — DuckDB PoC</title>
+    <title>Cash Flow</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900">
 <div class="mx-auto max-w-7xl px-6 py-8">
 
     <header class="mb-8">
-        <h1 class="text-2xl font-semibold">Cash Flow — DuckDB PoC</h1>
+        <h1 class="text-2xl font-semibold">Cash Flow</h1>
         <p class="mt-1 text-sm text-slate-600">
             Figured's Cash Flow report computed as a single DuckDB query over DuckLake/Parquet in GCS.
         </p>
@@ -136,16 +136,6 @@
                 </tbody>
             </table>
         </div>
-    @endif
-
-    {{-- The generated SQL --}}
-    @if ($sql)
-        <details class="mt-6 rounded-lg border border-slate-200 bg-white shadow-sm">
-            <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
-                Generated DuckDB SQL
-            </summary>
-            <pre class="overflow-x-auto border-t border-slate-200 bg-slate-900 p-4 text-xs leading-relaxed text-slate-100"><code>{{ $sql }}</code></pre>
-        </details>
     @endif
 
     {{-- Parquet files DuckLake holds for the tables this report reads --}}
@@ -292,6 +282,17 @@
             </div>
         </details>
     @endif
+
+    {{-- The generated SQL --}}
+    @if ($sql)
+        <details class="mt-6 rounded-lg border border-slate-200 bg-white shadow-sm">
+            <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
+                Generated DuckDB SQL
+            </summary>
+            <pre class="overflow-x-auto border-t border-slate-200 bg-slate-900 p-4 text-xs leading-relaxed text-slate-100"><code>{{ $sql }}</code></pre>
+        </details>
+    @endif
+
 
     <footer class="mt-8 text-xs text-slate-500">
         <p>
