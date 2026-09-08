@@ -196,6 +196,67 @@ enough to force multiple row groups, but not yet at the real Phase 1 target
 (one ~800K-row "hero" farm alongside several smaller farms across multiple
 cohorts) — that's the actual stress test this design still needs.
 
+## The Cash Flow parity oracle (Phase 1, Step 2)
+
+Captured by running a minimal, hand-built scenario through Figured's real V2
+`CashFlowStructureBuilder` + `ReportRunnerService`, and independently through
+the widget path (`ReportWidgetDataGeneratorService`) that actually feeds
+Reporting Studio's UI. Both agree.
+
+**Scenario** — calendar-year farm (`season_year_end_month = 12`), two
+accounts, four transactions, 12 monthly intervals, `ACTUALS_FORECAST` with
+the horizon at 2024-02-28 (Jan/Feb actual, Mar-Dec forecast):
+
+| Account | Basis | Type | Date | Amount as seeded |
+|---|---|---|---|---|
+| Revenue "DuckPoc Sales" | cash | actuals | 2024-01-15 | **−1000.00** |
+| Expense "DuckPoc Wages" | cash | actuals | 2024-01-20 | +200.00 |
+| Revenue "DuckPoc Sales" | cash | forecast | 2024-08-15 | **−500.00** |
+| Expense "DuckPoc Wages" | cash | forecast | 2024-08-20 | +100.00 |
+
+**Verified expected output** (dollars, per month Jan→Dec):
+
+```
+income:             [1000, 0,0,0,0,0,0,  500, 0,0,0,0]
+operating_expenses: [ 200, 0,0,0,0,0,0,  100, 0,0,0,0]
+gross_profit:       [1000, 0,0,0,0,0,0,  500, 0,0,0,0]
+operating_surplus:  [ 800, 0,0,0,0,0,0,  400, 0,0,0,0]
+net_cash_movement:  [ 800, 0,0,0,0,0,0,  400, 0,0,0,0]
+opening:            [   0, 800,800,800,800,800,800, 800, 1200,1200,1200,1200]
+closing:            [ 800, 800,800,800,800,800,800, 1200,1200,1200,1200,1200]
+```
+
+### THE sign rule — get this wrong and every number is wrong
+
+**Revenue must be seeded NEGATIVE (credit); expenses POSITIVE (debit).**
+This matches Xero's own journal convention ("positive value for a debit and
+negative for a credit") — which makes sense, since Figured's actuals are
+synced from Xero journals and inherit their signs.
+
+Documented in Figured's own
+`src/Figured/Packages/Development/RealisticFarms/REALISTIC_FARMS_README.md` §6:
+
+> "Revenue must be stored as credits (negative). No pipeline inverts amounts
+> when `absolute` is false — pass revenue negative for both actuals and
+> forecasts, or income renders sign-flipped."
+
+**This was learned the hard way in this PoC.** A first pass at this oracle
+seeded revenue as *positive* `+1000`. Nothing inverted it, so it stored
+positive, and the report's display layer (which flips revenue-class accounts —
+`XeroAccount::isAccountInversedForUser()` returns true for `REVENUE` only)
+rendered income as `−1000`. That cascaded: `operating_surplus` came out as
+`−1000 − 200 = −1200` instead of `+800`, and closing balances read `−1200 /
+−1800` instead of `800 / 1200`. Every layer of the engine agreed with itself,
+because the engine was correct — the *input* was malformed. The bad numbers
+looked plausible and survived three independent verification passes before
+the README line above surfaced the actual cause.
+
+Lesson for the DuckDB translation: `transaction_lines.amount` must carry the
+same signed convention (revenue negative, expense positive). Seeding
+"intuitive positive dollars" for revenue will produce a report that is
+wrong by `2 ×` the revenue figure, in a way that still looks internally
+consistent.
+
 ## Catalog backend choice
 
 Defaults to **SQLite** (`DUCKLAKE_CATALOG_DRIVER=sqlite`), per DuckLake's own
