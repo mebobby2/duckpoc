@@ -28,6 +28,7 @@ docker compose up -d                 # mysql + the report viewer on :8080
 docker compose run --rm app php artisan duckdb:cashflow:schema   # create tables
 docker compose run --rm app php artisan duckdb:cashflow:seed     # seed the oracle scenario
 docker compose run --rm app php artisan duckdb:cashflow:run      # run + parity-check
+docker compose run --rm app php artisan duckdb:cashflow:flush    # write inlined rows out to Parquet
 ```
 
 Then open **http://localhost:8080** for the browser viewer.
@@ -50,6 +51,51 @@ Negative values render bracketed (`(1,200.00)`) and zero as `–`, matching
 Figured's own `reportNumberFormat.js`. The oracle scenario has no negatives,
 so that path is written-but-unexercised.
 
+### Flushing inlined data to Parquet
+
+```bash
+docker compose run --rm app php artisan duckdb:cashflow:flush
+```
+
+**Nothing flushes on its own.** DuckLake sends small inserts (10 rows or
+fewer, by default) to the catalog database instead of writing a Parquet file
+per insert — deliberately, so transactional-scale writes don't each pay a
+round trip to object storage. There is no background compaction and no timer.
+Inlined rows become Parquet only when a single insert clears the threshold, or
+when you run the command above.
+
+The oracle scenario is 4 transaction lines, 2 accounts and 1 farm, so **every
+one of its inserts is under the threshold** — before flushing, the GCS bucket
+holds nothing for these tables and all the data lives in
+`storage/ducklake/catalog.sqlite`.
+
+Crucially, **queries are correct either way**: DuckLake reads inlined rows and
+Parquet as one table, so the report passed all 84 parity cells while the
+bucket was still empty. That is the trap — a green parity run proves the
+*calculation*, not the *storage*. Partition pruning and row-group statistics
+need files to prune, so run the flush when you want to verify the storage
+layer rather than the maths.
+
+After flushing, the layout in the bucket is:
+
+```
+main/transaction_lines/farm_type=dairy/region=waikato/year=2024/ducklake-….parquet
+main/accounts/ducklake-….parquet
+main/farms/ducklake-….parquet
+```
+
+Only `transaction_lines` is partitioned — it is the only table with
+`SET PARTITIONED BY` on it. The dimension tables are small and always read
+whole. Verify with:
+
+```bash
+gcloud storage ls -r "gs://<bucket>/<prefix>/main/transaction_lines/"
+```
+
+Note that a single file in a single partition still does not exercise
+*pruning* — there is nothing to prune away. That needs multiple cohorts and
+enough volume for multiple row groups, i.e. the 800K scale test.
+
 ### Commands
 
 | Command | What |
@@ -58,6 +104,7 @@ so that path is written-but-unexercised.
 | `duckdb:cashflow:schema` | Creates/recreates the Cash Flow tables (destructive) |
 | `duckdb:cashflow:seed` | Seeds the 4-line parity oracle scenario |
 | `duckdb:cashflow:run` | Runs the report as DuckDB SQL and diffs it against the oracle |
+| `duckdb:cashflow:flush` | Writes DuckLake's inlined rows out to Parquet and lists the resulting partition paths |
 
 With `GCS_BUCKET` left empty in `.env`, this runs entirely locally (SQLite
 catalog under `storage/ducklake/`, Parquet data under
