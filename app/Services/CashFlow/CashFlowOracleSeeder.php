@@ -24,9 +24,17 @@ use Saturio\DuckDB\DuckDB;
  */
 final class CashFlowOracleSeeder
 {
-    public const string FARM_ID = 'oracle-farm';
+    public const string FARM_ID = 'cashflow-oracle-farm';
     public const string FARM_TYPE = 'dairy';
     public const string REGION = 'waikato';
+
+    /**
+     * Farm ids this seeder used to write under. Cleared alongside the current
+     * one so a rename doesn't leave rows behind that no seeder owns any more —
+     * DuckLake has no foreign keys or cascade, so orphans just sit there and
+     * quietly inflate the cohort partition.
+     */
+    private const array LEGACY_FARM_IDS = ['oracle-farm'];
 
     /** Fixed-point multiplier — matches Figured's TEN_THOUSAND convention. */
     private const int FIXED_POINT = 10000;
@@ -47,10 +55,16 @@ final class CashFlowOracleSeeder
 
     private function clearExisting(): void
     {
-        $farmId = self::FARM_ID;
+        $farmIds = implode(
+            ', ',
+            array_map(
+                static fn (string $id): string => "'".str_replace("'", "''", $id)."'",
+                [self::FARM_ID, ...self::LEGACY_FARM_IDS],
+            ),
+        );
 
-        $this->db->query("DELETE FROM {$this->alias}.transaction_lines WHERE farm_id = '{$farmId}'");
-        $this->db->query("DELETE FROM {$this->alias}.farms WHERE farm_id = '{$farmId}'");
+        $this->db->query("DELETE FROM {$this->alias}.transaction_lines WHERE farm_id IN ({$farmIds})");
+        $this->db->query("DELETE FROM {$this->alias}.farms WHERE farm_id IN ({$farmIds})");
         $this->db->query("DELETE FROM {$this->alias}.accounts WHERE account_id IN ('acc-sales', 'acc-wages')");
     }
 

@@ -103,8 +103,122 @@ enough volume for multiple row groups, i.e. the 800K scale test.
 | `duckdb:test` | Smoke-tests the DuckDB → DuckLake → GCS chain end to end |
 | `duckdb:cashflow:schema` | Creates/recreates the Cash Flow tables (destructive) |
 | `duckdb:cashflow:seed` | Seeds the 4-line parity oracle scenario |
+| `duckdb:cashflow:seed-scale` | Seeds ~880K synthetic lines across 3 cohorts for the scale test |
 | `duckdb:cashflow:run` | Runs the report as DuckDB SQL and diffs it against the oracle |
 | `duckdb:cashflow:flush` | Writes DuckLake's inlined rows out to Parquet and lists the resulting partition paths |
+
+## Scale test results — the headline finding
+
+Seeded 880,000 transaction lines across 5 farms in 3 `(farm_type, region)`
+cohorts, which DuckLake wrote as **41 Parquet files across 24 partitions**
+(3 cohorts × 8 years). Bulk inserts bypass inlining entirely, so no flush was
+needed. Seed time: 47s.
+
+The hero farm shares a cohort with the oracle farm deliberately, so the
+oracle's parity check became a find-4-rows-inside-820,004 test. **It still
+passes all 84 cells.** Correctness holds at volume.
+
+### DuckDB's compute is genuinely fast
+
+Same query, three consecutive calls in one process:
+
+| Farm | call 1 | call 2 | call 3 |
+|---|---|---|---|
+| oracle (4 rows) | 1,079 ms | **19 ms** | **18 ms** |
+| isolated cohort (20K rows) | 3,766 ms | **20 ms** | **19 ms** |
+| hero (800K rows) | 6,082 ms | **31 ms** | **29 ms** |
+
+A full 12-month Cash Flow over an 800K-row farm in **~30 ms** — only ~10 ms
+more than the 4-row case. The earlier inference that "800K rows is nothing for
+DuckDB" is now measured rather than assumed.
+
+### The cold-start cost, and where it actually comes from
+
+Three real HTTP requests to the viewer, hero farm:
+
+```
+request 1: 6.26s     request 2: 6.21s     request 3: 5.85s
+```
+
+**No warm-up** — each request builds a fresh DuckDB instance, so nothing
+survives between requests and every page load re-reads Parquet from GCS.
+
+The cause is **per-file GCS latency**, and it is latency-bound rather than
+bandwidth-bound. Reading four distinct files cold through DuckDB's httpfs:
+
+| File | Cold read | Rows in file |
+|---|---|---|
+| 1 | 1,327 ms | 4 |
+| 2 | 1,048 ms | 100,000 |
+| 3 | 843 ms | 100,000 |
+| 4 | 875 ms | 100,000 |
+
+**A 4-row file costs the same as a 100,000-row file** — so the cost is per
+object, not per byte. ~900 ms × the number of files a query touches is the
+whole page-load budget.
+
+Breaking one cold request into phases (oracle farm — four rows):
+
+```
+connect/attach :    86 ms
+farms listing  : 3,073 ms     <- a SIX-row table
+report query   : 5,207 ms
+```
+
+The `farms` listing taking 3 s for six rows is the clearest illustration:
+volume is irrelevant, file count and per-object latency are everything.
+
+**Why this looked like a regression from the mass seed, but wasn't.** Page
+loads measured ~258–404 ms earlier in the PoC. Those measurements were taken
+*before* `duckdb:cashflow:flush` — all data was still inlined in the local
+SQLite catalog, so the queries did **zero** GCS reads. The slowdown came from
+data moving local → remote, not from row count. The bucket's region
+(`us-central1`, far from NZ) inflates the per-object figure, but cannot
+explain the change, since it was the same bucket before and after.
+
+### Partition pruning: `farm_type`/`region` yes, `year(date)` no
+
+Two tests, both cold:
+
+**1. Widening the date span should read ~8× the files if year pruning works:**
+
+| Span | Time |
+|---|---|
+| 1 year (2024) | 13,234 ms |
+| 8 years (2018–2025) | 10,716 ms |
+
+The wider query was *faster*. No pruning effect.
+
+**2. Adding the partition expression explicitly should prune if it can:**
+
+| Predicate | Cold time | Rows |
+|---|---|---|
+| `date BETWEEN …` only | 4,674 ms | 102,504 |
+| `+ year(date) = 2024` | 5,423 ms | 102,504 |
+
+Identical results, no improvement — the difference is noise.
+
+**Conclusion: DuckLake is not pruning on the `year(date)` transform**, from
+either a date range or an explicit predicate on the expression. Cohort
+pruning does appear to work — the isolated `sheep/otago` cohort (8 files) read
+cold in 3,766 ms versus 6,082 ms for `dairy/waikato` (17 files) — which is
+consistent with plain-column partition keys pruning while transform keys do
+not.
+
+**Design implication, and it is a real one:** if `year(date)` does not prune,
+partitioning by it multiplies file count 8× for no read benefit — and since
+cost is per-file, that is actively harmful. Worth testing before Phase 2:
+store an explicit `year` INTEGER column and partition on that plain column
+instead of the transform, or drop year from the partition key entirely.
+
+### A seeder bug worth recording
+
+The first scale seed produced an uneven year spread (55K/95K/105K instead of
+100K) and spilled into a spurious ninth year, giving a 7/16–9/16
+actuals/forecast split instead of 50/50. Cause: **DuckDB's `/` is float
+division** — `SELECT 21/20` returns `1.05`, so `(i / 20) % 8` never cycled
+cleanly. Fixed by using `//` (integer division); the re-seed produced exactly
+440,000 / 440,000.
 
 With `GCS_BUCKET` left empty in `.env`, this runs entirely locally (SQLite
 catalog under `storage/ducklake/`, Parquet data under
