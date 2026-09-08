@@ -242,7 +242,7 @@ volume is irrelevant, file count and per-object latency are everything.
 **Why this looked like a regression from the mass seed, but wasn't.** Page
 loads measured ~258–404 ms earlier in the PoC. Those measurements were taken
 *before* `duckdb:cashflow:flush` — all data was still inlined in the local
-SQLite catalog, so the queries did **zero** GCS reads. The slowdown came from
+local file catalog, so the queries did **zero** GCS reads. The slowdown came from
 data moving local → remote, not from row count. The bucket's region
 (`us-central1`, far from NZ) inflates the per-object figure, but cannot
 explain the change, since it was the same bucket before and after.
@@ -326,7 +326,7 @@ division** — `SELECT 21/20` returns `1.05`, so `(i / 20) % 8` never cycled
 cleanly. Fixed by using `//` (integer division); the re-seed produced exactly
 440,000 / 440,000.
 
-With `GCS_BUCKET` left empty in `.env`, this runs entirely locally (SQLite
+With `GCS_BUCKET` left empty in `.env`, this runs entirely locally (file
 catalog under `storage/ducklake/`, Parquet data under
 `storage/ducklake/data/`) — **zero cloud setup required** to confirm the
 mechanics work.
@@ -363,6 +363,31 @@ independently readable back via `read_parquet()`.
 
 ## Real gotchas hit while building this (all fixed, documented here so they don't get rediscovered)
 
+0. **`catalog.sqlite` is not SQLite, and deleting it orphans the whole lake.**
+   Two traps in one file.
+
+   The attach string is `ducklake:<path>` with no `sqlite:` prefix, so DuckLake
+   uses its default metadata backend, which is **DuckDB**. The file begins with
+   the magic bytes `DUCKD`; `sqlite3` and PDO's sqlite driver both reject it
+   with "file is not a database". The `sqlite` driver label and the `.sqlite`
+   extension are both misnomers. Inspect it with DuckDB instead:
+
+   ```sql
+   ATTACH 'storage/ducklake/catalog.sqlite' AS c (READ_ONLY);
+   SELECT value FROM c.ducklake_metadata WHERE key = 'data_path';
+   SELECT count(*) FROM c.ducklake_data_file;
+   ```
+
+   More importantly it is the **only** record of what the bucket contains —
+   schemas, the Parquet file list, partition values, snapshots. Delete it and
+   every Parquet object in GCS is orphaned: the data survives, but nothing can
+   find it, and there is no rebuild-from-bucket command. Back it up before any
+   experiment that might clobber it.
+
+   Note that MySQL being attached does **not** make MySQL the catalog. MySQL
+   holds the *dimension* tables (`farms`, `accounts`) as the `appdb` alias;
+   the catalog is entirely separate. Easy and expensive to conflate.
+
 1. **`ext-ffi` isn't in the base `php:8.3-cli` image.** It has to be compiled
    from source against `libffi-dev` — see `docker/php/Dockerfile`. Just
    running `docker-php-ext-enable ffi` fails with "module does not exist".
@@ -386,7 +411,7 @@ independently readable back via `read_parquet()`.
    anything — see `config/duckdb.php` → `DuckLakeConnectionFactory`.
 
 5. **DuckLake does not create missing parent directories.** Attaching a
-   SQLite catalog (or using a local, non-`gs://` `DATA_PATH`) whose
+   file catalog (or using a local, non-`gs://` `DATA_PATH`) whose
    directory doesn't exist yet fails with a raw IO error rather than
    creating it. `DuckLakeConnectionFactory::ensureCatalogAndDataDirectoriesExist()`
    handles this — found by actually running it, not by reading docs.
@@ -559,8 +584,13 @@ consistent.
 
 ## Catalog backend choice
 
-Defaults to **SQLite** (`DUCKLAKE_CATALOG_DRIVER=sqlite`), per DuckLake's own
-documented recommendation for local, single-writer PoCs. Postgres and MySQL
+Defaults to a **local file catalog** (`DUCKLAKE_CATALOG_DRIVER=sqlite`), per
+DuckLake's own documented recommendation for local, single-writer PoCs.
+
+Despite the driver name and the `.sqlite` filename, that file is a **DuckDB**
+database, not SQLite — see gotcha 0. The single-writer limitation that blocks
+compaction while the web container is running is therefore DuckDB's file lock,
+not SQLite's; same practical effect, different cause. Postgres and MySQL
 are both wired up as alternatives (see `config/duckdb.php`), but **MySQL as
 a DuckLake catalog has a currently-open bug**
 ([duckdb/ducklake#214](https://github.com/duckdb/ducklake/issues/214)) — use
@@ -586,7 +616,7 @@ if either errors.
 - The report rendering in a browser end to end, over real GCS-backed DuckLake, in ~400 ms per request including the full DuckDB setup/attach cycle
 
 **Not yet verified:**
-- Postgres or MySQL as the DuckLake catalog backend (SQLite remains the default per DuckLake's own PoC guidance)
+- Postgres or MySQL as the DuckLake catalog backend (a local DuckDB file remains the default per DuckLake's own PoC guidance)
 - Anything at actual data volume — this proves correctness, not performance at scale (though real per-farm row counts gathered separately — Figured's largest farms run ~180K–800K total journal rows — suggest single-farm query volume is not a meaningful performance risk for DuckDB regardless)
 - The `non_operating_income`, `non_operating_expenses`, `non_operating_movements`, `equity_movements` and `gst` sections. These are implemented in `CashFlowQuery` from the structure definition, but the oracle scenario has no accounts in them, so their sign handling — the last three are `setInverse(true)` sections — is written-but-unexercised. Deliberately left that way: the PoC's open question is DuckDB's performance and the multi-dimensional VJ problem, not exhaustive section coverage. GST is the one most likely to matter on real data.
 - Negative-value display (bracketed) in the viewer — no negatives in the oracle scenario

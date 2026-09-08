@@ -24,10 +24,24 @@ return [
         'driver' => env('DUCKLAKE_CATALOG_DRIVER', 'sqlite'),
 
         'connections' => [
+            // Named `sqlite` for the env-var contract, but the file this
+            // produces is a **DuckDB** database, not SQLite. The attach string
+            // is `ducklake:<path>` with no `sqlite:` prefix, so DuckLake uses
+            // its default metadata backend — DuckDB. Verified by magic bytes:
+            // the file begins `DUCKD`, and opening it with PDO's sqlite driver
+            // fails with "file is not a database".
+            //
+            // The `.sqlite` filename is therefore a misnomer kept for
+            // continuity. Do not reach for sqlite3 or PDO to inspect this file;
+            // read it with DuckDB:
+            //   ATTACH 'storage/ducklake/catalog.sqlite' AS c (READ_ONLY);
+            //   SELECT value FROM c.ducklake_metadata WHERE key = 'data_path';
+            //
+            // It is also the single source of truth for what lives in the
+            // bucket — schemas, the Parquet file list, partition values and
+            // snapshots. Deleting it orphans every Parquet object in GCS: the
+            // data survives, but nothing can find it.
             'sqlite' => [
-                // A local file catalog — DuckLake manages this as a DuckDB/SQLite
-                // database file. Fine for a single-process PoC; not for concurrent
-                // multi-writer access.
                 'path' => env('DUCKLAKE_CATALOG_SQLITE_PATH', storage_path('ducklake/catalog.sqlite')),
             ],
 
