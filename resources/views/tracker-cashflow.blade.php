@@ -304,8 +304,34 @@
         </details>
     @endif
 
+    {{-- Diagnostics skipped because the report itself was slow --}}
+    @if (!$diagnosticsAffordable)
+        <div class="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-xs text-amber-900">
+            <p class="text-sm font-medium">Source-transaction diagnostics skipped</p>
+            <p class="mt-1">
+                The report took {{ number_format($reportMs, 0) }} ms, over the
+                {{ number_format($diagnosticsBudgetMs, 0) }} ms budget — so this farm's data is large
+                enough that the diagnostics would cost more than the report. They are two further
+                full scans of everything in scope, on top of the two the report already did.
+            </p>
+            <p class="mt-1">
+                On the billion-row farm that was fatal rather than merely slow: four scans exceeded
+                PHP's execution limit, and because <code class="rounded bg-amber-100 px-1">php artisan serve</code>
+                is single-process, the resulting fatal took the whole server down instead of just
+                the request.
+            </p>
+            <p class="mt-2">
+                <a class="font-medium underline"
+                   href="{{ request()->fullUrlWithQuery(['force_diagnostics' => 1]) }}">
+                    Run them anyway
+                </a>
+                — expect it to be slow, and note the timings it reports.
+            </p>
+        </div>
+    @endif
+
     {{-- The transaction lines the report actually consumed --}}
-    @if (!empty($sourceRows) || $sourceSummary['n'] > 0)
+    @if ($diagnosticsAffordable && (!empty($sourceRows) || $sourceSummary['n'] > 0))
         <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm">
             <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
                 Source transactions
@@ -314,6 +340,9 @@
                     · {{ number_format($sourceSummary['n_tracker_tagged']) }} tracker-tagged
                     across {{ number_format($sourceSummary['n_trackers']) }} tracker(s)
                     · net {{ number_format($sourceSummary['net_dollars'], 2) }}
+                    @if ($summaryMs !== null)
+                        · counted in {{ number_format($summaryMs, 0) }} ms
+                    @endif
                 </span>
             </summary>
 
@@ -331,13 +360,34 @@
                     <code class="rounded bg-slate-100 px-1">direct_costs</code> /
                     <code class="rounded bg-slate-100 px-1">operating_expenses</code> /
                     <code class="rounded bg-slate-100 px-1">gst</code> sections.
-                    @if ($sourceSummary['n'] > count($sourceRows))
+                    @if (!$sourceRowsSkipped && $sourceSummary['n'] > count($sourceRows))
                         <br>Showing the first {{ number_format(count($sourceRows)) }}
-                        of {{ number_format($sourceSummary['n']) }} rows.
+                        of {{ number_format($sourceSummary['n']) }} rows@if ($sourceRowsMs !== null), fetched in {{ number_format($sourceRowsMs, 0) }} ms@endif.
                     @endif
                 </p>
 
-                <div class="max-h-96 overflow-auto">
+                @if ($sourceRowsSkipped)
+                    <div class="rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                        <p class="font-medium">Listing skipped — {{ number_format($sourceSummary['n']) }} rows in scope.</p>
+                        <p class="mt-1">
+                            Above {{ number_format($sourceListingMaxRows) }} rows this is opt-in. The listing is
+                            <code class="rounded bg-amber-100 px-1">ORDER BY date LIMIT {{ $sourceRowLimit }}</code>,
+                            which DuckDB answers with a bounded top-N heap — cheap in memory, but still a
+                            full scan of everything in scope. At this volume that means pulling gigabytes
+                            from GCS to render a debug table, which would make the page look slow for a
+                            reason that has nothing to do with the report itself.
+                        </p>
+                        <p class="mt-2">
+                            <a class="font-medium underline"
+                               href="{{ request()->fullUrlWithQuery(['force_source_rows' => 1]) }}">
+                                Load it anyway
+                            </a>
+                            — expect it to be slow, and note the timing it reports.
+                        </p>
+                    </div>
+                @endif
+
+                <div class="max-h-96 overflow-auto {{ $sourceRowsSkipped ? 'hidden' : '' }}">
                     <table class="min-w-full text-xs">
                         <thead class="sticky top-0 bg-white">
                             <tr class="border-b border-slate-200 text-left text-slate-600">

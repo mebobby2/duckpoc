@@ -118,6 +118,8 @@ enough volume for multiple row groups, i.e. the 800K scale test.
 | `duckdb:cashflow:flush` | Writes DuckLake's inlined rows out to Parquet and lists the resulting partition paths |
 | `duckdb:tracker:seed` | Seeds 3 farms x 200K journals differing only in tracker count (1/10/50) |
 | `duckdb:tracker:curve` | Measures report time against tracker count, volume held constant |
+| `duckdb:hero:seed` | Seeds the hero stress-test farm — 50 trackers, `--rows=` up to 1e9 |
+| `duckdb:hero:bench` | Report time on the hero farm across widening period windows |
 
 The root URL (`/`) is an index of the reports below.
 

@@ -27,6 +27,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # FFI open to the web tier.
 RUN echo "ffi.enable=1" > /usr/local/etc/php/conf.d/zz-ffi.ini
 
+# A large scan has to be allowed to finish, and PHP's default 30s ceiling is
+# enforced *inside* the FFI call — so a big query dies as
+# "Maximum execution time of 30+2 seconds exceeded in .../FFI/DuckDB.php".
+# Worse, `php artisan serve` is a single process, so that fatal takes the whole
+# dev server down with it rather than just the one request: every other page
+# then fails too, which makes the cause look like anything except a time limit.
+# Diagnosed the hard way — see the hero-farm section in the README.
+#
+# 600s is a PoC affordance for deliberately extreme queries (a billion-row
+# farm), NOT a model for production. Figured runs PHP-FPM with its own
+# `request_terminate_timeout`, so a genuinely long report would be killed there
+# regardless of this value. That is an argument for amortising setup with a
+# persistent instance and for an async path for huge scans — not for raising
+# timeouts in production.
+RUN printf 'max_execution_time=600\nmemory_limit=4G\n' > /usr/local/etc/php/conf.d/zz-limits.ini
+
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 WORKDIR /app

@@ -33,6 +33,19 @@ class TrackerCashFlowReportController extends Controller
     private const int SOURCE_ROW_LIMIT = 500;
 
     /**
+     * Above this many rows in scope, the source-row listing is skipped unless
+     * `?force_source_rows=1`. See the call site for why.
+     */
+    private const int SOURCE_LISTING_MAX_ROWS = 5_000_000;
+
+    /**
+     * If the report itself took longer than this, the diagnostic scans are
+     * skipped unless `?force_diagnostics=1` — the report's own elapsed time is
+     * a free proxy for how much data is in scope.
+     */
+    private const float DIAGNOSTICS_BUDGET_MS = 2000.0;
+
+    /**
      * Spans the actuals/forecast boundary the seeder creates (actuals through
      * 2021, forecast from 2022), with the horizon between — so every month in
      * the window has data. A horizon inside one of those halves leaves months
@@ -66,6 +79,10 @@ class TrackerCashFlowReportController extends Controller
         $error = null;
         $reportMs = null;
         $detailMs = null;
+        $summaryMs = null;
+        $sourceRowsMs = null;
+        $sourceRowsSkipped = false;
+        $diagnosticsAffordable = true;
 
         if ($farm === null) {
             $error = 'No tracker farms found. Run: php artisan duckdb:tracker:seed';
@@ -89,11 +106,40 @@ class TrackerCashFlowReportController extends Controller
                 $trackerRows = $query->trackerDetail(...$scope);
                 $detailMs = (microtime(true) - $startedAt) * 1000;
 
-                // Diagnostics, measured separately so they cannot inflate the
-                // two timings above — those are the numbers under test.
-                $sourceSummary = $query->sourceRowSummary(...$scope);
-                $sourceRows = $query->sourceRows(...$scope, limit: self::SOURCE_ROW_LIMIT);
+                // Both diagnostics below are full scans of everything in
+                // scope, on top of the two the report already did. On the
+                // billion-row hero farm that was fatal: four scans of ~1.5 GB
+                // blew through PHP's execution limit, and because
+                // `php artisan serve` is single-process the resulting fatal
+                // killed the whole server rather than just this request.
+                //
+                // Gated on the report's OWN measured time, which is free — an
+                // earlier attempt gated the listing on a row count from
+                // `sourceRowSummary()`, which is itself a full scan, so the
+                // guard could never fire before paying the cost it was meant
+                // to avoid. If the report came back quickly, the data is small
+                // enough that the diagnostics are cheap too.
+                $diagnosticsAffordable = $reportMs < self::DIAGNOSTICS_BUDGET_MS
+                    || $request->boolean('force_diagnostics');
 
+                if ($diagnosticsAffordable) {
+                    $startedAt = microtime(true);
+                    $sourceSummary = $query->sourceRowSummary(...$scope);
+                    $summaryMs = (microtime(true) - $startedAt) * 1000;
+
+                    $sourceRowsSkipped = $sourceSummary['n'] > self::SOURCE_LISTING_MAX_ROWS
+                        && !$request->boolean('force_source_rows');
+
+                    if (!$sourceRowsSkipped) {
+                        $startedAt = microtime(true);
+                        $sourceRows = $query->sourceRows(...$scope, limit: self::SOURCE_ROW_LIMIT);
+                        $sourceRowsMs = (microtime(true) - $startedAt) * 1000;
+                    }
+                }
+
+                // Catalog metadata only — no data scan — so this stays on
+                // regardless of volume. It is also the most useful panel at
+                // scale, since it shows which partitions were skippable.
                 $files = (new ParquetFileLister($db, $alias))
                     ->forQuery($farm, $periodFrom, $periodTo);
             } catch (Throwable $e) {
@@ -121,6 +167,12 @@ class TrackerCashFlowReportController extends Controller
             'sourceRows' => $sourceRows,
             'sourceSummary' => $sourceSummary,
             'sourceRowLimit' => self::SOURCE_ROW_LIMIT,
+            'sourceRowsSkipped' => $sourceRowsSkipped,
+            'sourceListingMaxRows' => self::SOURCE_LISTING_MAX_ROWS,
+            'summaryMs' => $summaryMs,
+            'sourceRowsMs' => $sourceRowsMs,
+            'diagnosticsAffordable' => $diagnosticsAffordable,
+            'diagnosticsBudgetMs' => self::DIAGNOSTICS_BUDGET_MS,
             'files' => $files,
             'trackerCount' => $farm === null ? 0 : $this->trackerCount($farm['farm_id']),
         ]);
