@@ -40,11 +40,12 @@ docker compose run --rm app php artisan duckdb:cashflow:run      # run + parity-
 docker compose run --rm app php artisan duckdb:cashflow:flush    # write inlined rows out to Parquet
 ```
 
-Then open **http://localhost:8080** for the browser viewer.
+Then open **http://localhost:8080** — the root is an index of the available
+reports, linking to each viewer.
 
 ### The report viewer
 
-`http://localhost:8080` renders the Cash Flow report with its parameters as
+`/cashflow` renders the Cash Flow report with its parameters as
 form inputs — farm, period from/to, actuals horizon, and basis. It also shows
 the partition the farm resolved to (`farm_type=…` / `region=…`, i.e. which
 Parquet files the query pruned to), the elapsed time, and the generated SQL in

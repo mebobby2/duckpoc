@@ -31,7 +31,9 @@
             grouping a single scan.
         </p>
         <p class="mt-2 text-sm">
-            <a href="{{ route('cashflow') }}" class="text-blue-700 underline">← plain Cash Flow report</a>
+            <a href="{{ route('reports') }}" class="text-blue-700 underline">← all reports</a>
+            <span class="mx-2 text-slate-300">|</span>
+            <a href="{{ route('cashflow') }}" class="text-blue-700 underline">plain Cash Flow report</a>
         </p>
     </header>
 
