@@ -6,7 +6,7 @@ namespace App\Services\CashFlow;
 
 use App\Services\CashFlow\Definition\CashFlowReportDefinition;
 use App\Services\CashFlow\Definition\ReportSection;
-use App\Services\CashFlow\Definition\SignRule;
+use App\Services\CashFlow\Definition\SectionAmountExpression;
 
 /**
  * Turns a report definition into one DuckDB query.
@@ -199,12 +199,7 @@ final class ReportSqlBuilder
     {
         $fp = self::FIXED_POINT;
 
-        $amount = match ($section->signRule) {
-            SignRule::AsStored => 'l.amount',
-            SignRule::InvertWholeSection => '-l.amount',
-            SignRule::FlipRevenueAccounts =>
-                "CASE WHEN l.account_class = 'REVENUE' THEN -l.amount ELSE l.amount END",
-        };
+        $amount = SectionAmountExpression::for($section->signRule);
 
         return sprintf(
             "    COALESCE(SUM(CASE WHEN l.account_category = '%s' THEN %s END), 0) / %d.0 AS %s",

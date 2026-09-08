@@ -83,6 +83,32 @@ final class CashFlowSchema
         $this->createTransactionLines();
     }
 
+    /**
+     * Adds `tracker_id` to an existing table without dropping it.
+     *
+     * Journal lines carry a tracker tag so per-tracker report sections can be
+     * resolved by grouping one scan, rather than by a query per tracker the
+     * way `LivestockQuantities` does today. Nullable because most lines —
+     * operating expenses, GST, equity movements — belong to no tracker.
+     *
+     * Kept separate from `recreate()` so adopting the column costs nothing:
+     * re-seeding ~880K rows is quick, but there is no reason to make a purely
+     * additive schema change destructive. Existing rows read back NULL.
+     * Idempotent, so it is safe on every deploy.
+     *
+     * `tracker_id` is deliberately NOT a partition key. It is high-cardinality
+     * and partitioning on it would multiply file count — and per-file round
+     * trips are the measured dominant cost here (see the README's pruning
+     * section). Row-group statistics handle the filtering instead.
+     */
+    public function addTrackerColumn(): void
+    {
+        $this->db->query(<<<SQL
+            ALTER TABLE {$this->alias}.transaction_lines
+            ADD COLUMN IF NOT EXISTS tracker_id VARCHAR
+            SQL);
+    }
+
     private function createTransactionLines(): void
     {
         $this->db->query(<<<SQL
@@ -95,7 +121,8 @@ final class CashFlowSchema
                 type VARCHAR NOT NULL,
                 basis VARCHAR NOT NULL,
                 date DATE NOT NULL,
-                amount BIGINT NOT NULL
+                amount BIGINT NOT NULL,
+                tracker_id VARCHAR
             )
             SQL);
 

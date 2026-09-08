@@ -9,6 +9,15 @@ over DuckLake/Parquet in GCS, and its output matches the real Figured report
 cell for cell (see the oracle section below). There's a browser viewer for it
 on `http://localhost:8080`.
 
+Phase 1b is done too, and it is the more interesting result. The volume test
+(880K journals, ~1.7s) turned out to measure the axis that was never the
+bottleneck — **farm complexity is**, via a per-tracker query fan-out in
+`LivestockQuantities`. So per-tracker Cash Flow sections now resolve by
+grouping a single scan, and **a farm with 50 trackers costs ~5% more than one
+with 1** — same journal volume, same SQL text. Start at
+[Tracker scaling](#tracker-scaling--the-axis-that-actually-hurts-today) for
+that, including an explicit note on what it does not yet show.
+
 ## Stack
 
 | Piece | What | Why |
@@ -106,6 +115,19 @@ enough volume for multiple row groups, i.e. the 800K scale test.
 | `duckdb:cashflow:seed-scale` | Seeds ~880K synthetic lines across 3 cohorts for the scale test |
 | `duckdb:cashflow:run` | Runs the report as DuckDB SQL and diffs it against the oracle |
 | `duckdb:cashflow:flush` | Writes DuckLake's inlined rows out to Parquet and lists the resulting partition paths |
+| `duckdb:tracker:seed` | Seeds 3 farms x 200K journals differing only in tracker count (1/10/50) |
+| `duckdb:tracker:curve` | Measures report time against tracker count, volume held constant |
+
+Two report viewers, both at `http://localhost:8080`:
+
+| Page | What |
+|---|---|
+| `/cashflow` | Plain Cash Flow — the parity-checked report (84/84 against Figured) |
+| `/tracker-cashflow` | Cash Flow with per-tracker income sections, and the tracker-count timings |
+
+The two are deliberately separate controllers and views. `/cashflow` is the
+artefact parity is asserted against, so nothing in the tracker work can
+regress it.
 
 ## Why this PoC uses an Australian bucket
 
@@ -177,6 +199,118 @@ pays a full round trip on each, and unlike the read path there is no connection
 reuse hiding the distance. So "the move bought less than expected" is true of
 report latency specifically, and false of ingest. Worth separating the two
 whenever a placement decision comes up — they have different cost structures.
+
+## Tracker scaling — the axis that actually hurts today
+
+Volume was the wrong thing to measure first. Figured's ex-CTO, on being shown
+the 583K-journals-in-1.7s result:
+
+> the complexity and slowness in current reports though comes from teh
+> complexity of the farm, rather than the outright number of journals — ones
+> with 50 trackers — means it has to do 50x queries
+
+He is right, and the codebase says exactly where. **It is not in journal
+aggregation:** `QueryMongoReportDataService` buckets intervals into
+`first`/`actuals`/`forecast`/`other` and issues one aggregation per bucket —
+**4 queries, whatever the tracker count.** Tracker sections do not multiply it.
+
+The fan-out is in the non-journal tracker data.
+`LivestockStructureBuilder::getSectionsByTracker()` loops
+`foreach ($trackers as $tracker)` and per tracker calls:
+
+```php
+$this->livestockQuantities->getTrackerQuantitiesSection($id.'_quantities', [$tracker->id], …)
+```
+
+Note `[$tracker->id]` — a single-element array, once per tracker. Inside,
+`TrackerQuantityService` does a `Tracker::findOrFail()` plus a stock-quantity
+computation. Textbook N+1, at report-structure level, gated behind
+`showTrackersQuantities`.
+
+So the real cost model is not `f(journals)` but roughly
+**`f(journals) + trackers × g(period)`**, and the second term is the one that
+was never tested here.
+
+### The experiment
+
+Three farms, **journal volume held constant** at 200,000 rows each, varying
+only tracker count (1 / 10 / 50). Vary both and the curve means nothing.
+Each farm gets its own `region` so it lands in its own partition and cannot be
+charged for another's files.
+
+```bash
+php artisan duckdb:tracker:seed     # 3 farms x 200K journals, 1/10/50 trackers
+php artisan duckdb:tracker:curve    # the timing curve
+```
+
+**Result — fresh process per run, farms measured in REVERSE order so the
+50-tracker farm runs first and gets no warmed cache:**
+
+| Farm | Trackers | Runs (ms) | Median |
+|---|---|---|---|
+| `tracker-farm-50` | 50 | 60 / 62 / 58 | **60 ms** |
+| `tracker-farm-10` | 10 | 57 / 55 / 59 | 57 ms |
+| `tracker-farm-01` | 1 | 57 / 69 / 56 | 57 ms |
+
+**50× the tracker cardinality costs ~5% more time.** The ordering is
+deliberately stacked against the conclusion: if tracker count were expensive,
+measuring 50 first would exaggerate it, not hide it.
+
+The structural half of the claim is cheaper to prove than the timing, and
+`duckdb:tracker:curve` asserts it: **the generated SQL is byte-identical
+(4,195 bytes) for 1 tracker and for 50.** Nothing interpolates a tracker id or
+count — the count reaches the query only as `GROUP BY tracker_id` cardinality.
+The command fails if a farm id ever appears in the SQL text, so a future change
+cannot quietly reintroduce per-tracker SQL.
+
+Query count: **2 for any farm** (consolidated report + per-tracker breakdown),
+against Figured's 4 + one per tracker.
+
+### The comparison worth quoting
+
+Figured builds the consolidated gross profit by string concatenation, one term
+per tracker:
+
+```php
+implode(' + ', $trackerGrossProfitIds) . ' + other_income - direct_costs'
+```
+
+At 50 trackers that is a 50-term formula string assembled at runtime and
+evaluated per interval. The equivalent here is one `SUM()` over the tracker
+groups. That difference is structural, not cosmetic — it is the same reason
+the fan-out exists at all.
+
+### What this does NOT show
+
+Being explicit, because it would be easy to overclaim:
+
+- **Only the journal-driven half is done.** Per-tracker *quantities and
+  valuation* — the stateful opening → movements → closing chain, which is
+  where `getStockQuantities()` spends its time — is Phase 2. If the real cost
+  in Figured is per-tracker *computation* rather than per-tracker *round
+  trips*, then the win comes from window functions (Phase 2), not from query
+  elimination (measured here). Both are DuckDB strengths, but they are
+  different claims.
+- **The N+1's structure is verified; its magnitude is not.** 50 cheap
+  `findOrFail`s would be ~100 ms, not seconds. The weight has to be inside
+  `getStockQuantities()`, which this PoC has not measured.
+- Tracker sections here are livestock only, and use a synthetic chart of
+  accounts, not Figured's real account mappings.
+
+### A seed calibration worth recording
+
+First run produced a permanently *negative* tracker gross profit. The signs
+were correct — verified against raw storage: income stored −106,117 (credit),
+costs +209,816 (debit), and 106,117 − 209,816 = −103,699, exactly what the
+report showed. The cause was the chart of accounts: **four cost accounts
+against two income accounts**, with rows spread evenly per account, makes costs
+~2× income by construction. Arithmetically right, completely unrealistic, and
+on a demo page it reads as a bug in the report. Fixed with an explicit
+`REVENUE_WEIGHT` in the seeder rather than by touching the report.
+
+The general lesson, which this project has now learned twice: synthetic data
+that is *self-consistent* still proves nothing about whether the inputs are
+plausible.
 
 ## Scale test results — the headline finding
 
@@ -614,6 +748,7 @@ if either errors.
 - MySQL connectivity and `php artisan migrate`
 - **Cash Flow parity**: the DuckDB query's output matches Figured's real report on all 84 cells (7 rows × 12 months) — `duckdb:cashflow:run` asserts this on every run, so a regression fails loudly rather than silently
 - The report rendering in a browser end to end, over real GCS-backed DuckLake, in ~400 ms per request including the full DuckDB setup/attach cycle
+- **Tracker-count independence**: per-tracker Cash Flow sections resolved by grouping one scan, with the 1/10/50 curve flat (~5% for 50x the trackers, measured worst-case-first in fresh processes) and the generated SQL byte-identical across tracker counts
 
 **Not yet verified:**
 - Postgres or MySQL as the DuckLake catalog backend (a local DuckDB file remains the default per DuckLake's own PoC guidance)
@@ -628,25 +763,37 @@ Phased per the architecture conversation this PoC came out of. **Phase 0
 
 1. ~~**Phase 1 — Cash Flow.**~~ **Done.** Schema + partitioning, the oracle
    captured from Figured's real engine, the report as one DuckDB query, and a
-   parity check that passes on all 84 cells. Plus a browser viewer.
-   Outstanding within this phase: the 800K-row scale test (one "hero" farm at
-   realistic max volume across multiple cohorts), which is what actually
-   exercises the partitioning and row-group-pruning design.
-2. **Phase 2 — Livestock valuation.** Research the actual virtual-journal
+   parity check that passes on all 84 cells. Plus a browser viewer. The
+   880K-row scale test is done too.
+2. ~~**Phase 1b — tracker sections in Cash Flow.**~~ **Done.** Added because
+   the volume result turned out to measure the axis that was never the
+   bottleneck: farm complexity is, and Cash Flow *already* has tracker
+   sections in real Figured — they were simply missing here. `tracker_id` is
+   now a fact-table column, per-tracker income/direct-cost sections resolve by
+   grouping one scan, and the 1/10/50 curve is flat. See the tracker scaling
+   section above, including what it deliberately does not show.
+3. **Phase 2 — Livestock valuation.** Research the actual virtual-journal
    handler (methodology, data dependencies, existing tests) first, then port
    it to DuckDB SQL against real synthetic tracker data. This is the
    genuinely hard, multi-dimensional case (account × type × basis ×
    tracking/mob × horizon, self-referential) — the step that actually tests
    whether this architecture avoids repeating a past internal ClickHouse
    evaluation's failure mode (swapping engines without solving the
-   underlying multi-dimensional derivation problem). Sequenced after Cash
-   Flow, not before — Cash Flow proves the plumbing works before spending
-   effort on the hard case.
-3. **Phase 3 — Overdraft interest**, built on top of the now-real Cash Flow
+   underlying multi-dimensional derivation problem).
+
+   **Phase 1b sharpened what this phase has to prove.** The per-tracker
+   *quantity and valuation* chain — opening stock → movements → closing →
+   valuation, stateful and ordered within each tracker — is where
+   `getStockQuantities()` actually spends its time, and it is the half Phase
+   1b did not touch. The claim to test is that it becomes a window function
+   `PARTITION BY tracker_id`, computed for every tracker in one pass. That is
+   the thing Mongo cannot express, and therefore the real reason the current
+   engine loops in PHP at all — not an implementation slip.
+4. **Phase 3 — Overdraft interest**, built on top of the now-real Cash Flow
    output instead of stubbed test values.
-4. **Phase 4 — Scale/latency test**, only once 1–3 are correct at small
+5. **Phase 4 — Scale/latency test**, only once 1–3 are correct at small
    scale, on the hardest real report shape (not Cash Flow, which real
    per-farm row counts already suggest isn't a meaningful performance risk).
-5. **Phase 5 — The additive derived-facts Parquet layer for BigQuery** /
+6. **Phase 5 — The additive derived-facts Parquet layer for BigQuery** /
    practice-wide benchmarking, built on report logic now proven correct on
    the hard case, not just the easy one.
