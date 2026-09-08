@@ -86,9 +86,18 @@ final class CashFlowSchema
         // supported in DuckLake"). Consistent with other lakehouse table
         // formats (Iceberg/Delta) — uniqueness isn't server-enforced;
         // seed/query code is responsible for not producing duplicate ids.
+        // account_class mirrors Figured's Xero account class. It exists
+        // separately from account_category because it drives a different
+        // decision: `XeroAccount::isAccountInversedForUser()` returns true for
+        // REVENUE and only REVENUE, and that is what makes the report flip
+        // revenue's stored credit (negative) into the positive figure a reader
+        // expects. account_category drives which report SECTION a line lands
+        // in; account_class drives the display sign.
         $this->db->query(<<<SQL
             CREATE TABLE {$this->alias}.accounts (
                 account_id VARCHAR NOT NULL,
+                account_name VARCHAR NOT NULL,
+                account_class VARCHAR NOT NULL,
                 account_category VARCHAR NOT NULL,
                 is_gst_account BOOLEAN NOT NULL DEFAULT false,
                 is_default_bank_account BOOLEAN NOT NULL DEFAULT false

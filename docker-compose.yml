@@ -25,7 +25,10 @@ services:
       MYSQL_USER: duckpoc
       MYSQL_PASSWORD: password
     ports:
-      - "3307:3306"
+      # 3308, not 3307 — figured-webapp's test-mysql owns 3307, and running
+      # both stacks at once is normal while cross-checking against the real
+      # Figured reports.
+      - "3308:3306"
     volumes:
       - duckpoc-mysql-data:/var/lib/mysql
 
