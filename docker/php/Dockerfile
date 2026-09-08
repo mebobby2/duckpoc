@@ -18,6 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# PHP auto-enables FFI for the `cli` SAPI only. Any web SAPI — including the
+# `cli-server` one behind `php artisan serve` — inherits the default
+# `ffi.enable=preload` and refuses FFI calls with "FFI API is restricted by
+# ffi.enable configuration directive", so every artisan command works while
+# the browser 500s. Enabling it outright is fine for this local PoC; a real
+# deployment would want `preload` plus an opcache preload script rather than
+# FFI open to the web tier.
+RUN echo "ffi.enable=1" > /usr/local/etc/php/conf.d/zz-ffi.ini
+
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 WORKDIR /app

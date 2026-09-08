@@ -13,9 +13,13 @@ services:
       HOME: /tmp
     depends_on:
       - mysql
-    # Idle by default — use `docker compose exec app <command>` or
-    # `docker compose run --rm app <command>` to run artisan/composer.
-    command: tail -f /dev/null
+    ports:
+      # 8080, not 8000 — Docker already holds 8000 on this machine.
+      - "8080:8000"
+    # `docker compose up -d app` serves the report viewer on
+    # http://localhost:8080. One-off artisan/composer commands still work via
+    # `docker compose run --rm app <command>`, which overrides this.
+    command: php artisan serve --host=0.0.0.0 --port=8000
 
   mysql:
     image: mysql:8.0

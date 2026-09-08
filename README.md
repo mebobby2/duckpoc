@@ -1,39 +1,63 @@
 # duckpoc
 
-A standalone Laravel 11 / PHP 8.3 app — same core stack as [Figured](https://github.com/figured/figured-webapp)
+A standalone PHP 8.3 / Laravel app — same core stack as [Figured](https://github.com/figured/figured-webapp)
 — set up to prove out a DuckDB + DuckLake + GCS architecture as a proof of
 concept, ahead of a possible rewrite of Figured's reporting engine.
 
-This is infrastructure/plumbing only: DuckDB connectivity, DuckLake catalog
-attach, GCS auth, MySQL for ordinary Laravel app data. It does not yet
-contain any report logic (Cash Flow, Overdraft interest, etc.) — that's the
-next layer to build on top of this.
+Phase 1 is done: Figured's **Cash Flow report runs as a single DuckDB query**
+over DuckLake/Parquet in GCS, and its output matches the real Figured report
+cell for cell (see the oracle section below). There's a browser viewer for it
+on `http://localhost:8080`.
 
 ## Stack
 
 | Piece | What | Why |
 |---|---|---|
-| PHP 8.3, Laravel 11 | Standard Laravel app | Matches Figured's stack |
+| PHP 8.3, Laravel 13 | Standard Laravel app | Figured itself is on Laravel 11; this scaffold took whatever `composer create-project` gave it, which is fine for a PoC but is a version ahead |
 | MySQL 8.0 | Laravel's own app DB (`DB_CONNECTION`) | Matches how Figured uses MySQL — app/config data, not report data |
 | DuckDB | Queried via [`satur.io/duckdb`](https://github.com/satur-io/duckdb-php) (FFI binding to the official C API) | No first-party PHP client exists; this is the most-adopted community one (148k+ installs) |
 | DuckLake | A DuckDB extension, attached at runtime | Catalog/table format over Parquet in GCS |
 | GCS | Data files (`gs://…`), authenticated via HMAC keys | See gotcha below — this is **not** service-account JSON auth |
 
-## First-time setup
+## Quick start
 
 ```bash
 docker compose build
-docker compose up -d mysql
-docker compose run --rm app composer install   # already run once during scaffolding; re-run after pulling changes
-cp .env.example .env   # already done — edit as needed
-docker compose run --rm app php artisan migrate
+docker compose up -d                 # mysql + the report viewer on :8080
+
+docker compose run --rm app php artisan duckdb:cashflow:schema   # create tables
+docker compose run --rm app php artisan duckdb:cashflow:seed     # seed the oracle scenario
+docker compose run --rm app php artisan duckdb:cashflow:run      # run + parity-check
 ```
 
-Then smoke-test the DuckDB/DuckLake chain:
+Then open **http://localhost:8080** for the browser viewer.
 
-```bash
-docker compose run --rm app php artisan duckdb:test
-```
+### The report viewer
+
+`http://localhost:8080` renders the Cash Flow report with its parameters as
+form inputs — farm, period from/to, actuals horizon, and basis. It also shows
+the partition the farm resolved to (`farm_type=…` / `region=…`, i.e. which
+Parquet files the query pruned to), the elapsed time, and the generated SQL in
+a collapsible panel.
+
+The elapsed time includes **the whole per-request DuckDB lifecycle** — a fresh
+instance, extension load, DuckLake attach, then the query — because that is
+the model this PoC is evaluating, not just query time in isolation. Typical
+figure on the oracle scenario is ~400 ms end-to-end for the page, which is
+almost entirely setup rather than the query itself.
+
+Negative values render bracketed (`(1,200.00)`) and zero as `–`, matching
+Figured's own `reportNumberFormat.js`. The oracle scenario has no negatives,
+so that path is written-but-unexercised.
+
+### Commands
+
+| Command | What |
+|---|---|
+| `duckdb:test` | Smoke-tests the DuckDB → DuckLake → GCS chain end to end |
+| `duckdb:cashflow:schema` | Creates/recreates the Cash Flow tables (destructive) |
+| `duckdb:cashflow:seed` | Seeds the 4-line parity oracle scenario |
+| `duckdb:cashflow:run` | Runs the report as DuckDB SQL and diffs it against the oracle |
 
 With `GCS_BUCKET` left empty in `.env`, this runs entirely locally (SQLite
 catalog under `storage/ducklake/`, Parquet data under
@@ -135,6 +159,15 @@ independently readable back via `read_parquet()`.
     empirically (see below), not assumed. Matters because row-group-level
     min/max statistics (not partitioning) are what makes farm_id sort-order
     pruning work — see partitioning strategy below.
+
+11. **FFI is auto-enabled for the `cli` SAPI only — a web SAPI needs
+    `ffi.enable=1` explicitly.** Every artisan command worked while the
+    browser 500'd with "FFI API is restricted by `ffi.enable` configuration
+    directive", because `php artisan serve` runs the `cli-server` SAPI, which
+    inherits the default `ffi.enable=preload`. Fixed in
+    `docker/php/Dockerfile` with a `conf.d` drop-in. Fine for a local PoC;
+    a real deployment would want `preload` plus an opcache preload script
+    rather than FFI open to the web tier.
 
 ## Partitioning strategy: `(farm_type, region, year)`, not `farm_id`
 
@@ -282,21 +315,26 @@ if either errors.
 - Real Parquet files landing in GCS at the expected `<DATA_PATH>/<schema>/<table>/` layout, confirmed two independent ways: `ducklake_list_files()` metadata, and reading each file back directly with `read_parquet('gs://...')`, bypassing the catalog entirely
 - Catalog + data persistence across separate `docker compose run` invocations — a second run produced its own separate, independently-readable Parquet file, proving durable transactional write behavior across process restarts, not just in-memory
 - MySQL connectivity and `php artisan migrate`
+- **Cash Flow parity**: the DuckDB query's output matches Figured's real report on all 84 cells (7 rows × 12 months) — `duckdb:cashflow:run` asserts this on every run, so a regression fails loudly rather than silently
+- The report rendering in a browser end to end, over real GCS-backed DuckLake, in ~400 ms per request including the full DuckDB setup/attach cycle
 
-**Not yet verified (needs real infra to test):**
+**Not yet verified:**
 - Postgres or MySQL as the DuckLake catalog backend (SQLite remains the default per DuckLake's own PoC guidance)
-- Anything at actual data volume — this only proves the plumbing works correctly, not that it performs at scale (though real per-farm row counts gathered separately — Figured's largest farms run ~180K–800K total journal rows — suggest single-farm query volume is not a meaningful performance risk for DuckDB regardless)
+- Anything at actual data volume — this proves correctness, not performance at scale (though real per-farm row counts gathered separately — Figured's largest farms run ~180K–800K total journal rows — suggest single-farm query volume is not a meaningful performance risk for DuckDB regardless)
+- The `non_operating_income`, `non_operating_expenses`, `non_operating_movements`, `equity_movements` and `gst` sections. These are implemented in `CashFlowQuery` from the structure definition, but the oracle scenario has no accounts in them, so their sign handling — the last three are `setInverse(true)` sections — is written-but-unexercised. Deliberately left that way: the PoC's open question is DuckDB's performance and the multi-dimensional VJ problem, not exhaustive section coverage. GST is the one most likely to matter on real data.
+- Negative-value display (bracketed) in the viewer — no negatives in the oracle scenario
 
 ## Next steps
 
-Phased per the architecture conversation this PoC came out of — Phase 0
-(this scaffold) is done; the rest is not yet started:
+Phased per the architecture conversation this PoC came out of. **Phase 0
+(scaffold) and Phase 1 (Cash Flow) are done**; the rest is not started:
 
-1. **Phase 1 — Cash Flow.** Build the synthetic data generator (farm/accounts
-   schema, `farm_id=X/year=Y` Hive partitioning), then port Cash Flow's
-   aggregation + running-balance logic to DuckDB SQL. No VJ derivation of its
-   own, so this proves the basic plumbing and query pattern — not yet the
-   hard part.
+1. ~~**Phase 1 — Cash Flow.**~~ **Done.** Schema + partitioning, the oracle
+   captured from Figured's real engine, the report as one DuckDB query, and a
+   parity check that passes on all 84 cells. Plus a browser viewer.
+   Outstanding within this phase: the 800K-row scale test (one "hero" farm at
+   realistic max volume across multiple cohorts), which is what actually
+   exercises the partitioning and row-group-pruning design.
 2. **Phase 2 — Livestock valuation.** Research the actual virtual-journal
    handler (methodology, data dependencies, existing tests) first, then port
    it to DuckDB SQL against real synthetic tracker data. This is the
