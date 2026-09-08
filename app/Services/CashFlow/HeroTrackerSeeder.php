@@ -51,9 +51,22 @@ final class HeroTrackerSeeder
     /** Actuals up to and including this year; forecast after. */
     private const int HORIZON_YEAR = 2021;
 
-    /** 10 years, matching the span of Figured's largest real farms. */
-    private const int FIRST_YEAR = 2016;
-    private const int YEARS = 10;
+    /**
+     * 30 years, 1996-2025.
+     *
+     * Deliberately longer than any real Figured farm — the product has only
+     * existed since ~2013, and real farms hold ~10 years. The span is stretched
+     * for a partitioning reason, not a realism one: `year(date)` is the
+     * partition key, so 30 years means 30 partitions of ~16.7M rows instead of
+     * 10 of 50M. That makes narrowing a report's window actually reduce the
+     * files it opens, which at 10 years it barely did — a one-month query and a
+     * one-year query read the same files.
+     *
+     * Per-year density is still ~208x a real farm (16.7M vs ~80K). Nothing
+     * about the span fixes that; only fewer rows would.
+     */
+    private const int FIRST_YEAR = 1996;
+    private const int YEARS = 30;
 
     /** Same chart of accounts as the small tracker farms, so results compare. */
     private const array ACCOUNTS = [
@@ -98,26 +111,69 @@ final class HeroTrackerSeeder
         $this->seedFarm();
         $this->seedTrackers();
 
-        $chunkCount = (int) ceil($totalRows / $chunkRows);
+        // Driven by years, not by chunk index.
+        //
+        // The previous version mapped chunk -> year with `chunk % YEARS`, which
+        // only distributes evenly when the chunk count is a multiple of the
+        // year count. At 500M rows in 25M chunks over 30 years that is 20
+        // chunks, so ten years would have received no rows at all — it had been
+        // working by coincidence (40/10, 20/10). Deriving the plan from the
+        // years makes even coverage structural rather than lucky.
+        $plan = $this->chunkPlan($totalRows, $chunkRows);
+
+        $chunkCount = count($plan);
         $startedAt = microtime(true);
         $written = 0;
+        $offset = 0;
 
-        for ($chunk = 0; $chunk < $chunkCount; $chunk++) {
-            $offset = $chunk * $chunkRows;
-            $rows = min($chunkRows, $totalRows - $offset);
-
-            // Each chunk targets one year, so it writes into exactly one
-            // partition — see the class docblock.
-            $year = self::FIRST_YEAR + ($chunk % self::YEARS);
-
+        foreach ($plan as $index => [$year, $rows]) {
             $this->insertChunk($offset, $rows, $year);
 
+            $offset += $rows;
             $written += $rows;
 
             if ($onChunk !== null) {
-                $onChunk($chunk + 1, $chunkCount, $written, microtime(true) - $startedAt);
+                $onChunk($index + 1, $chunkCount, $written, microtime(true) - $startedAt);
             }
         }
+    }
+
+    /** How many inserts `seed()` will issue for this request. */
+    public function plannedChunkCount(int $totalRows, int $chunkRows): int
+    {
+        return count($this->chunkPlan($totalRows, $chunkRows));
+    }
+
+    /**
+     * Splits the requested total evenly across every year, then splits each
+     * year into inserts no larger than `$chunkRows`.
+     *
+     * Each insert therefore targets exactly one year, and so lands in exactly
+     * one partition — which is what keeps the sort bounded and the written
+     * files aligned to partitions. Any remainder from uneven division goes to
+     * the final year rather than being dropped.
+     *
+     * @return list<array{0: int, 1: int}> [year, rows] per insert
+     */
+    private function chunkPlan(int $totalRows, int $chunkRows): array
+    {
+        $perYear = intdiv($totalRows, self::YEARS);
+        $remainder = $totalRows - ($perYear * self::YEARS);
+
+        $plan = [];
+
+        for ($y = 0; $y < self::YEARS; $y++) {
+            $year = self::FIRST_YEAR + $y;
+            $rowsThisYear = $perYear + ($y === self::YEARS - 1 ? $remainder : 0);
+
+            while ($rowsThisYear > 0) {
+                $rows = min($chunkRows, $rowsThisYear);
+                $plan[] = [$year, $rows];
+                $rowsThisYear -= $rows;
+            }
+        }
+
+        return $plan;
     }
 
     /**

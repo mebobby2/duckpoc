@@ -18,11 +18,18 @@ with 1** — same journal volume, same SQL text. Start at
 [Tracker scaling](#tracker-scaling--the-axis-that-actually-hurts-today) for
 that, including an explicit note on what it does not yet show.
 
+One number to keep in proportion before reading further: **a realistic farm's
+report runs cold in 0.94 s with 10 HTTP requests** (200K rows, 50 trackers).
+Everything below about seconds and thousands of requests concerns the
+deliberately oversized hero farm, which is ~625x any real farm — see
+[The hero farm](#the-hero-farm--what-it-is-and-what-it-is-not) for why it
+exists and what it does not prove.
+
 The biggest single win, though, was neither SQL nor architecture but **physical
 layout**: DuckDB's default Parquet row group size (122,880) is tuned for local
 disk, and over object storage it dominated everything. Raising it to 1,000,000
-made the same billion-row report **5.9x faster** (54.8s -> 9.3s) and writes
-**1.55x faster**. See
+made the same report **5.9x faster** and writes **1.55x faster**, and partition
+granularity halved it again. See
 [Row group size](#row-group-size-the-single-biggest-win-measured-in-this-poc).
 
 ## Stack
@@ -125,7 +132,7 @@ enough volume for multiple row groups, i.e. the 800K scale test.
 | `duckdb:cashflow:flush` | Writes DuckLake's inlined rows out to Parquet and lists the resulting partition paths |
 | `duckdb:tracker:seed` | Seeds 3 farms x 200K journals differing only in tracker count (1/10/50) |
 | `duckdb:tracker:curve` | Measures report time against tracker count, volume held constant |
-| `duckdb:hero:seed` | Seeds the hero stress-test farm — 50 trackers, `--rows=` up to 1e9 |
+| `duckdb:hero:seed` | Seeds the hero stress-test farm — 50 trackers over 30 years, `--rows=` (default 10M) |
 | `duckdb:hero:bench` | Report time on the hero farm across widening period windows |
 
 The root URL (`/`) is an index of the reports below.
@@ -212,6 +219,109 @@ reuse hiding the distance. So "the move bought less than expected" is true of
 report latency specifically, and false of ingest. Worth separating the two
 whenever a placement decision comes up — they have different cost structures.
 
+## The hero farm — what it is, and what it is not
+
+`hero-tracker-farm-50` currently holds **500,000,000 journal lines across 30
+years (1996-2025)**, 16,666,666 per year, with 50 livestock trackers.
+
+**It is not a realistic farm, and the gap is not close.** Figured's largest real
+farms run ~800K journals over ~10 years (~80K/year). Put side by side:
+
+| | Span | Total | Per year | 2-month window |
+|---|---|---|---|---|
+| Largest real farm | 10 years | 800,000 | ~80,000 | ~13,300 rows |
+| `hero-tracker-farm-50` | 30 years | 500,000,000 | 16,666,666 | ~2,700,000 rows |
+| Ratio | 3x | **625x** | **208x** | **~200x** |
+
+The sharpest way to put it: **one month of the hero farm holds more journals
+than the largest real farm accumulates in a decade.**
+
+The 30-year span is also longer than any real farm could have — Figured has
+only existed since ~2013. It is stretched for a partitioning reason, not a
+realism one, and the seeder says so in its docblock so the number is not later
+mistaken for a claim about real data. 500M cannot be a realistic single farm at
+any span; only fewer rows would fix that.
+
+### So what is it for?
+
+Two questions that a realistic farm cannot answer:
+
+1. **DuckDB's ceiling** — where does the engine stop coping? (It did not, at
+   1e9.)
+2. **Practice-wide volume** — 500M is roughly the whole platform's journals in
+   one table (~3,300 farms at ~150K each), which is the cross-farm
+   benchmarking problem this architecture is also meant to serve. Read that
+   way it is a *realistic aggregate*, just not a realistic farm.
+
+### The realistic per-farm number
+
+This is the figure to quote when the question is "is this fast enough for
+Figured". Cold, on `tracker-farm-50` (200K rows, 50 trackers):
+
+```
+total            0.94s
+SQL engine       0.00s
+storage/waiting  0.94s
+HTTP GETs        10
+transferred      64.1 KiB
+```
+
+**Under a second, 10 requests, 64 KiB — and SQL time is literally zero.** At
+realistic volume the query is free and the entire cost is a handful of round
+trips to Sydney, which co-located production compute would not pay either.
+
+### Partition granularity: worth as much as row group size
+
+Reseeding the same 500M rows from a 10-year span to a 30-year span triples the
+partition count (`year(date)` is the partition key) and so thirds the rows per
+partition. Same volume, same row group size, cold profiles:
+
+| Window | 10-year span | 30-year span | |
+|---|---|---|---|
+| 2 months | 5.14 s / 502 GETs | **2.37 s / 189 GETs** | 2.2x faster |
+| 1 year | 10.02 s / 950 GETs | **4.40 s / 320 GETs** | 2.3x faster |
+
+This is the answer to a puzzle that came up earlier: narrowing a report's
+window from a year to two months barely helped (67s vs 37s at one point),
+because at 10 years a two-month query opened *the same files* as a one-year
+query — a month is far smaller than a year-sized partition, so there was
+nothing further to prune.
+
+Note the limit, visible in the numbers above: **1-month and 2-month windows
+both cost 189 GETs**, because both still read one whole year partition. Finer
+granularity would need month-level partitioning, which multiplies file count —
+and file count is the other cost driver. Year looks like the right balance.
+
+### Seeding it
+
+```bash
+php artisan duckdb:hero:seed --rows=500000000 --chunk=25000000
+```
+
+500M takes ~6.7 min at ~1.25M rows/s. The seeder clears the farm first, so the
+previous version's Parquet files become tombstoned — **run the cleanup
+afterwards** or the bucket keeps both copies:
+
+```sql
+CALL ducklake_expire_snapshots('lake', older_than => now());
+CALL ducklake_cleanup_old_files('lake', cleanup_all => true);
+```
+
+Skipping that left the bucket at 7.74 GB when the live data was 3.87 GB.
+
+### A distribution bug worth recording
+
+The seeder used to map inserts to years with `chunk % YEARS`, which only
+distributes evenly when the chunk count is a multiple of the year count. It
+worked for 1e9/25M over 10 years (40 chunks) and 500M/25M over 10 years (20
+chunks) — both exact multiples — purely by coincidence.
+
+Moving to a 30-year span would have made it 20 chunks over 30 years, leaving
+**ten years with zero rows while reporting complete success**. It now derives
+the plan from the years (one insert per year, split further only if a year
+exceeds `--chunk`), so even coverage is structural. Verified after seeding:
+30 distinct years, zero empty, min 16,666,666 / max 16,666,686 rows per year.
+
 ## Row group size: the single biggest win measured in this PoC
 
 **DuckDB's default Parquet row group size is 122,880 rows. Over object storage
@@ -224,7 +334,13 @@ DuckDB issues **one HTTP range request per (row group x column)**. Row group
 count therefore sets the request count, and each request pays a full network
 round trip. Bytes barely matter; requests do.
 
-The billion-row hero farm, same 2-month report, profiled cold both times:
+Measured on the hero farm when it held **1,000,000,000 rows over 10 years** —
+kept as the historical record because this is the comparison that isolates row
+group size, and re-deriving it would mean re-seeding a billion rows twice. The
+farm has since been reseeded smaller (see *The hero farm* below); the ratios
+below are what the setting changes, not the current absolute times.
+
+Same 2-month report, profiled cold both times:
 
 | | 122,880 (default) | 1,000,000 | Change |
 |---|---|---|---|
@@ -246,7 +362,7 @@ were wrong.
 Not predicted. Fewer column chunks to encode, smaller footers, and fewer
 catalog rows for DuckLake to track:
 
-| | Row groups | Seed time (1e9 rows) | Throughput |
+| | Row groups | Seed time (1e9 rows, 10-year span) | Throughput |
 |---|---|---|---|
 | Default | 122,880 | 1,190 s | 840,584 rows/s |
 | Tuned | 1,000,000 | **768 s** | **1,302,188 rows/s** |

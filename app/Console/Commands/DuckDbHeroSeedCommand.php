@@ -46,7 +46,11 @@ class DuckDbHeroSeedCommand extends Command
         $seeder = new HeroTrackerSeeder($db, $alias, $appAlias);
         $seeder->ensureAccounts();
 
-        $chunks = (int) ceil($totalRows / $chunkRows);
+        // The seeder plans one insert per year (split further if a year
+        // exceeds --chunk), so the insert count is not simply rows/chunk —
+        // it is at least one per year. Asking the seeder avoids a header that
+        // disagrees with the progress lines below it.
+        $chunks = $seeder->plannedChunkCount($totalRows, $chunkRows);
 
         $this->info(sprintf(
             'Seeding %s to %s — %s rows in %d chunk(s) of %s, %d trackers',
