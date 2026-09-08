@@ -14,6 +14,11 @@
         <p class="mt-1 text-sm text-slate-600">
             Figured's Cash Flow report computed as a single DuckDB query over DuckLake/Parquet in GCS.
         </p>
+        <p class="mt-2 text-sm">
+            <a href="{{ route('reports') }}" class="text-blue-700 underline">← all reports</a>
+            <span class="mx-2 text-slate-300">|</span>
+            <a href="{{ route('tracker-cashflow') }}" class="text-blue-700 underline">per-tracker Cash Flow report</a>
+        </p>
     </header>
 
     {{-- Report parameters --}}
