@@ -61,12 +61,102 @@ final class CashFlowQuery
     ): array {
         $statement = $this->db->preparedStatement($this->sql());
 
-        // Bound as VARCHAR, including the dates. Left to infer, the client
-        // reads DuckDB's own param type — DATE, because the SQL wraps these in
-        // CAST(... AS DATE) — and then fails converting a PHP string to it
-        // ("Error creating a DUCKDB_TYPE_DATE from the value '2024-01-01'").
-        // Binding text and letting the SQL's own CAST do the conversion keeps
-        // the call sites plain strings.
+        $this->bindScope($statement, $farmId, $farmType, $region, $periodFrom, $periodTo, $horizon, $basis);
+
+        // generate_series' upper bound is inclusive and steps by month, so it
+        // needs the first of the final month, not the period end date. Only
+        // the report query has a month spine, so this is bound here rather
+        // than in bindScope().
+        $statement->bindParam(
+            'last_month_start',
+            date('Y-m-01', strtotime($periodTo)),
+            Type::DUCKDB_TYPE_VARCHAR,
+        );
+
+        return iterator_to_array($statement->execute()->rows(true));
+    }
+
+    /**
+     * The individual transaction lines the report consumed.
+     *
+     * Uses the same in-scope predicate as the report, so this is genuinely
+     * what fed the numbers rather than a re-derived approximation.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function sourceRows(
+        string $farmId,
+        string $farmType,
+        string $region,
+        string $periodFrom,
+        string $periodTo,
+        string $horizon,
+        string $basis = 'cash',
+        int $limit = 500,
+    ): array {
+        $statement = $this->db->preparedStatement($this->builder()->buildSourceRowsSql());
+
+        $this->bindScope($statement, $farmId, $farmType, $region, $periodFrom, $periodTo, $horizon, $basis);
+
+        // Type left to inference here, unlike the scope params: DuckDB infers
+        // an integer for LIMIT, and forcing VARCHAR fails outright
+        // ("Error creating a DUCKDB_TYPE_VARCHAR from the value '500'").
+        $statement->bindParam('row_limit', $limit);
+
+        return iterator_to_array($statement->execute()->rows(true));
+    }
+
+    /**
+     * Row count and net total across everything in scope — so the viewer can
+     * say how much it is not showing when the listing is truncated.
+     *
+     * @return array{n: int, net_dollars: float}
+     */
+    public function sourceRowSummary(
+        string $farmId,
+        string $farmType,
+        string $region,
+        string $periodFrom,
+        string $periodTo,
+        string $horizon,
+        string $basis = 'cash',
+    ): array {
+        $statement = $this->db->preparedStatement($this->builder()->buildSourceRowCountSql());
+
+        $this->bindScope($statement, $farmId, $farmType, $region, $periodFrom, $periodTo, $horizon, $basis);
+
+        $row = iterator_to_array($statement->execute()->rows(true))[0] ?? [];
+
+        return [
+            'n' => (int) ($row['n'] ?? 0),
+            'net_dollars' => (float) ($row['net_dollars'] ?? 0),
+        ];
+    }
+
+    public function sql(): string
+    {
+        return $this->builder()->build();
+    }
+
+    private function builder(): ReportSqlBuilder
+    {
+        return new ReportSqlBuilder($this->definition, $this->alias);
+    }
+
+    /**
+     * Everything bound as VARCHAR — see the note in run() for why inferring
+     * the type fails on the CAST-wrapped date parameters.
+     */
+    private function bindScope(
+        object $statement,
+        string $farmId,
+        string $farmType,
+        string $region,
+        string $periodFrom,
+        string $periodTo,
+        string $horizon,
+        string $basis,
+    ): void {
         foreach ([
             'farm_id' => $farmId,
             'farm_type' => $farmType,
@@ -75,18 +165,8 @@ final class CashFlowQuery
             'period_from' => $periodFrom,
             'period_to' => $periodTo,
             'horizon' => $horizon,
-            // generate_series' upper bound is inclusive and steps by month, so
-            // it needs the first of the final month, not the period end date.
-            'last_month_start' => date('Y-m-01', strtotime($periodTo)),
         ] as $parameter => $value) {
             $statement->bindParam($parameter, $value, Type::DUCKDB_TYPE_VARCHAR);
         }
-
-        return iterator_to_array($statement->execute()->rows(true));
-    }
-
-    public function sql(): string
-    {
-        return (new ReportSqlBuilder($this->definition, $this->alias))->build();
     }
 }

@@ -105,7 +105,21 @@ final class ReportSqlBuilder
                     tl.amount
                 FROM {$this->alias}.transaction_lines tl
                 JOIN {$this->alias}.accounts a ON a.account_id = tl.account_id
-                WHERE tl.farm_id   = \$farm_id
+                {$this->inScopePredicate()}
+            SQL;
+    }
+
+    /**
+     * The one definition of "which rows feed this report".
+     *
+     * Shared by the report itself and by the source-row listing the viewer
+     * shows, so the two cannot drift — a copy would risk the UI displaying
+     * rows the report never actually consumed.
+     */
+    private function inScopePredicate(): string
+    {
+        return <<<SQL
+            WHERE tl.farm_id   = \$farm_id
                   AND tl.farm_type = \$farm_type
                   AND tl.region    = \$region
                   AND tl.basis     = \$basis
@@ -115,6 +129,50 @@ final class ReportSqlBuilder
                      OR (tl.date >  CAST(\$horizon AS DATE) AND tl.type = 'forecast')
                   )
             SQL;
+    }
+
+    /**
+     * The individual transaction lines the report consumed, for display.
+     *
+     * Same predicate as the report, more columns — including the raw
+     * fixed-point amount, since the stored sign (revenue as a credit) is the
+     * single easiest thing to get wrong here and worth being able to see.
+     */
+    public function buildSourceRowsSql(): string
+    {
+        return <<<SQL
+            SELECT
+                tl.line_id,
+                tl.date,
+                tl.type,
+                tl.basis,
+                a.account_id,
+                a.account_name,
+                a.account_class,
+                a.account_category,
+                tl.amount AS amount_raw,
+                tl.amount / {$this->fixedPoint()}.0 AS amount_dollars
+            FROM {$this->alias}.transaction_lines tl
+            JOIN {$this->alias}.accounts a ON a.account_id = tl.account_id
+            {$this->inScopePredicate()}
+            ORDER BY tl.date, tl.line_id
+            LIMIT \$row_limit
+            SQL;
+    }
+
+    public function buildSourceRowCountSql(): string
+    {
+        return <<<SQL
+            SELECT count(*) AS n, sum(tl.amount) / {$this->fixedPoint()}.0 AS net_dollars
+            FROM {$this->alias}.transaction_lines tl
+            JOIN {$this->alias}.accounts a ON a.account_id = tl.account_id
+            {$this->inScopePredicate()}
+            SQL;
+    }
+
+    private function fixedPoint(): int
+    {
+        return self::FIXED_POINT;
     }
 
     private function sectionsCte(): string
