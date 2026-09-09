@@ -73,7 +73,7 @@
     @endif
 
     @if ($farm !== null && $elapsedMs !== null)
-        <div class="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-4">
+        <div class="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-{{ $jitter !== null ? 6 : 5 }}">
             <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
                 <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Enterprise types</p>
                 <p class="mt-1 text-2xl font-semibold tabular-nums">{{ count($trackerBreakdown) }}</p>
@@ -82,10 +82,38 @@
                 </p>
             </div>
             <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Report time</p>
+                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">DuckDB report</p>
                 <p class="mt-1 text-2xl font-semibold tabular-nums">{{ number_format($elapsedMs, 0) }} ms</p>
                 <p class="mt-1 text-xs text-slate-500">1 query, all levels</p>
             </div>
+            <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Page load</p>
+                <p class="mt-1 text-2xl font-semibold tabular-nums" data-page-ms>&mdash;</p>
+                <p class="mt-1 text-xs text-slate-500">
+                    @if ($serverMs !== null)
+                        server {{ number_format($serverMs, 0) }} ms
+                    @endif
+                    @if ($summaryMs !== null)
+                        · diagnostics {{ number_format($summaryMs + ($sourceRowsMs ?? 0), 0) }} ms
+                    @endif
+                </p>
+            </div>
+            @if ($jitter !== null)
+                <div class="rounded-lg border border-amber-300 bg-amber-50 p-4 shadow-sm">
+                    <p class="text-xs font-medium uppercase tracking-wide text-amber-700">Total, actual + jitter</p>
+                    <p class="mt-1 text-2xl font-semibold tabular-nums text-amber-900">
+                        {{ number_format($jitter['low_ms'], 0) }}&ndash;{{ number_format($jitter['high_ms'], 0) }} ms
+                    </p>
+                    <p class="mt-1 text-xs text-amber-700">
+                        {{ number_format($elapsedMs, 0) }} ms actual
+                        + {{ number_format($jitter['added_low_ms'], 0) }}&ndash;{{ number_format($jitter['added_high_ms'], 0) }} ms network
+                    </p>
+                    <p class="mt-0.5 text-xs text-amber-600">
+                        {{ number_format($jitter['requests']) }} reqs
+                        &times; {{ number_format($jitter['low_latency_ms'], 0) }}&ndash;{{ number_format($jitter['high_latency_ms'], 0) }} ms
+                    </p>
+                </div>
+            @endif
             <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
                 <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Queries issued</p>
                 <p class="mt-1 text-2xl font-semibold tabular-nums">1</p>
@@ -728,5 +756,24 @@
     @endif
 
 </div>
+    <script>
+        // Wall clock as the browser experienced it. The server figure stops at
+        // view dispatch, so a large gap here is HTML rendering or transfer
+        // rather than anything DuckDB did — the distinction that made a 3,575 ms
+        // report look like a 20-30 second page.
+        (() => {
+            const write = () => {
+                const ms = Math.round(performance.now());
+                document.querySelectorAll('[data-page-ms]').forEach((el) => {
+                    el.textContent = ms.toLocaleString() + ' ms';
+                });
+            };
+            if (document.readyState === 'complete') {
+                write();
+            } else {
+                window.addEventListener('load', write);
+            }
+        })();
+    </script>
 </body>
 </html>

@@ -31,8 +31,9 @@ final class DuckLakeConnectionFactory
 
         $this->ensureCatalogAndDataDirectoriesExist();
         $this->configureExtensionDirectory($db);
+        $this->configureTempDirectory($db);
         $this->loadExtensions($db);
-        $this->createGcsSecret($db);
+        $this->createStorageSecret($db);
         $this->attachCatalog($db);
         $this->attachAppDatabase($db);
 
@@ -83,7 +84,7 @@ final class DuckLakeConnectionFactory
     private function ensureCatalogAndDataDirectoriesExist(): void
     {
         if ($this->config['catalog']['driver'] === 'sqlite') {
-            $this->makeDirectoryFor($this->config['catalog']['connections']['sqlite']['path']);
+            $this->makeDirectoryFor($this->catalogPathFor($this->config['catalog']['connections']['sqlite']['path']));
         }
 
         if (empty($this->config['gcs']['bucket'])) {
@@ -109,6 +110,25 @@ final class DuckLakeConnectionFactory
         $this->makeDirectory($directory);
 
         $db->query(sprintf("SET extension_directory = '%s'", $this->escape($directory)));
+    }
+
+    /**
+     * DuckDB's `.tmp` default is relative to the working directory, which puts
+     * spill files on the Docker bind mount — see config/duckdb.php for the
+     * measurement. Left unset, this silently charges every spilling query for
+     * the slowest filesystem available.
+     */
+    private function configureTempDirectory(DuckDB $db): void
+    {
+        $directory = $this->config['temp_directory'] ?? null;
+
+        if ($directory === null || $directory === '') {
+            return;
+        }
+
+        $this->makeDirectory($directory);
+
+        $db->query(sprintf("SET temp_directory = '%s'", $this->escape($directory)));
     }
 
     private function loadExtensions(DuckDB $db): void
@@ -172,14 +192,43 @@ final class DuckLakeConnectionFactory
         $db->query('SET mysql_pool_enable_thread_local_cache = true');
     }
 
-    private function createGcsSecret(DuckDB $db): void
+    /**
+     * Credentials for whichever object store the lake sits on.
+     *
+     * GCS is reached through its S3-compatibility layer, which is why it needs
+     * HMAC keys rather than a service-account JSON key. MinIO is genuine S3,
+     * but needs an explicit endpoint and path-style URLs — a bucket name cannot
+     * be a subdomain of `minio:9000`.
+     */
+    private function createStorageSecret(DuckDB $db): void
     {
+        if ($this->storage() === 's3') {
+            $s3 = $this->config['s3'];
+
+            $db->query(sprintf(
+                "CREATE OR REPLACE SECRET s3_secret (
+                    TYPE s3,
+                    KEY_ID '%s',
+                    SECRET '%s',
+                    ENDPOINT '%s',
+                    URL_STYLE 'path',
+                    USE_SSL %s
+                )",
+                $this->escape($s3['key_id']),
+                $this->escape($s3['secret']),
+                $this->escape($s3['endpoint']),
+                $s3['use_ssl'] ? 'true' : 'false',
+            ));
+
+            return;
+        }
+
         $gcs = $this->config['gcs'];
 
         if (empty($gcs['key_id']) || empty($gcs['secret'])) {
             // No credentials configured — fine for a purely local run (e.g. a
-            // sqlite catalog with a local DATA_PATH instead of gs://), but any
-            // gs:// path will fail auth without this.
+            // catalog with a local DATA_PATH instead of gs://), but any gs://
+            // path will fail auth without this.
             return;
         }
 
@@ -188,6 +237,20 @@ final class DuckLakeConnectionFactory
             $this->escape($gcs['key_id']),
             $this->escape($gcs['secret']),
         ));
+    }
+
+    private function storage(): string
+    {
+        return $this->config['storage'] ?? 'gcs';
+    }
+
+    private function catalogPathFor(string $path): string
+    {
+        if ($this->storage() === 'gcs') {
+            return $path;
+        }
+
+        return preg_replace('/\.sqlite$/', '', $path).'.'.$this->storage().'.sqlite';
     }
 
     private function attachCatalog(DuckDB $db): void
@@ -211,7 +274,10 @@ final class DuckLakeConnectionFactory
             ?? throw new RuntimeException("Unknown DuckLake catalog driver: {$driver}");
 
         return match ($driver) {
-            'sqlite' => 'ducklake:'.$connection['path'],
+            // Suffixed per backend. A DuckLake catalog stores its DATA_PATH
+            // and refuses to attach if it does not match, so gcs and s3 cannot
+            // share one catalog file.
+            'sqlite' => 'ducklake:'.$this->catalogPathFor($connection['path']),
 
             'postgres' => sprintf(
                 'ducklake:postgres:dbname=%s host=%s port=%s user=%s password=%s',
@@ -239,12 +305,18 @@ final class DuckLakeConnectionFactory
 
     private function dataPath(): string
     {
+        if ($this->storage() === 's3') {
+            $s3 = $this->config['s3'];
+
+            return sprintf('s3://%s/%s', $s3['bucket'], ltrim($s3['data_path_prefix'], '/'));
+        }
+
         $gcs = $this->config['gcs'];
 
         if (empty($gcs['bucket'])) {
-            // Local fallback — writes Parquet under storage/ instead of GCS.
-            // Useful for smoke-testing the catalog/attach mechanics without
-            // any cloud credentials at all.
+            // Local fallback — writes Parquet under storage/ instead of an
+            // object store. Useful for smoke-testing the catalog mechanics
+            // with no cloud credentials at all.
             return storage_path('ducklake/data/');
         }
 

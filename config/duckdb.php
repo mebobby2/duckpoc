@@ -87,6 +87,46 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Alternate S3-compatible backend (MinIO)
+    |--------------------------------------------------------------------------
+    |
+    | Set DUCKDB_STORAGE=s3 to point the lake at MinIO on the same host instead
+    | of GCS. This exists to isolate ONE variable: network latency. Every GCS
+    | figure in this PoC carries an ~8 ms Auckland->Sydney round trip, and
+    | request count multiplied by that latency has been the dominant cost in
+    | every measurement. Production runs compute beside its data, so those
+    | numbers describe the development environment more than the architecture.
+    |
+    | Read the result as an OPTIMISTIC BOUND, not a production estimate:
+    | localhost is faster than co-located GCS (~0.1 ms vs ~0.5-1 ms), and MinIO
+    | on one node behaves differently from a distributed object store. What it
+    | answers is the useful question — is latency the constraint, or is
+    | something else?
+    |
+    */
+    's3' => [
+        'bucket' => env('S3_BUCKET', 'duckpoc'),
+        'data_path_prefix' => env('S3_DATA_PATH_PREFIX', 'lake/'),
+        'endpoint' => env('S3_ENDPOINT', 'minio:9000'),
+        'key_id' => env('S3_KEY_ID', 'duckpoc'),
+        'secret' => env('S3_SECRET', 'duckpoc-secret'),
+        'use_ssl' => (bool) env('S3_USE_SSL', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Which storage backend the lake uses
+    |--------------------------------------------------------------------------
+    |
+    | 'gcs' (default) or 's3'. Each backend gets its own catalog file, because
+    | a DuckLake catalog records its DATA_PATH and refuses to attach against a
+    | different one.
+    |
+    */
+    'storage' => env('DUCKDB_STORAGE', 'gcs'),
+
+    /*
+    |--------------------------------------------------------------------------
     | Local extension/scratch storage
     |--------------------------------------------------------------------------
     |
@@ -97,6 +137,27 @@ return [
     |
     */
     'extension_directory' => env('DUCKDB_EXTENSION_DIRECTORY', storage_path('duckdb/extensions')),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Where DuckDB spills intermediates that exceed memory_limit
+    |--------------------------------------------------------------------------
+    |
+    | DuckDB's default is `.tmp`, a RELATIVE path — so it lands in the process
+    | working directory, which here is the Docker bind mount from macOS. That is
+    | the slowest filesystem in this setup, and the Gross Margin V2 query spills
+    | heavily: one 12-month window on the 500M-row farm issued 25,596 local
+    | writes and 12,646 local reads against `.tmp/duckdb_temp_storage_*.tmp`,
+    | with `FileSystem` overtaking `HTTPFSInfo` as the largest cost once MinIO
+    | had removed the network. Pointing it at container-local storage measured
+    | ~25% faster on that window (3,673-3,699 ms -> 2,744-2,838 ms).
+    |
+    | This is a development-environment fix, not an architectural one: the spill
+    | itself is the real problem, and no production deployment would be reading
+    | through a macOS bind mount. It removes a phantom from the measurements.
+    |
+    */
+    'temp_directory' => env('DUCKDB_TEMP_DIRECTORY', '/tmp/duckdb-spill'),
 
     /*
     |--------------------------------------------------------------------------

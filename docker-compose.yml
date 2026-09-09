@@ -21,6 +21,28 @@ services:
     # `docker compose run --rm app <command>`, which overrides this.
     command: php artisan serve --host=0.0.0.0 --port=8000
 
+  # S3-compatible object storage on the same host, so the report can be
+  # measured without the ~8 ms Auckland->Sydney round trip that dominates every
+  # GCS number in this PoC. It is a latency control, not a production proposal:
+  # localhost is FASTER than co-located GCS would be, so it gives an optimistic
+  # floor rather than a realistic production figure.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9011"
+    environment:
+      MINIO_ROOT_USER: duckpoc
+      MINIO_ROOT_PASSWORD: duckpoc-secret
+    ports:
+      - "9010:9000"
+      - "9011:9011"
+    volumes:
+      - duckpoc-minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   mysql:
     image: mysql:8.0
     environment:
@@ -37,4 +59,5 @@ services:
       - duckpoc-mysql-data:/var/lib/mysql
 
 volumes:
+  duckpoc-minio-data:
   duckpoc-mysql-data:

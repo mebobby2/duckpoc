@@ -43,6 +43,24 @@ class GrossMarginV2ReportController extends Controller
     private const int SOURCE_LISTING_MAX_ROWS = 5_000_000;
     private const float DIAGNOSTICS_BUDGET_MS = 30000.0;
 
+    /**
+     * Per-request latency bounds used to project a MinIO run onto real storage.
+     *
+     * MinIO answers from localhost at ~0.1 ms, so a measurement taken against
+     * it contains no network cost at all — which is exactly why it is fast, and
+     * why quoting it as a production figure would overstate the case. These
+     * bracket that gap.
+     *
+     * 1-2 ms models compute co-located with storage in one region, which is
+     * where this would actually run: same-region object storage measures
+     * ~0.5-1 ms per request, so the band is the realistic case with a little
+     * headroom. It is deliberately NOT the ~8 ms this project measures
+     * Auckland-to-Sydney — that figure describes the development environment,
+     * not the architecture.
+     */
+    private const float JITTER_LOW_MS = 1.0;
+    private const float JITTER_HIGH_MS = 2.0;
+
     public function __invoke(Request $request, DuckDB $db): View
     {
         $alias = config('duckdb.attached_alias');
@@ -72,6 +90,7 @@ class GrossMarginV2ReportController extends Controller
         $diagnosticsAffordable = true;
         $sourceRowsSkipped = false;
         $trace = null;
+        $reportRequests = null;
 
         if ($farm === null) {
             $error = 'No mixed-enterprise farm found. Run: php artisan duckdb:gm2:seed';
@@ -99,6 +118,8 @@ class GrossMarginV2ReportController extends Controller
                 );
 
                 $elapsedMs = (microtime(true) - $startedAt) * 1000;
+
+                $reportRequests = $requests->connectionEvents();
 
                 // Collected immediately, before the diagnostic queries below
                 // add their own events to the log.
@@ -158,6 +179,30 @@ class GrossMarginV2ReportController extends Controller
             }
         }
 
+        // Only meaningful on MinIO: on GCS the measured time already contains
+        // real round trips, so adding more would double-count them.
+        $jitter = null;
+
+        if (config('duckdb.storage') === 's3' && $elapsedMs !== null && $reportRequests !== null) {
+            $jitter = [
+                'requests' => $reportRequests,
+                'low_latency_ms' => self::JITTER_LOW_MS,
+                'high_latency_ms' => self::JITTER_HIGH_MS,
+                'added_low_ms' => $reportRequests * self::JITTER_LOW_MS,
+                'added_high_ms' => $reportRequests * self::JITTER_HIGH_MS,
+                'low_ms' => $elapsedMs + $reportRequests * self::JITTER_LOW_MS,
+                'high_ms' => $elapsedMs + $reportRequests * self::JITTER_HIGH_MS,
+            ];
+        }
+
+        // Measured from the framework's own entry point, so it includes
+        // bootstrap and the diagnostic scans that `elapsedMs` deliberately
+        // excludes. It stops short of HTML rendering, which is why the page
+        // also reports a browser-side figure.
+        $serverMs = defined('LARAVEL_START')
+            ? (microtime(true) - LARAVEL_START) * 1000
+            : null;
+
         return view('gross-margin-v2', [
             'farms' => $farms,
             'farm' => $farm,
@@ -185,6 +230,8 @@ class GrossMarginV2ReportController extends Controller
             'sourceRowsSkipped' => $sourceRowsSkipped,
             'sourceListingMaxRows' => self::SOURCE_LISTING_MAX_ROWS,
             'trace' => $trace,
+            'serverMs' => $serverMs,
+            'jitter' => $jitter,
         ]);
     }
 

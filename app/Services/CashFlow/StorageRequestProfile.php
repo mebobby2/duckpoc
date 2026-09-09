@@ -76,6 +76,19 @@ final class StorageRequestProfile
     }
 
     /**
+     * Request count at a chosen moment, rather than at the end of the request.
+     *
+     * `summarise()` reports whatever the log holds by the time it runs, which
+     * is after the diagnostic scans — 247 events against the 215 the report
+     * itself issued. Anything projecting a cost per request needs the report's
+     * own share, so it has to read the counter the instant the report returns.
+     */
+    public function connectionEvents(): ?int
+    {
+        return $this->logCount(null);
+    }
+
+    /**
      * @param list<array<string, mixed>> $files output of ParquetFileLister
      * @return array{
      *     files_in_scope: int, row_groups: null|int, columns_read: int,
