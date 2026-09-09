@@ -19,7 +19,8 @@ class DuckDbGmV2SeedCommand extends Command
 {
     protected $signature = 'duckdb:gm2:seed
         {--bulk : Seed the volume variant (gm-dairy-farm-1m) instead of the demo farm}
-        {--rows=1000000 : Target journal lines when --bulk is used}';
+        {--huge : Seed the large variant (gm-dairy-farm-500m)}
+        {--rows=1000000 : Target journal lines when --bulk or --huge is used}';
 
     protected $description = 'Seed a mixed milk + livestock dairy farm for the Gross Margin V2 report';
 
@@ -32,11 +33,20 @@ class DuckDbGmV2SeedCommand extends Command
         $schema->ensureWriteOptions();
         $schema->addTrackerColumn();
 
-        $bulk = (bool) $this->option('bulk');
+        $huge = (bool) $this->option('huge');
+        $bulk = $huge || (bool) $this->option('bulk');
         $rows = $bulk ? max(1, (int) $this->option('rows')) : 0;
 
-        $farmId = $bulk ? GrossMarginV2Seeder::BULK_FARM_ID : GrossMarginV2Seeder::FARM_ID;
-        $region = $bulk ? GrossMarginV2Seeder::BULK_REGION : GrossMarginV2Seeder::REGION;
+        $farmId = match (true) {
+            $huge => GrossMarginV2Seeder::HUGE_FARM_ID,
+            $bulk => GrossMarginV2Seeder::BULK_FARM_ID,
+            default => GrossMarginV2Seeder::FARM_ID,
+        };
+        $region = match (true) {
+            $huge => GrossMarginV2Seeder::HUGE_REGION,
+            $bulk => GrossMarginV2Seeder::BULK_REGION,
+            default => GrossMarginV2Seeder::REGION,
+        };
 
         $this->info(sprintf(
             'Seeding %s — milk + livestock trackers, %d-%d%s',

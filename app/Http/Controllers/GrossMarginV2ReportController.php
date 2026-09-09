@@ -8,6 +8,7 @@ use App\Services\CashFlow\GrossMarginV2Query;
 use App\Services\CashFlow\GrossMarginV2Seeder;
 use App\Services\CashFlow\ParquetFileLister;
 use App\Services\CashFlow\QueryProfiler;
+use App\Services\CashFlow\QueryTrace;
 use App\Services\CashFlow\StorageRequestProfile;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -59,6 +60,7 @@ class GrossMarginV2ReportController extends Controller
         $summaryMs = null;
         $sourceRowsMs = null;
         $diagnosticsAffordable = true;
+        $trace = null;
 
         if ($farm === null) {
             $error = 'No mixed-enterprise farm found. Run: php artisan duckdb:gm2:seed';
@@ -66,6 +68,12 @@ class GrossMarginV2ReportController extends Controller
             try {
                 $requests = new StorageRequestProfile($db);
                 $requests->startLogging();
+
+                // Armed before the query, read after it — DuckDB's log is
+                // per-process, so this is the only point at which a browser
+                // request's own trace can be captured.
+                $tracer = $request->boolean('trace') ? new QueryTrace($db) : null;
+                $tracer?->start();
 
                 $startedAt = microtime(true);
 
@@ -80,6 +88,10 @@ class GrossMarginV2ReportController extends Controller
                 );
 
                 $elapsedMs = (microtime(true) - $startedAt) * 1000;
+
+                // Collected immediately, before the diagnostic queries below
+                // add their own events to the log.
+                $trace = $tracer?->collect();
 
                 $scope = [
                     $farm['farm_id'],
@@ -154,6 +166,7 @@ class GrossMarginV2ReportController extends Controller
             'summaryMs' => $summaryMs,
             'sourceRowsMs' => $sourceRowsMs,
             'diagnosticsAffordable' => $diagnosticsAffordable,
+            'trace' => $trace,
         ]);
     }
 
@@ -246,7 +259,7 @@ class GrossMarginV2ReportController extends Controller
         try {
             return DB::table('farms')
                 ->join('trackers', 'trackers.farm_id', '=', 'farms.farm_id')
-                ->whereIn('farms.farm_id', [GrossMarginV2Seeder::FARM_ID, GrossMarginV2Seeder::BULK_FARM_ID])
+                ->whereIn('farms.farm_id', [GrossMarginV2Seeder::FARM_ID, GrossMarginV2Seeder::BULK_FARM_ID, GrossMarginV2Seeder::HUGE_FARM_ID])
                 ->select('farms.farm_id', 'farms.farm_type', 'farms.region')
                 ->groupBy('farms.farm_id', 'farms.farm_type', 'farms.region')
                 ->get()

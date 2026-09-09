@@ -170,6 +170,166 @@
         </div>
     @endif
 
+    {{-- DuckDB's own execution waterfall for THIS request --}}
+    @if ($trace === null)
+        <div class="mb-4 rounded-lg border border-slate-200 bg-white p-4 text-xs text-slate-600 shadow-sm">
+            <span class="font-medium text-slate-900">DuckDB trace:</span>
+            not captured. DuckDB's log lives in the process, so it cannot be read after the request ends —
+            it has to be armed before the query runs.
+            <a class="font-medium text-blue-700 underline"
+               href="{{ request()->fullUrlWithQuery(['trace' => 1]) }}">Trace this request</a>
+        </div>
+    @elseif (!$trace['ok'])
+        <div class="mb-4 rounded-lg border border-red-200 bg-red-50 p-4 text-xs text-red-700">
+            Trace failed: {{ $trace['error'] }}
+        </div>
+    @else
+        @php
+            $colour = [
+                'HTTPFSInfo' => 'bg-rose-500',
+                'HTTP' => 'bg-orange-400',
+                'FileSystem' => 'bg-amber-400',
+                'DuckLakeMetadata' => 'bg-violet-500',
+                'PhysicalOperator' => 'bg-sky-500',
+                'QueryLog' => 'bg-emerald-500',
+                'Transaction' => 'bg-slate-400',
+            ];
+            $text = [
+                'HTTPFSInfo' => 'text-rose-700',
+                'HTTP' => 'text-orange-700',
+                'FileSystem' => 'text-amber-700',
+                'DuckLakeMetadata' => 'text-violet-700',
+                'PhysicalOperator' => 'text-sky-700',
+                'QueryLog' => 'text-emerald-700',
+                'Transaction' => 'text-slate-600',
+            ];
+            $span = max(0.001, $trace['total_ms']);
+        @endphp
+
+        <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm" open>
+            <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
+                DuckDB execution waterfall
+                <span class="ml-2 font-normal text-slate-500">
+                    {{ number_format($trace['total_ms'], 0) }} ms traced ·
+                    {{ number_format(count($trace['steps'])) }} steps
+                </span>
+            </summary>
+
+            <div class="border-t border-slate-200 px-5 py-4">
+                <p class="mb-3 text-xs text-slate-500">
+                    Every event DuckDB logged, in the order it happened, with the time that elapsed
+                    <em>after</em> it. That is the key to reading this: a step's duration is the wait that
+                    followed it, not its own cost — so a 300 ms
+                    <span class="{{ $text['HTTPFSInfo'] }}">HTTPFSInfo</span> row means DuckDB was blocked
+                    on that network read for 300 ms.
+                </p>
+
+                {{-- Time by phase --}}
+                <p class="mb-1 text-xs font-medium text-slate-700">Where the time went</p>
+                <div class="mb-4 overflow-x-auto rounded border border-slate-200">
+                    <table class="min-w-full text-xs">
+                        <thead class="bg-slate-50">
+                            <tr class="text-left text-slate-600">
+                                <th class="px-2 py-1 font-medium">Phase</th>
+                                <th class="px-2 py-1 text-right font-medium">Total</th>
+                                <th class="px-2 py-1 text-right font-medium">Share</th>
+                                <th class="px-2 py-1 text-right font-medium">Events</th>
+                                <th class="px-2 py-1 text-right font-medium">Worst step</th>
+                                <th class="px-2 py-1 font-medium">&nbsp;</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach ($trace['by_type'] as $t)
+                                <tr class="border-t border-slate-100">
+                                    <td class="px-2 py-1 font-medium {{ $text[$t['type']] ?? 'text-slate-700' }}">{{ $t['type'] }}</td>
+                                    <td class="px-2 py-1 text-right tabular-nums">{{ number_format($t['ms'], 1) }} ms</td>
+                                    <td class="px-2 py-1 text-right tabular-nums">{{ number_format($t['share'], 1) }}%</td>
+                                    <td class="px-2 py-1 text-right tabular-nums text-slate-500">{{ number_format($t['events']) }}</td>
+                                    <td class="px-2 py-1 text-right tabular-nums text-slate-500">{{ number_format($t['worst_ms'], 1) }} ms</td>
+                                    <td class="px-2 py-1 w-1/3">
+                                        <div class="h-2 rounded {{ $colour[$t['type']] ?? 'bg-slate-400' }}"
+                                             style="width: {{ max(1, $t['share']) }}%"></div>
+                                    </td>
+                                </tr>
+                            @endforeach
+                        </tbody>
+                    </table>
+                </div>
+
+                {{-- Biggest single waits --}}
+                @if (!empty($trace['hotspots']))
+                    <p class="mb-1 text-xs font-medium text-slate-700">Biggest single waits</p>
+                    <div class="mb-4 overflow-x-auto rounded border border-slate-200">
+                        <table class="min-w-full text-xs">
+                            <thead class="bg-slate-50">
+                                <tr class="text-left text-slate-600">
+                                    <th class="px-2 py-1 text-right font-medium">at</th>
+                                    <th class="px-2 py-1 text-right font-medium">waited</th>
+                                    <th class="px-2 py-1 font-medium">after this step</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach ($trace['hotspots'] as $h)
+                                    <tr class="border-t border-slate-100">
+                                        <td class="px-2 py-1 text-right tabular-nums text-slate-400">{{ number_format($h['at_ms'], 0) }} ms</td>
+                                        <td class="px-2 py-1 text-right font-semibold tabular-nums {{ $text[$h['type']] ?? '' }}">{{ number_format($h['dur_ms'], 1) }} ms</td>
+                                        <td class="px-2 py-1 font-mono text-slate-600">
+                                            <span class="{{ $text[$h['type']] ?? '' }}">{{ $h['type'] }}</span>
+                                            · {{ \Illuminate\Support\Str::limit($h['detail'], 100) }}
+                                        </td>
+                                    </tr>
+                                @endforeach
+                            </tbody>
+                        </table>
+                    </div>
+                @endif
+
+                {{-- Full timeline --}}
+                <p class="mb-1 text-xs font-medium text-slate-700">
+                    Full timeline
+                    <span class="font-normal text-slate-500">— in the order it happened</span>
+                </p>
+                <div class="max-h-[32rem] overflow-auto rounded border border-slate-200">
+                    <table class="min-w-full text-xs">
+                        <thead class="sticky top-0 bg-slate-50">
+                            <tr class="text-left text-slate-600">
+                                <th class="px-2 py-1 text-right font-medium">#</th>
+                                <th class="px-2 py-1 text-right font-medium">at</th>
+                                <th class="px-2 py-1 text-right font-medium">waited</th>
+                                <th class="px-2 py-1 font-medium">step</th>
+                                <th class="px-2 py-1 font-medium w-1/4">timeline</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach ($trace['steps'] as $i => $step)
+                                <tr class="border-t border-slate-100 {{ $step['slow'] ? 'bg-rose-50' : '' }}">
+                                    <td class="px-2 py-0.5 text-right text-slate-400">{{ $i + 1 }}</td>
+                                    <td class="px-2 py-0.5 text-right tabular-nums text-slate-400">{{ number_format($step['at_ms'], 1) }}</td>
+                                    <td class="px-2 py-0.5 text-right tabular-nums {{ $step['slow'] ? 'font-semibold text-rose-700' : 'text-slate-500' }}">
+                                        {{ $step['dur_ms'] >= 0.05 ? number_format($step['dur_ms'], 2) : '·' }}
+                                    </td>
+                                    <td class="px-2 py-0.5 whitespace-nowrap">
+                                        <span class="{{ $text[$step['type']] ?? 'text-slate-600' }} font-medium">{{ $step['type'] }}</span>
+                                        <span class="ml-1 font-mono text-slate-500">{{ \Illuminate\Support\Str::limit($step['detail'], 84) }}</span>
+                                    </td>
+                                    <td class="px-2 py-0.5">
+                                        <div class="relative h-2 w-full rounded bg-slate-100">
+                                            <div class="absolute h-2 rounded {{ $colour[$step['type']] ?? 'bg-slate-400' }}"
+                                                 style="left: {{ min(99, $step['at_ms'] / $span * 100) }}%; width: {{ max(0.6, $step['dur_ms'] / $span * 100) }}%"></div>
+                                        </div>
+                                    </td>
+                                </tr>
+                            @endforeach
+                        </tbody>
+                    </table>
+                </div>
+                <p class="mt-1 text-xs text-slate-500">
+                    Rows shaded red waited 5 ms or more. A "·" means under 0.05 ms.
+                </p>
+            </div>
+        </details>
+    @endif
+
     {{-- Storage range requests — the measured cost driver --}}
     @if ($storage !== null)
         <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm" open>

@@ -30,6 +30,10 @@ final class GrossMarginV2Seeder
     public const string BULK_FARM_ID = 'gm-dairy-farm-1m';
     public const string BULK_REGION = 'gm-bulk';
 
+    /** A larger variant again — its own region so it partitions separately. */
+    public const string HUGE_FARM_ID = 'gm-dairy-farm-500m';
+    public const string HUGE_REGION = 'gm-huge';
+
     private const int FIXED_POINT = 10000;
 
     /**
