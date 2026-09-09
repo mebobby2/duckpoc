@@ -93,11 +93,42 @@ final class CashFlowSchema
      * **4,247 GETs to transfer 26.5 MiB**, and at ~12.5 ms per request that
      * was 53 of its 55 seconds — against 1.7 s of actual SQL.
      *
-     * 1,000,000 is within DuckDB's own recommended 1-5M range for remote
-     * storage. Larger row groups mean fewer, fatter requests, so the
-     * per-request latency is amortised over far more rows.
+     * 5,000,000 — the top of DuckDB's recommended 1-5M range for remote
+     * storage. Larger row groups mean fewer, fatter requests, so per-request
+     * latency is amortised over far more rows.
+     *
+     * Raised from 1,000,000 after measuring the request arithmetic directly:
+     * requests = files x row_groups_per_file x columns_read. On the 500M-row
+     * farm a 2-month window issued 2,379 requests, which is exactly
+     * 12 files x 19 row groups x 10 columns. Row group COUNT is the driver, so
+     * merging files into bigger ones changes nothing on its own — compaction
+     * rewrites at the same row group size and leaves the total unchanged.
+     *
+     * The setting alone is not enough. At 1,000,000 the files actually came
+     * out at 917,504 rows per group, because `write_buffer_row_group_memory_limit`
+     * (250 MiB by default) fills before the row count target is reached and
+     * flushes early. `applyWriteTuning()` raises it so the requested size can
+     * actually be achieved.
      */
-    private const int PARQUET_ROW_GROUP_SIZE = 1_000_000;
+    private const int PARQUET_ROW_GROUP_SIZE = 5_000_000;
+
+    /**
+     * Session settings that let `parquet_row_group_size` actually be reached.
+     *
+     * Session `SET`s, not catalog options, so unlike `ensureWriteOptions()`
+     * they do not persist — every writing process has to apply them. Kept
+     * beside the row group size because they are meaningless apart from it:
+     * without the raised buffer the size target is silently capped, which is
+     * how a requested 1,000,000 came out as 917,504.
+     *
+     * Buffers one large row group rather than five smaller ones, since only
+     * the size matters here and a wider buffer costs memory for no benefit.
+     */
+    public function applyWriteTuning(): void
+    {
+        $this->db->query("SET write_buffer_row_group_memory_limit='1GB'");
+        $this->db->query('SET write_buffer_row_group_count=1');
+    }
 
     /**
      * Persists the lake's write options in the catalog.

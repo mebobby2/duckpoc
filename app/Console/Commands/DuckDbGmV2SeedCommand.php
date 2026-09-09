@@ -31,6 +31,7 @@ class DuckDbGmV2SeedCommand extends Command
 
         $schema = new CashFlowSchema($db, $alias);
         $schema->ensureWriteOptions();
+        $schema->applyWriteTuning();
         $schema->addTrackerColumn();
 
         $huge = (bool) $this->option('huge');

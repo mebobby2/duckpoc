@@ -386,7 +386,6 @@ final class GrossMarginV2Seeder
                     INTERVAL 1 MONTH
                 ) AS m(month_start)
                 CROSS JOIN range(0, {$perMonth}) AS g(n)
-                ORDER BY (m.month_start + INTERVAL (CAST(g.n % 28 AS INTEGER)) DAY)
                 SQL);
         }
     }
