@@ -716,6 +716,121 @@ real GCS bucket: two separate runs each produced their own real Parquet
 file, correctly persisted across process invocations, with both files
 independently readable back via `read_parquet()`.
 
+## Big-farm findings (the 500M-row farm)
+
+`gm-dairy-farm-500m` holds 499,999,724 rows, all `basis='cash'`: 333,333,148
+actuals (2024-01-01 .. 2026-08-28) and 166,666,576 forecast (2026-09-01 ..
+2027-12-28). With the default horizon of `2026-08-31` sitting cleanly between
+the two, `period_from=2024-01-01` / `period_to=2027-12-31` reaches every row —
+useful as the worst-case report window. Only 14 of the 50 accounts carry a
+`report_group`, but the seeder used exactly those, so nothing is lost to the
+report's `report_group IS NOT NULL` filter.
+
+### The spill — the largest single win after row group size
+
+Gross Margin V2 spent most of its time writing to local disk, not reading the
+lake. On a 12-month window: **25,596 local writes and 12,646 local reads**
+against `.tmp/duckdb_temp_storage_*.tmp`, with `FileSystem` overtaking
+`HTTPFSInfo` as the dominant cost once MinIO had removed the network.
+
+The cause was ordering. `report_lines AS MATERIALIZED` joined `accounts` onto
+every journal line *first* — 125M rows each carrying four repeated VARCHARs
+(`account_name`, `account_class`, `report_group`, `report_group_label`),
+roughly 12 GB against a 13.4 GiB memory limit — and only aggregated afterwards.
+The fix aggregates the fact table to one row per (month, account) **before** any
+dimension column is attached, which collapses 125M rows to ~600, then joins the
+labels to those. `MATERIALIZED` moved onto the small aggregate, because `levels`
+is read twice below and without pinning it DuckDB may re-derive the CTE and scan
+the lake twice.
+
+Two things make it equivalent rather than merely faster: `SUM` is associative,
+so per-account subtotals summed per section equal the raw lines summed once; and
+the REVENUE sign flip is safe to apply to a per-account subtotal because
+`account_class` is a property of the account, so every line under it shares the
+sign.
+
+| window | rows | before | after |
+|---|---|---|---|
+| 1 year | 125.0M | 3,673 ms | **875 ms** |
+| 3 years | 281.2M | 30,274 ms | **1,685 ms** |
+
+Local filesystem operations went from 38,242 to **zero**. Verified by diffing
+the full report output against the pre-change SQL: identical across 249 rows
+(1 year) and 561 rows (3 years), every field including per-unit margins and the
+derived Gross Margin row.
+
+This also retired an earlier wrong conclusion recorded here — that the 3-year
+window was compute-bound and beyond what co-location could fix. It was
+spilling.
+
+### Wide windows are decode-bound, not request-bound
+
+Requests track row groups almost exactly — **requests = 9 x row_groups**
+(245/27, 726/81, 964/108) — but request count is not what wide windows pay for:
+
+| window | rows | row groups | files | reqs | time |
+|---|---|---|---|---|---|
+| 1 month | 10.4M | 27 | 2 | 245 | 160 ms |
+| 1 year | 125.0M | 27 | 2 | 245 | 841 ms |
+| 3 years | 281.2M | 81 | 6 | 726 | 1,680 ms |
+| full span | 500.0M | 108 | 8 | 964 | 2,925 ms |
+
+The first two rows issue **identical requests** and differ 5x in time, so the
+difference is decoding 114M more rows: about **6 ms per million rows**. That
+model predicts 500M x 6 ms = ~3,000 ms against 2,925 ms measured.
+
+So ~2.9 s is close to the floor for scanning half a billion rows with this
+design, and storage tuning will not move it. The report is already frugal with
+bytes: it transfers ~38 MB of a 4.3 GB file, because `line_id` (2.44 GB) and
+`_ducklake_internal_row_id` (1.83 GB) are 99% of the file and neither is read.
+Beating it means not reading 500M rows at all — a pre-aggregated monthly rollup
+(~600 rows per farm), i.e. the direction in `docs/bigquery-dbt-separation.md`.
+
+Raising row group size does not help here and cannot be done in place:
+`ducklake_merge_adjacent_files` only merges small *adjacent* files, so on an
+already-compacted lake it is a **no-op (0.0 s)**. Row group size is fixed at
+write time.
+
+### Not tested: sorting by date within a partition
+
+The lever worth trying next, recorded because the diagnostic that found it is
+cheap to repeat. Every row group in the `year=2025` files carries the same
+`date` statistics:
+
+```
+group 0   2025-01-01 .. 2025-12-28
+group 1   2025-01-01 .. 2025-12-28
+group 2   2025-01-01 .. 2025-12-28
+...
+```
+
+Rows are in random date order within each partition, so every row group's
+min/max spans the whole year and **DuckDB cannot skip a single one**. That is
+why a 1-month window reads 27 row groups and decodes ~125M rows to return
+10.4M — roughly 12x more work than needed, and why the 1-month and 1-year
+windows issue identical requests.
+
+Sorting by date within each partition should make those statistics selective, so
+a 1-month window touches ~2-3 row groups instead of 27. Predicted ~30 ms rather
+than 160 ms, and more importantly it would stop narrow reports scaling with the
+size of the year they sit in. This matters more than the full-span number,
+because production reports are monthly and quarterly.
+
+**Untested.** DuckLake has no sort-key concept, so it means controlling insert
+order in the seeder and rewriting a farm's data to measure it. Note the
+trade-off with the row group size finding above: sorted data favours *smaller*
+row groups (finer pruning), unsorted data favours larger ones (fewer requests).
+
+### `temp_directory` defaults onto the Docker bind mount
+
+DuckDB's default is `.tmp` — a **relative** path, so it resolves to the process
+working directory, which in this container is the macOS bind mount, the slowest
+filesystem available here. Every spilling query silently paid for it. Now set
+via `config/duckdb.php` (`DUCKDB_TEMP_DIRECTORY`, default `/tmp/duckdb-spill`)
+and applied in `DuckLakeConnectionFactory`. Worth ~25% on a cold process, ~11%
+through the warm page — but a development-environment artifact, not an
+architectural finding.
+
 ## Real gotchas hit while building this (all fixed, documented here so they don't get rediscovered)
 
 0. **`catalog.sqlite` is not SQLite, and deleting it orphans the whole lake.**
@@ -815,6 +930,31 @@ independently readable back via `read_parquet()`.
     `docker/php/Dockerfile` with a `conf.d` drop-in. Fine for a local PoC;
     a real deployment would want `preload` plus an opcache preload script
     rather than FFI open to the web tier.
+
+12. **`php artisan serve` strips environment variables, and it will make you
+    draw the wrong conclusion.** Passing `-e DUCKDB_STORAGE=s3` to the
+    container had no effect on served requests: the parent `serve` process
+    saw it (so `docker exec ... tinker` reported `s3`, which is what made it
+    convincing), but `ServeCommand` spawns a `php -S` child and filters the
+    environment through a hardcoded allowlist —
+
+    ```php
+    $hasEnvironment = file_exists($environmentFile);   // .env exists -> true
+    ...
+    return $this->shouldPassThroughEnvironmentVariable($key) ? [$key => $value] : [$key => false];
+    ```
+
+    `static::$passthroughVariables` is `APP_ENV`, `PATH`, `XDEBUG_*` and a few
+    Herd paths. Anything else is forwarded as `false`, i.e. **explicitly
+    unset**, so the child fell back to the config default and read GCS. Every
+    "MinIO made no difference" page measurement was a GCS run. Fixed with
+    `--no-reload`, which bypasses the filter entirely.
+
+    The lesson beyond the flag: **verify a backend switch by removing the
+    backend.** `docker compose stop minio` and re-requesting the page settled
+    in seconds what config inspection had got wrong — the old server still
+    rendered a full report, the fixed one renders nothing. Do that before
+    trusting any A/B measurement between storage backends.
 
 ## Partitioning strategy: `(farm_type, region, year)`, not `farm_id`
 
@@ -972,6 +1112,9 @@ if either errors.
 - **Tracker-count independence**: per-tracker Cash Flow sections resolved by grouping one scan, with the 1/10/50 curve flat (~5% for 50x the trackers, measured worst-case-first in fresh processes) and the generated SQL byte-identical across tracker counts
 
 **Not yet verified:**
+- **Sorting by date within a partition to enable row-group pruning** — the
+  single largest untested lever for narrow report windows. See "Big-farm
+  findings" above for the diagnostic and the predicted effect
 - Postgres or MySQL as the DuckLake catalog backend (a local DuckDB file remains the default per DuckLake's own PoC guidance)
 - Anything at actual data volume — this proves correctness, not performance at scale (though real per-farm row counts gathered separately — Figured's largest farms run ~180K–800K total journal rows — suggest single-farm query volume is not a meaningful performance risk for DuckDB regardless)
 - The `non_operating_income`, `non_operating_expenses`, `non_operating_movements`, `equity_movements` and `gst` sections. These are implemented in `CashFlowQuery` from the structure definition, but the oracle scenario has no accounts in them, so their sign handling — the last three are `setInverse(true)` sections — is written-but-unexercised. Deliberately left that way: the PoC's open question is DuckDB's performance and the multi-dimensional VJ problem, not exhaustive section coverage. GST is the one most likely to matter on real data.
