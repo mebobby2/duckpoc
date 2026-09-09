@@ -71,36 +71,72 @@ final class GrossMarginV2SqlBuilder
                 ) AS m(month_start)
             ),
 
-            report_lines AS MATERIALIZED (
+            -- The accounts this report can place, and the only dimension
+            -- columns it needs. Tiny, and it doubles as the scope filter below.
+            account_scope AS (
+                SELECT
+                    account_id,
+                    account_name,
+                    account_class,
+                    report_group,
+                    report_group_label,
+                    report_group_order,
+                    line_order
+                FROM {$this->appAlias}.accounts
+                WHERE report_group IS NOT NULL
+            ),
+
+            -- Collapse the fact table to one row per (month, account) BEFORE
+            -- any dimension column is attached.
+            --
+            -- The previous shape materialised the joined lines — every journal
+            -- row carrying its account's name, class and labels — and a
+            -- 12-month window on the 500M-row farm made that 125M rows wide
+            -- enough to exceed a 13.4 GiB memory limit, spilling ~38k local
+            -- reads and writes. Aggregating first leaves ~600 rows, because
+            -- SUM is associative: summing per account and then per group gives
+            -- the same totals as summing the raw lines once.
+            --
+            -- MATERIALIZED belongs here rather than on the raw scan. `levels`
+            -- is read twice below (once for the margin, once for the rows), so
+            -- without it DuckDB is free to re-derive this CTE and scan the lake
+            -- twice. Pinning the small aggregate guarantees one scan.
+            monthly_by_account AS MATERIALIZED (
                 SELECT
                     date_trunc('month', tl.date)::DATE AS month_start,
-                    a.account_id,
+                    tl.account_id,
+                    SUM(tl.amount) AS amount_raw
+                FROM {$this->alias}.transaction_lines tl
+                {$this->factScopePredicate()}
+                GROUP BY 1, 2
+            ),
+
+            -- Section is derived, not stored: every `*_income` group rolls up
+            -- to Income and every `*_costs` group to Direct Costs. Keeping it
+            -- derived means a new enterprise type needs no schema change.
+            --
+            -- Revenue is stored as a credit, so REVENUE-class accounts are
+            -- flipped here. Flipping the per-account subtotal is equivalent to
+            -- flipping each line: account_class is a property of the account,
+            -- so every line inside one of these groups shares the same sign.
+            classified AS (
+                SELECT
+                    f.month_start,
+                    f.account_id,
                     a.account_name,
                     a.account_class,
                     a.report_group,
                     a.report_group_label,
                     a.report_group_order,
                     a.line_order,
-                    tl.amount
-                FROM {$this->alias}.transaction_lines tl
-                JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
-                {$this->inScopePredicate()}
-            ),
-
-            -- Section is derived, not stored: every `*_income` group rolls up
-            -- to Income and every `*_costs` group to Direct Costs. Keeping it
-            -- derived means a new enterprise type needs no schema change.
-            classified AS (
-                SELECT
-                    l.*,
-                    CASE WHEN l.report_group LIKE '%_income' THEN 'income' ELSE 'costs' END AS report_section,
-                    CASE WHEN l.report_group LIKE '%_income' THEN 1 ELSE 2 END AS report_section_order
-                FROM report_lines l
+                    CASE WHEN a.account_class = 'REVENUE' THEN -f.amount_raw ELSE f.amount_raw END AS amount,
+                    CASE WHEN a.report_group LIKE '%_income' THEN 'income' ELSE 'costs' END AS report_section,
+                    CASE WHEN a.report_group LIKE '%_income' THEN 1 ELSE 2 END AS report_section_order
+                FROM monthly_by_account f
+                JOIN account_scope a ON a.account_id = f.account_id
             ),
 
             -- Line items, group subtotals AND section totals from ONE scan.
-            -- Revenue is stored as a credit, so REVENUE-class accounts are
-            -- flipped on the way out.
             levels AS (
                 SELECT
                     c.month_start,
@@ -112,8 +148,7 @@ final class GrossMarginV2SqlBuilder
                     any_value(c.report_group_order) AS report_group_order,
                     any_value(c.account_name) AS account_name,
                     any_value(c.line_order) AS line_order,
-                    SUM(CASE WHEN c.account_class = 'REVENUE' THEN -c.amount ELSE c.amount END)
-                        / 10000.0 AS amount,
+                    SUM(c.amount) / 10000.0 AS amount,
                     GROUPING(c.account_id) AS g_account,
                     GROUPING(c.report_group) AS g_group
                 FROM classified c
@@ -235,6 +270,29 @@ final class GrossMarginV2SqlBuilder
             LEFT JOIN milk_units mu ON mu.month_start = m.month_start
             LEFT JOIN stock_units su ON su.month_start = m.month_start
             ORDER BY r.report_section_order, r.report_group_order, r.level, r.line_order, m.interval_index
+            SQL;
+    }
+
+    /**
+     * The scope predicate for the fact table alone.
+     *
+     * Same rows as `inScopePredicate()`, expressed without a join: the
+     * semi-join against `account_scope` stands in for `a.report_group IS NOT
+     * NULL`, which is equivalent because `account_id` is unique in `accounts`.
+     * Keeping the dimension out of the scan is what lets the aggregate run
+     * before any string column is touched.
+     */
+    private function factScopePredicate(): string
+    {
+        return <<<SQL
+            WHERE tl.farm_id   = \$farm_id
+                  AND tl.basis     = \$basis
+                  AND tl.account_id IN (SELECT account_id FROM account_scope)
+                  AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
+                  AND (
+                        (tl.date <= CAST(\$horizon AS DATE) AND tl.type = 'actuals')
+                     OR (tl.date >  CAST(\$horizon AS DATE) AND tl.type = 'forecast')
+                  )
             SQL;
     }
 
