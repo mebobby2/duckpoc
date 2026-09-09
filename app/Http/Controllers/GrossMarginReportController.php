@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace App\Http\Controllers;
 
 use App\Services\CashFlow\GrossMarginQuery;
+use App\Services\CashFlow\ParquetFileLister;
 use App\Services\CashFlow\QueryProfiler;
+use App\Services\CashFlow\StorageRequestProfile;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\View\View;
@@ -28,6 +30,17 @@ class GrossMarginReportController extends Controller
     private const string DEFAULT_PERIOD_TO = '2021-12-31';
     private const string DEFAULT_HORIZON = '2021-12-31';
 
+    /** Source rows shown before truncating. */
+    private const int SOURCE_ROW_LIMIT = 500;
+
+    /**
+     * Above this report time, the diagnostic scans are skipped unless
+     * `?force_diagnostics=1` — the report's own elapsed time is a free proxy
+     * for how much data is in scope. Same guard, and same reasoning, as the
+     * tracker Cash Flow page.
+     */
+    private const float DIAGNOSTICS_BUDGET_MS = 30000.0;
+
     public function __invoke(Request $request, DuckDB $db): View
     {
         $alias = config('duckdb.attached_alias');
@@ -48,11 +61,23 @@ class GrossMarginReportController extends Controller
         $error = null;
         $elapsedMs = null;
         $profile = null;
+        $sourceRows = [];
+        $sourceSummary = ['n' => 0, 'n_trackers' => 0, 'net_dollars' => 0.0];
+        $files = [];
+        $storage = null;
+        $summaryMs = null;
+        $sourceRowsMs = null;
+        $diagnosticsAffordable = true;
 
         if ($farm === null) {
             $error = 'No tracker farms found. Run: php artisan duckdb:tracker:seed && php artisan duckdb:stock:seed';
         } else {
             try {
+                // Armed before any lake read, so its counters cover this
+                // report's own query rather than a re-run.
+                $requests = new StorageRequestProfile($db);
+                $requests->startLogging();
+
                 $startedAt = microtime(true);
 
                 $rows = $query->run(
@@ -66,6 +91,36 @@ class GrossMarginReportController extends Controller
                 );
 
                 $elapsedMs = (microtime(true) - $startedAt) * 1000;
+
+                $scope = [
+                    $farm['farm_id'],
+                    $farm['farm_type'],
+                    $farm['region'],
+                    $periodFrom,
+                    $periodTo,
+                    $horizon,
+                    $basis,
+                ];
+
+                $diagnosticsAffordable = $elapsedMs < self::DIAGNOSTICS_BUDGET_MS
+                    || $request->boolean('force_diagnostics');
+
+                if ($diagnosticsAffordable) {
+                    $startedAt = microtime(true);
+                    $sourceSummary = $query->sourceRowSummary(...$scope);
+                    $summaryMs = (microtime(true) - $startedAt) * 1000;
+
+                    $startedAt = microtime(true);
+                    $sourceRows = $query->sourceRows(...$scope, limit: self::SOURCE_ROW_LIMIT);
+                    $sourceRowsMs = (microtime(true) - $startedAt) * 1000;
+                }
+
+                // Catalog metadata only — no data scan — so it stays on at any
+                // volume.
+                $files = (new ParquetFileLister($db, $alias))
+                    ->forQuery($farm, $periodFrom, $periodTo);
+
+                $storage = $requests->summarise($files);
 
                 if ($request->boolean('explain')) {
                     $profile = (new QueryProfiler($db))->profile($query->sql(), [
@@ -98,6 +153,15 @@ class GrossMarginReportController extends Controller
             'error' => $error,
             'elapsedMs' => $elapsedMs,
             'profile' => $profile,
+            'sourceRows' => $sourceRows,
+            'sourceSummary' => $sourceSummary,
+            'sourceRowLimit' => self::SOURCE_ROW_LIMIT,
+            'summaryMs' => $summaryMs,
+            'sourceRowsMs' => $sourceRowsMs,
+            'diagnosticsAffordable' => $diagnosticsAffordable,
+            'diagnosticsBudgetMs' => self::DIAGNOSTICS_BUDGET_MS,
+            'files' => $files,
+            'storage' => $storage,
             'trackerCount' => $farm === null ? 0 : $this->trackerCount($farm['farm_id']),
             'movementRowCount' => $farm === null ? 0 : $this->movementRowCount($farm['farm_id']),
         ]);

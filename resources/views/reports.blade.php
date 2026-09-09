@@ -55,15 +55,35 @@
             </p>
         </a>
 
+
+        <a href="{{ route('gross-margin') }}"
+           class="block rounded-lg border border-slate-200 bg-white p-5 shadow-sm hover:border-slate-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Gross Margin — per operating entity</h2>
+                <span class="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+                    the slow one in Figured
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                Income, direct costs <em>and stock quantities</em> per tracker, with margin expressed per
+                head. This is the report Figured's ex-CTO named as the real bottleneck — it needs a
+                per-tracker running stock balance, which Figured computes with a query per tracker,
+                twice per report.
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: per-tracker quantities · stateful opening → movements → closing as one window
+                function · federated join across GCS journals and MySQL stock movements
+            </p>
+        </a>
     </div>
 
     <section class="mt-10 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
         <h2 class="text-sm font-semibold">Not built yet</h2>
         <ul class="mt-2 space-y-1 text-sm text-slate-600">
             <li>
-                <span class="font-medium text-slate-900">Livestock valuation</span> — the stateful
-                per-tracker opening → movements → closing chain. The genuinely hard
-                multi-dimensional case, and the half the tracker report above does not cover.
+                <span class="font-medium text-slate-900">Livestock valuation</span> — stock is now
+                tracked in <em>head</em>; valuing it in dollars (national standard cost, market value)
+                is the remaining half.
             </li>
             <li>
                 <span class="font-medium text-slate-900">Overdraft interest</span> — a virtual

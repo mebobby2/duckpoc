@@ -111,16 +111,75 @@ final class GrossMarginSqlBuilder
                     tl.amount
                 FROM {$this->alias}.transaction_lines tl
                 JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
-                WHERE tl.farm_id   = \$farm_id
-                      AND tl.farm_type = \$farm_type
-                      AND tl.region    = \$region
-                      AND tl.basis     = \$basis
-                      AND tl.tracker_id IS NOT NULL
-                      AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
-                      AND (
-                            (tl.date <= CAST(\$horizon AS DATE) AND tl.type = 'actuals')
-                         OR (tl.date >  CAST(\$horizon AS DATE) AND tl.type = 'forecast')
-                      )
+                {$this->inScopePredicate()}
+            SQL;
+    }
+
+    /**
+     * The one definition of "which journal lines feed this report".
+     *
+     * Shared with the source-row diagnostics below, so the listing cannot show
+     * rows the report did not consume. Note `tracker_id IS NOT NULL`: a Gross
+     * Margin report is per operating entity, so farm-level overheads have no
+     * tracker to belong to and are out of scope by definition — which is a
+     * real difference from Cash Flow, where they are the bulk of the report.
+     */
+    private function inScopePredicate(): string
+    {
+        return <<<SQL
+            WHERE tl.farm_id   = \$farm_id
+                  AND tl.farm_type = \$farm_type
+                  AND tl.region    = \$region
+                  AND tl.basis     = \$basis
+                  AND tl.tracker_id IS NOT NULL
+                  AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
+                  AND (
+                        (tl.date <= CAST(\$horizon AS DATE) AND tl.type = 'actuals')
+                     OR (tl.date >  CAST(\$horizon AS DATE) AND tl.type = 'forecast')
+                  )
+            SQL;
+    }
+
+    /**
+     * The journal lines the report consumed, for display.
+     */
+    public function buildSourceRowsSql(): string
+    {
+        $fp = self::FIXED_POINT;
+
+        return <<<SQL
+            SELECT
+                tl.line_id,
+                tl.date,
+                tl.type,
+                a.account_name,
+                a.account_class,
+                a.account_category,
+                tl.tracker_id,
+                t.tracker_name,
+                tl.amount AS amount_raw,
+                tl.amount / {$fp}.0 AS amount_dollars
+            FROM {$this->alias}.transaction_lines tl
+            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
+            LEFT JOIN {$this->appAlias}.trackers t ON t.tracker_id = tl.tracker_id
+            {$this->inScopePredicate()}
+            ORDER BY tl.date, tl.line_id
+            LIMIT \$row_limit
+            SQL;
+    }
+
+    public function buildSourceRowCountSql(): string
+    {
+        $fp = self::FIXED_POINT;
+
+        return <<<SQL
+            SELECT
+                count(*) AS n,
+                count(DISTINCT tl.tracker_id) AS n_trackers,
+                sum(tl.amount) / {$fp}.0 AS net_dollars
+            FROM {$this->alias}.transaction_lines tl
+            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
+            {$this->inScopePredicate()}
             SQL;
     }
 
