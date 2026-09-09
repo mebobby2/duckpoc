@@ -128,8 +128,6 @@ final class GrossMarginSqlBuilder
     {
         return <<<SQL
             WHERE tl.farm_id   = \$farm_id
-                  AND tl.farm_type = \$farm_type
-                  AND tl.region    = \$region
                   AND tl.basis     = \$basis
                   AND tl.tracker_id IS NOT NULL
                   AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
@@ -163,7 +161,13 @@ final class GrossMarginSqlBuilder
             JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
             LEFT JOIN {$this->appAlias}.trackers t ON t.tracker_id = tl.tracker_id
             {$this->inScopePredicate()}
-            ORDER BY tl.date, tl.line_id
+            -- `date` only. Adding `line_id` as a tie-breaker forced DuckDB to
+            -- read it for every row in scope to resolve the sort, and it is
+            -- ~80% of each file's bytes (unique per row, so barely
+            -- compressible). On a 20.8M-row window that turned a 500-row debug
+            -- listing into a 35-second column scan, while the report itself
+            -- never touches the column at all.
+            ORDER BY tl.date
             LIMIT \$row_limit
             SQL;
     }

@@ -41,16 +41,20 @@ use Throwable;
 final class StorageRequestProfile
 {
     /**
-     * Columns the tracker report actually reads from `transaction_lines`.
+     * Columns a report reads from `transaction_lines` as ORDINARY columns.
      *
-     * Predicate columns (farm_id, farm_type, region, basis, type) compress to
-     * near nothing and are constant per file, but they are still separate
-     * column chunks and so still cost a request each. `line_id` is excluded
-     * deliberately — it is ~80% of each file's bytes and the report never
-     * touches it, which is why column pruning matters so much here.
+     * Only these cost requests. `farm_id` and `basis` are excluded because
+     * they are partition keys, and a partition-key predicate is resolved from
+     * the catalog — measured at ~1 request versus ~1 per row group per file
+     * for an ordinary column. `farm_type` and `region` are excluded because no
+     * report filters on them any more. `line_id` is excluded because nothing
+     * reads it, though it is ~80% of each file's bytes.
+     *
+     * An earlier version listed all nine and produced badly inflated
+     * predictions as a result.
      */
     private const array COLUMNS_READ = [
-        'farm_id', 'farm_type', 'region', 'basis', 'type', 'date', 'account_id', 'amount', 'tracker_id',
+        'date', 'type', 'account_id', 'amount', 'tracker_id',
     ];
 
     public function __construct(

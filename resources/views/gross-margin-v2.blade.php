@@ -505,8 +505,23 @@
         </div>
     @endif
 
+    @if ($sourceRowsSkipped)
+        <div class="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-xs text-amber-900">
+            <p class="text-sm font-medium">Source-row listing skipped</p>
+            <p class="mt-1">
+                {{ number_format($sourceSummary['n']) }} rows in scope, over the
+                {{ number_format($sourceListingMaxRows) }} row limit. The listing is
+                <code class="rounded bg-amber-100 px-1">ORDER BY date LIMIT {{ $sourceRowLimit }}</code>,
+                which DuckDB answers with a bounded top-N heap — but it still reads the sort column for
+                every row in scope. The row counts and net total above are already computed, so nothing
+                is missing except the sample rows.
+                <a class="font-medium underline" href="{{ request()->fullUrlWithQuery(['force_source_rows' => 1]) }}">Load it anyway</a>.
+            </p>
+        </div>
+    @endif
+
     {{-- The journal lines the report consumed --}}
-    @if ($diagnosticsAffordable && $sourceSummary['n'] > 0)
+    @if ($diagnosticsAffordable && !$sourceRowsSkipped && $sourceSummary['n'] > 0)
         <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm">
             <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
                 Source transactions

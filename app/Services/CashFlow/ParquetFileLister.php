@@ -96,13 +96,12 @@ final class ParquetFileLister
         // read — treating them as out of scope would be wrong, not cautious.
         $inScope = true;
 
-        if (preg_match('~/(farm_type=[^/]+)/(region=[^/]+)/(year=[^/]+)/~', $path, $m)) {
+        if (preg_match('~/(farm_id=[^/]+)/(basis=[^/]+)/(year=[^/]+)/~', $path, $m)) {
             $partition = "{$m[1]}/{$m[2]}/{$m[3]}";
 
             $year = (int) substr($m[3], strlen('year='));
 
-            $inScope = $m[1] === 'farm_type='.$farm['farm_type']
-                && $m[2] === 'region='.$farm['region']
+            $inScope = $m[1] === 'farm_id='.$farm['farm_id']
                 && $year >= $fromYear
                 && $year <= $toYear;
         }

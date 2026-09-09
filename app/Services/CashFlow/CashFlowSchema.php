@@ -14,42 +14,51 @@ use Saturio\DuckDB\DuckDB;
  * `database/migrations/..._create_cashflow_dimension_tables.php` for why. Only
  * fact data belongs in the lake, mirroring how Figured places its own data.
  *
- * Partitioning strategy: `(farm_type, region, year(date))` — NOT `farm_id`.
- * This is a deliberate choice to serve both consumers of this same physical
- * data with one layout, rather than maintaining two:
+ * Partitioning strategy: `(farm_id, basis, year(date))`.
  *
- * - BigQuery's cross-farm benchmarking/practice-wide queries filter by
- *   cohort attributes (farm_type, region), never by an individual farm_id —
- *   partitioning on farm_id would give those queries zero pruning benefit
- *   and force scanning data scattered across thousands of unrelated
- *   directories. Partitioning on (farm_type, region, year) gives BigQuery
- *   real, direct pruning on exactly what it filters by.
- * - DuckDB's single-farm report queries lose farm-level partition pruning as
- *   a result — a query for one farm now has to scan its whole cohort
- *   partition (~20-30 farms), not just its own directory. This is a
- *   deliberately cheap trade: real per-farm data (Figured's largest farms
- *   run ~180K-800K total journal rows) means even a full cohort partition is
- *   only single-digit millions of rows — trivial for DuckDB to scan and
- *   filter, regardless.
- * - To recover *some* of DuckDB's lost precision, farm_id is used as a
- *   physical SORT key (not a partition key) within each partition's file(s):
- *   seed/insert code is expected to ORDER BY farm_id, so that Parquet
- *   row-group min/max statistics let DuckDB's reader skip row groups outside
- *   the target farm_id's range even without a farm_id partition. DuckLake
- *   has no separate "cluster by"/sort-key concept distinct from
- *   PARTITIONED BY — this has to be enforced by insert order, and verified
- *   empirically (see DuckDbCashFlowPartitionCheckCommand), not assumed.
+ * Chosen by measurement, not principle. Every key is a filter that every
+ * customer report applies, and the cost difference between a partition key and
+ * an ordinary column is large: a partition-key predicate is resolved from the
+ * catalog for ~1 request, while an ordinary-column predicate costs roughly one
+ * request per row group per file. On a 2-month single-farm report the four
+ * candidate layouts measured:
  *
- * IMPORTANT CAVEAT (not yet solved, flagged honestly): this sort-order
- * benefit only holds as long as data is written in farm_id order. Real
- * incremental writes (new transactions arriving farm-by-farm, not in bulk
- * sorted batches) will NOT naturally stay farm_id-sorted over time — a real
- * system would need periodic compaction with an explicit re-sort to
- * maintain this. Not designed here; noted as a known gap for Phase 5+.
+ *     (farm_type, region, year)            22 requests   3,885 ms
+ *     (farm_type, region, farm_id, year)   11 requests   1,454 ms
+ *     (farm_id, basis, year)                7 requests   1,378 ms   <- this
+ *     (farm_id, basis, type, year)         14 requests   1,280 ms
  *
- * DuckLake can only partition a table by ITS OWN columns, not a joined
- * dimension table's — that's why farm_type/region are denormalized directly
- * onto transaction_lines, not just left in the `farms` table.
+ * `basis` is safe as a key because a report reads exactly one basis —
+ * Figured's `ReportStructure::getBasis(): string` returns a single value, and
+ * `OverdraftLimitsStructureBuilder` even hard-codes `Basis::CASH`.
+ *
+ * `type` (actuals/forecast) was rejected despite looking attractive: it
+ * produced 1,665 files for 160 partitions, because the report's horizon
+ * predicate spans both values so neither partition can be pruned, and the
+ * extra key just fragments writes.
+ *
+ * WHY NOT `(farm_type, region, ...)` ANY MORE: that layout existed to serve
+ * BigQuery's cross-farm queries from the same physical files. That is no longer
+ * the plan — BigQuery is served by a separate dbt-derived layer, because
+ * DuckLake writes row deletions to sidecar `-delete.parquet` files that only
+ * DuckDB resolves. A raw Parquet reader saw 100,000 rows where the table held
+ * 60,000, which makes a shared layout not merely suboptimal but incorrect.
+ * Freed of that constraint, this layout optimises purely for single-farm
+ * reporting.
+ *
+ * `farm_type` and `region` REMAIN as columns, deliberately. They are no longer
+ * partition keys and no report filters on them, but the BigQuery export layer
+ * wants them for clustering, and they cost nothing while unread.
+ *
+ * On sorting: DuckLake has no sort-key concept, so any ordering must come from
+ * insert order and is lost on compaction. It also interacts badly with
+ * partitioning — an `ORDER BY date` against a farm-leading partition key
+ * scatters each partition's rows through the sorted stream and fragments the
+ * write (the 1,665-file result above). If a sort is used, lead with the
+ * partition keys. In practice it barely matters: a real farm holds ~800K rows
+ * over 10 years, so a farm-basis-year partition is ~40K rows and row groups
+ * hold 2,621,440 — an entire partition is one row group, leaving nothing for
+ * row-group statistics to prune.
  *
  * IMPORTANT: DuckLake partitioning only applies to data written AFTER
  * `SET PARTITIONED BY` runs — existing rows are not retroactively
@@ -199,7 +208,7 @@ final class CashFlowSchema
         // farm_id.
         $this->db->query(<<<SQL
             ALTER TABLE {$this->alias}.transaction_lines
-            SET PARTITIONED BY (farm_type, region, year(date))
+            SET PARTITIONED BY (farm_id, basis, year(date))
             SQL);
     }
 }

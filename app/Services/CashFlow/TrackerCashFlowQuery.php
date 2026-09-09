@@ -176,8 +176,6 @@ final class TrackerCashFlowQuery
     ): void {
         foreach ([
             'farm_id' => $farmId,
-            'farm_type' => $farmType,
-            'region' => $region,
             'basis' => $basis,
             'period_from' => $periodFrom,
             'period_to' => $periodTo,

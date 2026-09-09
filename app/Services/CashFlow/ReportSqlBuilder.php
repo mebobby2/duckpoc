@@ -95,8 +95,10 @@ final class ReportSqlBuilder
     /**
      * The rows in scope, with the actuals/forecast horizon applied.
      *
-     * farm_type and region are named so DuckDB can prune to this cohort's
-     * Parquet files rather than scanning every partition.
+     * farm_id and basis are named because they are partition keys — DuckLake
+     * resolves those predicates from its catalog for roughly one request,
+     * where an ordinary-column predicate costs about one request per row group
+     * per file.
      */
     private function reportLinesCte(): string
     {
@@ -123,8 +125,6 @@ final class ReportSqlBuilder
     {
         return <<<SQL
             WHERE tl.farm_id   = \$farm_id
-                  AND tl.farm_type = \$farm_type
-                  AND tl.region    = \$region
                   AND tl.basis     = \$basis
                   AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
                   AND (
@@ -158,7 +158,13 @@ final class ReportSqlBuilder
             FROM {$this->alias}.transaction_lines tl
             JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
             {$this->inScopePredicate()}
-            ORDER BY tl.date, tl.line_id
+            -- `date` only. Adding `line_id` as a tie-breaker forced DuckDB to
+            -- read it for every row in scope to resolve the sort, and it is
+            -- ~80% of each file's bytes (unique per row, so barely
+            -- compressible). On a 20.8M-row window that turned a 500-row debug
+            -- listing into a 35-second column scan, while the report itself
+            -- never touches the column at all.
+            ORDER BY tl.date
             LIMIT \$row_limit
             SQL;
     }

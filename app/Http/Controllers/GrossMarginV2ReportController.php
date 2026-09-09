@@ -31,6 +31,16 @@ class GrossMarginV2ReportController extends Controller
     private const string DEFAULT_PERIOD_TO = '2027-05-31';
 
     private const int SOURCE_ROW_LIMIT = 500;
+
+    /**
+     * Above this many rows in scope, the source-row listing is skipped unless
+     * `?force_source_rows=1`.
+     *
+     * The report-time budget below is not sufficient on its own: the listing's
+     * cost tracks rows IN SCOPE, not report time. A 3.6s report over a 20.8M
+     * row window passed the 30s budget and then spent 35s on the listing.
+     */
+    private const int SOURCE_LISTING_MAX_ROWS = 5_000_000;
     private const float DIAGNOSTICS_BUDGET_MS = 30000.0;
 
     public function __invoke(Request $request, DuckDB $db): View
@@ -60,6 +70,7 @@ class GrossMarginV2ReportController extends Controller
         $summaryMs = null;
         $sourceRowsMs = null;
         $diagnosticsAffordable = true;
+        $sourceRowsSkipped = false;
         $trace = null;
 
         if ($farm === null) {
@@ -114,9 +125,14 @@ class GrossMarginV2ReportController extends Controller
                     $sourceSummary = $query->sourceRowSummary(...$scope);
                     $summaryMs = (microtime(true) - $startedAt) * 1000;
 
-                    $startedAt = microtime(true);
-                    $sourceRows = $query->sourceRows(...$scope, limit: self::SOURCE_ROW_LIMIT);
-                    $sourceRowsMs = (microtime(true) - $startedAt) * 1000;
+                    $sourceRowsSkipped = $sourceSummary['n'] > self::SOURCE_LISTING_MAX_ROWS
+                        && !$request->boolean('force_source_rows');
+
+                    if (!$sourceRowsSkipped) {
+                        $startedAt = microtime(true);
+                        $sourceRows = $query->sourceRows(...$scope, limit: self::SOURCE_ROW_LIMIT);
+                        $sourceRowsMs = (microtime(true) - $startedAt) * 1000;
+                    }
                 }
 
                 // Catalog metadata only — no data scan — so it stays on at any
@@ -166,6 +182,8 @@ class GrossMarginV2ReportController extends Controller
             'summaryMs' => $summaryMs,
             'sourceRowsMs' => $sourceRowsMs,
             'diagnosticsAffordable' => $diagnosticsAffordable,
+            'sourceRowsSkipped' => $sourceRowsSkipped,
+            'sourceListingMaxRows' => self::SOURCE_LISTING_MAX_ROWS,
             'trace' => $trace,
         ]);
     }
