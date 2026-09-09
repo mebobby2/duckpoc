@@ -75,6 +75,27 @@
                 function · federated join across GCS journals and MySQL stock movements
             </p>
         </a>
+
+        <a href="{{ route('gross-margin-v2') }}"
+           class="block rounded-lg border border-slate-300 bg-white p-5 shadow-sm ring-1 ring-slate-200 hover:border-slate-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Gross Margin V2 — mixed enterprise</h2>
+                <span class="rounded bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800">
+                    milk + livestock, 1 query
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                The real report's shape: sections nested under Income and Direct Costs, mixing milk and
+                livestock enterprises on one farm, with a Gross Margin line and Actual/Forecast per column.
+                Figured needs two separate reports for this — milk and livestock quantities come from
+                different services and the two structure builders exclude each other.
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: 4 aggregation levels from one scan via GROUPING SETS · hierarchy as data, not
+                builder branching · two different quantity shapes (milk as a flow, livestock as a running
+                balance) in one statement
+            </p>
+        </a>
     </div>
 
     <section class="mt-10 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
