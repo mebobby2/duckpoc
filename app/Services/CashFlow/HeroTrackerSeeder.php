@@ -280,7 +280,7 @@ final class HeroTrackerSeeder
                 END,
                 CASE
                     WHEN a.account_category IN ('tracker_income', 'tracker_direct_costs')
-                    THEN '{$this->farmId()}-t' || lpad(CAST(g.i % {$trackers} AS VARCHAR), 2, '0')
+                    THEN '{$this->farmId()}-t' || lpad(CAST(g.tracker_idx AS VARCHAR), 2, '0')
                 END
             FROM (
                 SELECT
@@ -288,7 +288,22 @@ final class HeroTrackerSeeder
                     -- 7919 is prime, so dates scatter across the year instead
                     -- of marching in lockstep with the account cycle.
                     CAST((i * 7919) % 365 AS INTEGER) AS day_offset,
-                    CAST(i % {$accountCount} AS INTEGER) AS acc_idx
+                    CAST(i % {$accountCount} AS INTEGER) AS acc_idx,
+                    -- The CYCLE number, not the phase.
+                    --
+                    -- Using `i % trackers` correlates the tracker with the
+                    -- account, because gcd(accounts, trackers) > 1: with 14
+                    -- accounts and 50 trackers, gcd is 2, so even-numbered
+                    -- trackers only ever saw even-numbered accounts. Both
+                    -- income accounts are odd-indexed, so half the trackers
+                    -- got costs and no income at all — every one of them
+                    -- showing a large negative gross margin.
+                    --
+                    -- Dividing instead advances the tracker once per complete
+                    -- pass through the chart of accounts, so every tracker
+                    -- receives every account. Year is a per-chunk constant
+                    -- here, so it cannot correlate with either.
+                    CAST((i // {$accountCount}) % {$trackers} AS INTEGER) AS tracker_idx
                 FROM range({$offset}, {$upper}) AS t(i)
             ) g
             JOIN (

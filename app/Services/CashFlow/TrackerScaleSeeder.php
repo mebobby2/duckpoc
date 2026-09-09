@@ -264,7 +264,7 @@ final class TrackerScaleSeeder
                 -- tracker, exactly as in the real report.
                 CASE
                     WHEN a.account_category IN ('tracker_income', 'tracker_direct_costs')
-                    THEN '{$farmId}-t' || lpad(CAST(g.i % {$trackerCount} AS VARCHAR), 2, '0')
+                    THEN '{$farmId}-t' || lpad(CAST(g.tracker_idx AS VARCHAR), 2, '0')
                 END
             FROM (
                 SELECT
@@ -272,7 +272,20 @@ final class TrackerScaleSeeder
                     -- `//`, not `/`: DuckDB's `/` is float division.
                     {$this->firstYear()} + CAST((i // {$accountCount}) % {$this->years()} AS INTEGER) AS yr,
                     CAST((i * 7919) % 365 AS INTEGER) AS day_offset,
-                    CAST(i % {$accountCount} AS INTEGER) AS acc_idx
+                    CAST(i % {$accountCount} AS INTEGER) AS acc_idx,
+                    -- Advanced once per complete (account x year) pass, so it
+                    -- correlates with neither.
+                    --
+                    -- `i % trackerCount` correlated with the account, because
+                    -- gcd(accounts, trackers) > 1 — with 14 accounts and 10
+                    -- trackers, gcd is 2, so even trackers only ever saw even
+                    -- accounts. Both income accounts are odd-indexed, so half
+                    -- the trackers received costs and no income, and showed a
+                    -- large negative gross margin. Dividing by accountCount
+                    -- alone would then correlate with the year, which is
+                    -- `(i // accountCount) % YEARS` — hence dividing by their
+                    -- product.
+                    CAST((i // ({$accountCount} * {$this->years()})) % {$trackerCount} AS INTEGER) AS tracker_idx
                 FROM range(0, {$rowTarget}) AS t(i)
             ) g
             JOIN (
