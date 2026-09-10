@@ -324,7 +324,12 @@ class GrossMarginV2ReportController extends Controller
         try {
             return DB::table('farms')
                 ->join('trackers', 'trackers.farm_id', '=', 'farms.farm_id')
-                ->whereIn('farms.farm_id', [GrossMarginV2Seeder::FARM_ID, GrossMarginV2Seeder::BULK_FARM_ID, GrossMarginV2Seeder::HUGE_FARM_ID])
+                ->whereIn('farms.farm_id', [
+                    GrossMarginV2Seeder::FARM_ID,
+                    GrossMarginV2Seeder::BULK_FARM_ID,
+                    GrossMarginV2Seeder::HUGE_FARM_ID,
+                    GrossMarginV2Seeder::MEGA_FARM_ID,
+                ])
                 ->select('farms.farm_id', 'farms.farm_type', 'farms.region')
                 ->groupBy('farms.farm_id', 'farms.farm_type', 'farms.region')
                 ->get()

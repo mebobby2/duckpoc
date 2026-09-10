@@ -20,6 +20,7 @@ class DuckDbGmV2SeedCommand extends Command
     protected $signature = 'duckdb:gm2:seed
         {--bulk : Seed the volume variant (gm-dairy-farm-1m) instead of the demo farm}
         {--huge : Seed the large variant (gm-dairy-farm-500m)}
+        {--mega : Seed the billion-row variant (gm-dairy-farm-1b)}
         {--rows=1000000 : Target journal lines when --bulk or --huge is used}';
 
     protected $description = 'Seed a mixed milk + livestock dairy farm for the Gross Margin V2 report';
@@ -34,16 +35,19 @@ class DuckDbGmV2SeedCommand extends Command
         $schema->applyWriteTuning();
         $schema->addTrackerColumn();
 
+        $mega = (bool) $this->option('mega');
         $huge = (bool) $this->option('huge');
-        $bulk = $huge || (bool) $this->option('bulk');
+        $bulk = $mega || $huge || (bool) $this->option('bulk');
         $rows = $bulk ? max(1, (int) $this->option('rows')) : 0;
 
         $farmId = match (true) {
+            $mega => GrossMarginV2Seeder::MEGA_FARM_ID,
             $huge => GrossMarginV2Seeder::HUGE_FARM_ID,
             $bulk => GrossMarginV2Seeder::BULK_FARM_ID,
             default => GrossMarginV2Seeder::FARM_ID,
         };
         $region = match (true) {
+            $mega => GrossMarginV2Seeder::MEGA_REGION,
             $huge => GrossMarginV2Seeder::HUGE_REGION,
             $bulk => GrossMarginV2Seeder::BULK_REGION,
             default => GrossMarginV2Seeder::REGION,

@@ -34,6 +34,15 @@ final class GrossMarginV2Seeder
     public const string HUGE_FARM_ID = 'gm-dairy-farm-500m';
     public const string HUGE_REGION = 'gm-huge';
 
+    /**
+     * The billion-row variant. Separate from HUGE rather than a bigger --rows
+     * on it, because the 500M farm is the reference every timing in the README
+     * is quoted against; re-seeding it at a different volume would invalidate
+     * those numbers with nothing left to compare to.
+     */
+    public const string MEGA_FARM_ID = 'gm-dairy-farm-1b';
+    public const string MEGA_REGION = 'gm-mega';
+
     private const int FIXED_POINT = 10000;
 
     /**
