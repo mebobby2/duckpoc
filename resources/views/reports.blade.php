@@ -96,6 +96,27 @@
                 balance) in one statement
             </p>
         </a>
+
+        <a href="{{ route('alloydb-gross-margin') }}"
+           class="block rounded-lg border border-sky-300 bg-white p-5 shadow-sm ring-1 ring-sky-200 hover:border-sky-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Gross Margin — AlloyDB</h2>
+                <span class="rounded bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-800">
+                    one database
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                The same report, same SQL structure, served from AlloyDB — PostgreSQL 17 with an
+                in-memory columnar engine. Journals, accounts, trackers, milk production and stock
+                movements all live in one database, so the report is an ordinary join and there is
+                no lake, no catalog and no maintenance to schedule.
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: whether one relational database can serve both the app and its reports ·
+                columnar engine capacity as the scaling limit · the same GROUPING SETS hierarchy
+                running unmodified on a different engine
+            </p>
+        </a>
     </div>
 
     <section class="mt-10 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">

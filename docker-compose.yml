@@ -21,6 +21,33 @@ services:
     # `docker compose run --rm app <command>`, which overrides this.
     command: php artisan serve --host=0.0.0.0 --port=8000
 
+  # The same app, pinned to MinIO instead of GCS, so both storage backends are
+  # servable side by side: 8080 reads gs://, 8081 reads s3://.
+  #
+  # --no-reload is load-bearing, not a preference. `artisan serve` spawns a
+  # `php -S` child and filters its environment through a hardcoded allowlist
+  # (ServeCommand::$passthroughVariables), forwarding anything else as `false`
+  # — i.e. explicitly unset. Without this flag DUCKDB_STORAGE never reaches the
+  # process that handles requests, the child falls back to the config default,
+  # and the page silently serves GCS while claiming to be MinIO. That cost a
+  # round of wrong conclusions; verify a backend switch by stopping the backend.
+  app-minio:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      HOME: /tmp
+      DUCKDB_STORAGE: s3
+    depends_on:
+      - mysql
+      - minio
+    ports:
+      - "8081:8000"
+    command: php artisan serve --host=0.0.0.0 --port=8000 --no-reload
+
   # S3-compatible object storage on the same host, so the report can be
   # measured without the ~8 ms Auckland->Sydney round trip that dominates every
   # GCS number in this PoC. It is a latency control, not a production proposal:

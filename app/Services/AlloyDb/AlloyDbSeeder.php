@@ -5,39 +5,85 @@ declare(strict_types=1);
 namespace App\Services\AlloyDb;
 
 use Illuminate\Database\ConnectionInterface;
-use Illuminate\Support\Facades\DB;
 
 /**
- * Loads AlloyDB with data equivalent to the DuckLake path, so the two can be
- * timed against each other rather than against each other's data.
+ * Loads a complete mixed milk + livestock dairy farm into AlloyDB.
  *
- * Two different strategies, on purpose:
+ * Self-contained on purpose: farms, accounts, trackers, milk production, stock
+ * movements and journal lines are all generated here and all land in
+ * PostgreSQL. Nothing is read from anywhere else.
  *
- * - **Dimensions are copied from MySQL**, not regenerated. Accounts, trackers,
- *   milk production and stock movements total a few hundred rows, and copying
- *   makes them identical by construction. Regenerating them would risk the two
- *   sides disagreeing about, say, a tracker's opening stock — and then the
- *   reports would differ for reasons that have nothing to do with the engines.
- * - **Facts are generated inside Postgres**, mirroring
- *   `GrossMarginV2Seeder::insertAccountLines()` formula for formula. Shipping
- *   500M rows from PHP would measure the client, not the database.
+ * That independence IS the proposition under test. Production data — trackers,
+ * milk records, stock movements — has no reason to live in a separate
+ * relational database when the analytical store is itself a relational
+ * database. One system holds the farm's operational records and reports on
+ * them, and a report is an ordinary join rather than a federated one.
  *
- * The formulas are duplicated rather than shared because the two dialects
- * differ in every function that matters — `strftime` vs `to_char`, `range` vs
- * `generate_series`, `INTERVAL n DAY` vs `n * INTERVAL '1 day'`. A shared
- * builder would be a translation layer wrapping two literal strings.
+ * Two loading strategies, for different reasons:
+ *
+ * - **Dimensions are built row by row from PHP.** A few hundred rows, and the
+ *   seasonal curves read more clearly as PHP than as generated SQL.
+ * - **Journal lines are generated inside Postgres**, from `generate_series`.
+ *   Shipping 500M rows over a client connection would measure the client.
+ *
+ * The generated values mirror `GrossMarginV2Seeder` so the two engines can be
+ * compared on equivalent data — report output has been verified identical
+ * across four periods.
  */
 final class AlloyDbSeeder
 {
     private const int FIXED_POINT = 10_000;
     private const int FIRST_YEAR = 2024;
     private const int YEARS = 4;
+    private const int KG_MS_PER_COW_PEAK = 40;
     private const int PAYOUT_PER_KG_MS = 8;
+    private const int HERD = 950;
     private const string HORIZON_DATE = '2026-08-31';
+
+    /**
+     * Opening head, applied to EVERY tracker including the milk platform.
+     *
+     * Mirrors what the lake actually holds. The Gross Margin seeder gives each
+     * tracker its own opening figure and only livestock any movements, but the
+     * stock-movement seeder ran afterwards and overwrote both — so the data the
+     * DuckDB report reads has 1,200 opening head on all five trackers and
+     * movements for all five. Equivalence with the lake is what makes a timing
+     * comparison mean anything, so this reproduces the lake rather than the
+     * more principled intent.
+     */
+    private const int OPENING_STOCK = 1_200;
+
+    /** [suffix, name, type, stock class] */
+    private const array TRACKERS = [
+        ['milk', 'Milk Platform', 'milk', ''],
+        ['ma-cows', 'MA Cows', 'livestock', 'MA Cows'],
+        ['r2-heifers', 'R2 Heifers', 'livestock', 'R2 Heifers'],
+        ['bobby-calves', 'Bobby Calves', 'livestock', 'Bobby Calves'],
+        ['bulls', 'Breeding Bulls', 'livestock', 'Breeding Bulls'],
+    ];
+
+    /** [suffix, name, class, category, group, group label, group order, line order, tracker] */
+    private const array ACCOUNTS = [
+        ['milk-current', 'Milk Production - Current Year', 'REVENUE', 'tracker_income', 'dairy_income', 'Dairy Income', 1, 1, 'milk'],
+        ['milk-deferred', 'Milk Production - Deferred', 'REVENUE', 'tracker_income', 'dairy_income', 'Dairy Income', 1, 2, 'milk'],
+        ['sales-bobby', 'Sales - Dairy Bobby Calves', 'REVENUE', 'tracker_income', 'livestock_income', 'Livestock Income', 2, 1, 'bobby-calves'],
+        ['sales-r2', 'Sales - Dairy R2 Heifers', 'REVENUE', 'tracker_income', 'livestock_income', 'Livestock Income', 2, 2, 'r2-heifers'],
+        ['sales-ma', 'Sales - Dairy MA Cows', 'REVENUE', 'tracker_income', 'livestock_income', 'Livestock Income', 2, 3, 'ma-cows'],
+        ['sales-bulls', 'Sales - Dairy Breeding Bulls', 'REVENUE', 'tracker_income', 'livestock_income', 'Livestock Income', 2, 4, 'bulls'],
+        ['other-income', 'Other Income', 'REVENUE', 'tracker_income', 'other_income', 'Other', 3, 1, 'milk'],
+        ['feed-supplement', 'Feed - Supplements', 'EXPENSE', 'tracker_direct_costs', 'dairy_costs', 'Dairy Costs', 4, 1, 'milk'],
+        ['feed-grazing', 'Feed - Grazing', 'EXPENSE', 'tracker_direct_costs', 'dairy_costs', 'Dairy Costs', 4, 2, 'milk'],
+        ['shed-costs', 'Shed & Milk Harvesting', 'EXPENSE', 'tracker_direct_costs', 'dairy_costs', 'Dairy Costs', 4, 3, 'milk'],
+        ['animal-health', 'Animal Health', 'EXPENSE', 'tracker_direct_costs', 'livestock_costs', 'Livestock Costs', 5, 1, 'ma-cows'],
+        ['breeding', 'Breeding & AI', 'EXPENSE', 'tracker_direct_costs', 'livestock_costs', 'Livestock Costs', 5, 2, 'ma-cows'],
+        ['calf-rearing', 'Calf Rearing', 'EXPENSE', 'tracker_direct_costs', 'livestock_costs', 'Livestock Costs', 5, 3, 'bobby-calves'],
+        ['stock-purchases', 'Stock Purchases', 'EXPENSE', 'tracker_direct_costs', 'livestock_costs', 'Livestock Costs', 5, 4, 'r2-heifers'],
+    ];
 
     public function __construct(
         private readonly ConnectionInterface $db,
         private readonly string $farmId,
+        private readonly string $region,
         private readonly int $bulkRows = 0,
     ) {
     }
@@ -47,165 +93,211 @@ final class AlloyDbSeeder
      */
     public function seed(): array
     {
-        $dimensions = $this->copyDimensions();
+        $dimensions = $this->seedDimensions();
         $this->db->statement('DELETE FROM transaction_lines WHERE farm_id = ?', [$this->farmId]);
-        $facts = $this->generateFacts();
+        $facts = $this->seedJournals();
 
         return ['dimension_rows' => $dimensions, 'fact_rows' => $facts];
     }
 
-    private function copyDimensions(): int
+    private function seedDimensions(): int
     {
-        $copied = 0;
+        $count = 0;
 
-        $farm = DB::table('farms')->where('farm_id', $this->farmId)->first();
-        $this->db->table('farms')->upsert([
-            ['farm_id' => $farm->farm_id, 'farm_type' => $farm->farm_type, 'region' => $farm->region],
-        ], ['farm_id']);
-        $copied++;
+        $this->db->table('farms')->upsert(
+            [['farm_id' => $this->farmId, 'farm_type' => 'dairy', 'region' => $this->region]],
+            ['farm_id']
+        );
+        $count++;
 
-        $accounts = DB::table('accounts')->where('account_id', 'like', 'gm-%')->get();
-        foreach ($accounts as $account) {
+        foreach (self::ACCOUNTS as [$suffix, $name, $class, $category, $group, $label, $groupOrder, $lineOrder]) {
             $this->db->table('accounts')->upsert([[
-                'account_id' => $account->account_id,
-                'account_name' => $account->account_name,
-                'account_class' => $account->account_class,
-                'account_category' => $account->account_category,
-                'report_group' => $account->report_group,
-                'report_group_label' => $account->report_group_label,
-                'report_group_order' => $account->report_group_order,
-                'line_order' => $account->line_order,
+                'account_id' => 'gm-'.$suffix,
+                'account_name' => $name,
+                'account_class' => $class,
+                'account_category' => $category,
+                'report_group' => $group,
+                'report_group_label' => $label,
+                'report_group_order' => $groupOrder,
+                'line_order' => $lineOrder,
             ]], ['account_id']);
-            $copied++;
+            $count++;
         }
 
-        $trackers = DB::table('trackers')->where('farm_id', $this->farmId)->get();
-        $trackerIds = $trackers->pluck('tracker_id')->all();
+        $trackerIds = array_map(
+            fn (array $t): string => $this->trackerId($t[0]),
+            self::TRACKERS
+        );
 
-        foreach ($trackers as $tracker) {
+        $this->db->table('tracker_milk_production')->whereIn('tracker_id', $trackerIds)->delete();
+        $this->db->table('tracker_stock_movements')->whereIn('tracker_id', $trackerIds)->delete();
+
+        foreach (self::TRACKERS as $order => [$suffix, $name, $type, $stockType]) {
             $this->db->table('trackers')->upsert([[
-                'tracker_id' => $tracker->tracker_id,
-                'farm_id' => $tracker->farm_id,
-                'tracker_name' => $tracker->tracker_name,
-                'tracker_type' => $tracker->tracker_type,
-                'stock_type' => $tracker->stock_type,
-                'opening_stock' => $tracker->opening_stock,
-                'display_order' => $tracker->display_order,
+                'tracker_id' => $this->trackerId($suffix),
+                'farm_id' => $this->farmId,
+                'tracker_name' => $name,
+                'tracker_type' => $type,
+                'stock_type' => $stockType,
+                'opening_stock' => self::OPENING_STOCK,
+                'display_order' => $order,
             ]], ['tracker_id']);
-            $copied++;
+            $count++;
         }
 
-        if ($trackerIds !== []) {
-            $this->db->table('tracker_milk_production')->whereIn('tracker_id', $trackerIds)->delete();
-            $this->db->table('tracker_stock_movements')->whereIn('tracker_id', $trackerIds)->delete();
-        }
+        $count += $this->seedMilkProduction();
+        $count += $this->seedStockMovements();
 
-        foreach (DB::table('tracker_milk_production')->whereIn('tracker_id', $trackerIds)->get() as $row) {
-            $this->db->table('tracker_milk_production')->insert([
-                'tracker_id' => $row->tracker_id,
-                'month' => $row->month,
-                'kg_ms_current' => $row->kg_ms_current,
-                'kg_ms_deferred' => $row->kg_ms_deferred,
-            ]);
-            $copied++;
-        }
-
-        foreach (DB::table('tracker_stock_movements')->whereIn('tracker_id', $trackerIds)->get() as $row) {
-            $this->db->table('tracker_stock_movements')->insert([
-                'tracker_id' => $row->tracker_id,
-                'month' => $row->month,
-                'purchases' => $row->purchases,
-                'births' => $row->births,
-                'sales' => $row->sales,
-                'deaths' => $row->deaths,
-            ]);
-            $copied++;
-        }
-
-        return $copied;
+        return $count;
     }
 
-    private function generateFacts(): int
+    private function seedMilkProduction(): int
     {
-        $farm = $this->db->table('farms')->where('farm_id', $this->farmId)->first();
-        $accounts = $this->db->table('accounts')->where('account_id', 'like', 'gm-%')->get();
-        $trackers = $this->db->table('trackers')->where('farm_id', $this->farmId)->get()->keyBy('tracker_type');
+        $rows = [];
+        $trackerId = $this->trackerId('milk');
 
-        $milkTracker = $trackers['milk']->tracker_id ?? null;
-        $perMonth = $this->linesPerAccountMonth($accounts->count());
+        for ($year = self::FIRST_YEAR; $year <= self::lastYear(); $year++) {
+            for ($month = 1; $month <= 12; $month++) {
+                // Southern-hemisphere lactation curve: peak in spring, dry over
+                // winter. Without the seasonality a per-unit margin would be
+                // flat all year, which is not what a dairy report looks like.
+                $seasonal = match (true) {
+                    in_array($month, [9, 10, 11], true) => 100,
+                    in_array($month, [8, 12], true) => 80,
+                    in_array($month, [1, 2, 3], true) => 60,
+                    in_array($month, [4, 5], true) => 30,
+                    default => 0,
+                };
 
-        foreach ($accounts as $account) {
-            $trackerId = $this->trackerFor($account->account_id, $this->farmId);
+                $rows[] = [
+                    'tracker_id' => $trackerId,
+                    'month' => sprintf('%04d-%02d-01', $year, $month),
+                    'kg_ms_current' => intdiv(self::HERD * self::KG_MS_PER_COW_PEAK * $seasonal, 100),
+                    'kg_ms_deferred' => $month === 9 ? 13_000 : 0,
+                ];
+            }
+        }
 
-            if (str_contains($account->account_id, 'milk-current') || str_contains($account->account_id, 'milk-deferred')) {
-                $column = str_contains($account->account_id, 'milk-current') ? 'kg_ms_current' : 'kg_ms_deferred';
-                $this->insertMilkLines($account->account_id, (string) $milkTracker, $column, $farm);
+        foreach (array_chunk($rows, 500) as $chunk) {
+            $this->db->table('tracker_milk_production')->insert($chunk);
+        }
+
+        return count($rows);
+    }
+
+    /**
+     * Movements for every tracker, including the milk platform — see
+     * OPENING_STOCK for why the milk tracker carries head at all.
+     *
+     * `phase` rotates the seasonal amplitude per tracker and year so the
+     * closing balances diverge between mobs instead of moving in lockstep,
+     * which would make per-head margins indistinguishable.
+     */
+    private function seedStockMovements(): int
+    {
+        $rows = [];
+
+        foreach (self::TRACKERS as $index => [$suffix]) {
+            $trackerId = $this->trackerId($suffix);
+
+            for ($year = self::FIRST_YEAR; $year <= self::lastYear(); $year++) {
+                $phase = ($index + $year) % 3;
+
+                for ($month = 1; $month <= 12; $month++) {
+                    $rows[] = [
+                        'tracker_id' => $trackerId,
+                        'month' => sprintf('%04d-%02d-01', $year, $month),
+                        'purchases' => $month === 7 ? 40 : 0,
+                        'births' => in_array($month, [9, 10, 11], true) ? 120 + ($phase * 10) : 0,
+                        'sales' => in_array($month, [3, 4, 5], true) ? 110 + ($phase * 10) : 0,
+                        'deaths' => 3 + (($index + $month) % 4),
+                    ];
+                }
+            }
+        }
+
+        foreach (array_chunk($rows, 500) as $chunk) {
+            $this->db->table('tracker_stock_movements')->insert($chunk);
+        }
+
+        return count($rows);
+    }
+
+    private function seedJournals(): int
+    {
+        $perMonth = $this->linesPerAccountMonth();
+
+        foreach (self::ACCOUNTS as [$suffix, , $class, , , , , , $trackerSuffix]) {
+            $accountId = 'gm-'.$suffix;
+            $trackerId = $this->trackerId($trackerSuffix);
+
+            if ($suffix === 'milk-current' || $suffix === 'milk-deferred') {
+                $this->insertMilkLines(
+                    $accountId,
+                    $trackerId,
+                    $suffix === 'milk-current' ? 'kg_ms_current' : 'kg_ms_deferred'
+                );
 
                 continue;
             }
 
-            $this->insertAccountLines($account->account_id, $trackerId, $account->account_class, $farm, $perMonth);
+            $this->insertAccountLines($accountId, $trackerId, $class, $perMonth);
         }
 
-        $count = $this->db->selectOne(
+        $row = $this->db->selectOne(
             'SELECT count(*) AS n FROM transaction_lines WHERE farm_id = ?',
             [$this->farmId]
         );
 
-        return (int) $count->n;
+        return (int) $row->n;
     }
 
-    private function insertMilkLines(string $accountId, string $trackerId, string $column, object $farm): void
+    private function insertMilkLines(string $accountId, string $trackerId, string $column): void
     {
         $payout = self::PAYOUT_PER_KG_MS;
         $fp = self::FIXED_POINT;
+        $horizon = self::HORIZON_DATE;
 
         $this->db->statement(<<<SQL
             INSERT INTO transaction_lines
                 (farm_id, farm_type, region, line_id, account_id, type, basis, date, amount, tracker_id)
             SELECT
-                ?, ?, ?,
+                ?, 'dairy', ?,
                 ? || to_char(mp.month, 'YYYYMM'),
                 ?,
-                CASE WHEN mp.month <= DATE '{$this->horizonDate()}' THEN 'actuals' ELSE 'forecast' END,
+                CASE WHEN mp.month <= DATE '{$horizon}' THEN 'actuals' ELSE 'forecast' END,
                 'cash',
                 (mp.month + INTERVAL '14 days')::DATE,
-                -- Cast before multiplying, exactly as the DuckDB side does:
-                -- kg_ms x payout x 10,000 overflows a 32-bit integer.
+                -- Cast before multiplying: kg_ms x payout x 10,000 exceeds a
+                -- 32-bit integer at realistic production volumes.
                 -(mp.{$column}::BIGINT * {$payout} * {$fp}),
                 ?
             FROM tracker_milk_production mp
             WHERE mp.tracker_id = ? AND mp.{$column} > 0
-            SQL, [
-                $this->farmId, $farm->farm_type, $farm->region,
-                $accountId.'-', $accountId, $trackerId, $trackerId,
-            ]);
+            SQL, [$this->farmId, $this->region, $accountId.'-', $accountId, $trackerId, $trackerId]);
     }
 
-    private function insertAccountLines(
-        string $accountId,
-        string $trackerId,
-        string $class,
-        object $farm,
-        int $perMonth,
-    ): void {
+    private function insertAccountLines(string $accountId, string $trackerId, string $class, int $perMonth): void
+    {
         $fp = self::FIXED_POINT;
         $sign = $class === 'REVENUE' ? '-' : '';
         $base = $class === 'REVENUE' ? 9_000 : 6_000;
+        $horizon = self::HORIZON_DATE;
 
-        // One insert per year, mirroring the DuckDB seeder's loop. There it kept
-        // each write inside one partition; here it just bounds the size of any
-        // single statement.
+        // One statement per year, so no single insert has to materialise the
+        // whole span at bulk volumes.
         for ($year = self::FIRST_YEAR; $year <= self::lastYear(); $year++) {
             $this->db->statement(<<<SQL
                 INSERT INTO transaction_lines
                     (farm_id, farm_type, region, line_id, account_id, type, basis, date, amount, tracker_id)
                 SELECT
-                    ?, ?, ?,
+                    ?, 'dairy', ?,
                     ? || to_char(m.month_start, 'YYYYMM') || '-' || g.n::TEXT,
                     ?,
-                    CASE WHEN m.month_start <= DATE '{$this->horizonDate()}' THEN 'actuals' ELSE 'forecast' END,
+                    CASE WHEN m.month_start <= DATE '{$horizon}' THEN 'actuals' ELSE 'forecast' END,
                     'cash',
+                    -- Spread across the month so a line reads as an individual
+                    -- transaction rather than a monthly lump.
                     (m.month_start + ((g.n % 28) * INTERVAL '1 day'))::DATE,
                     {$sign}(({$base} + (EXTRACT(MONTH FROM m.month_start)::INT * 400)) * {$fp} / {$perMonth})::BIGINT,
                     ?
@@ -215,46 +307,32 @@ final class AlloyDbSeeder
                     INTERVAL '1 month'
                 ) AS m(month_start)
                 CROSS JOIN generate_series(0, {$perMonth} - 1) AS g(n)
-                SQL, [
-                    $this->farmId, $farm->farm_type, $farm->region,
-                    $accountId.'-', $accountId, $trackerId,
-                ]);
+                SQL, [$this->farmId, $this->region, $accountId.'-', $accountId, $trackerId]);
         }
     }
 
-    private function trackerFor(string $accountId, string $farmId): string
-    {
-        $map = [
-            'sales-bobby' => 'bobby-calves',
-            'sales-r2' => 'r2-heifers',
-            'sales-ma' => 'ma-cows',
-            'sales-bulls' => 'bulls',
-        ];
-
-        foreach ($map as $needle => $suffix) {
-            if (str_contains($accountId, $needle)) {
-                return $farmId.'-'.$suffix;
-            }
-        }
-
-        return $farmId.'-milk';
-    }
-
-    private function linesPerAccountMonth(int $accountCount): int
+    /**
+     * Fan-out per account-month, derived from the requested total.
+     *
+     * Volume changes how much data the report scans, never what it reports: the
+     * per-line amount is divided by the fan-out, so the monthly total holds
+     * constant whether an account has one line a month or a thousand.
+     */
+    private function linesPerAccountMonth(): int
     {
         if ($this->bulkRows < 1) {
             return 1;
         }
 
-        // Two milk accounts are driven by the production table, not fanned out.
-        $fanned = max(1, $accountCount - 2);
+        // The two milk accounts come from the production table, not the fan-out.
+        $fanned = count(self::ACCOUNTS) - 2;
 
         return max(1, intdiv($this->bulkRows, $fanned * self::YEARS * 12));
     }
 
-    private function horizonDate(): string
+    private function trackerId(string $suffix): string
     {
-        return self::HORIZON_DATE;
+        return $this->farmId.'-'.$suffix;
     }
 
     private static function lastYear(): int

@@ -13,17 +13,19 @@ use Throwable;
 class AlloyDbSetupCommand extends Command
 {
     protected $signature = 'alloydb:setup
-        {--farm=gm-dairy-farm : Farm to load, copied from MySQL and regenerated in Postgres}
+        {--farm=gm-dairy-farm : Farm to load}
+        {--region=gm-waikato : Region recorded on the farm}
         {--rows=0 : Target journal lines (0 = demo scale, one line per account-month)}
         {--fresh : Recreate the schema, dropping whatever is there}
         {--columnar : Populate the in-memory columnar engine after loading}';
 
-    protected $description = 'Load the AlloyDB comparison: schema, data equivalent to DuckLake, and optionally the columnar engine';
+    protected $description = 'Load a farm into AlloyDB: schema, dimensions, journals, and optionally the columnar engine';
 
     public function handle(): int
     {
         $connection = DB::connection('alloydb');
         $farmId = (string) $this->option('farm');
+        $region = (string) $this->option('region');
         $rows = max(0, (int) $this->option('rows'));
 
         $schema = new AlloyDbSchema($connection);
@@ -34,7 +36,7 @@ class AlloyDbSetupCommand extends Command
         }
 
         $this->info(sprintf(
-            'Loading %s%s',
+            'Loading %s%s — everything in Postgres, nothing read from MySQL',
             $farmId,
             $rows > 0 ? sprintf(' — target %s journal lines', number_format($rows)) : ' — demo scale',
         ));
@@ -42,7 +44,7 @@ class AlloyDbSetupCommand extends Command
         $started = microtime(true);
 
         try {
-            $result = (new AlloyDbSeeder($connection, $farmId, $rows))->seed();
+            $result = (new AlloyDbSeeder($connection, $farmId, $region, $rows))->seed();
         } catch (Throwable $e) {
             $this->error('Load failed: '.$e->getMessage());
 

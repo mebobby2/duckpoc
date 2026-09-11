@@ -62,9 +62,9 @@ final class GrossMarginV2PgSqlBuilder
             ),
 
             -- Collapse the facts to one row per (month, account) before any
-            -- dimension column is attached. Same reasoning as the DuckDB side:
-            -- joining names onto every journal line first is what built an
-            -- intermediate too wide to hold in memory.
+            -- dimension column is attached. Joining names onto every journal
+            -- line first and aggregating afterwards builds an intermediate wide
+            -- enough to exhaust memory and spill; this leaves ~600 rows.
             monthly_by_account AS MATERIALIZED (
                 SELECT
                     date_trunc('month', tl.date)::DATE AS month_start,
