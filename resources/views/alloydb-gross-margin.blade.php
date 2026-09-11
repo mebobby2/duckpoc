@@ -115,7 +115,7 @@
                 </p>
             </div>
             <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Source rows</p>
+                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Transaction lines</p>
                 <p class="mt-1 text-2xl font-semibold tabular-nums">
                     @if ($summaryMs !== null){{ number_format($sourceSummary['n']) }}@else&mdash;@endif
                 </p>
@@ -211,6 +211,139 @@
     @endif
 
     @if ($farm !== null)
+        {{-- ---------- transaction lines ---------- --}}
+        <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm" open>
+            <summary class="cursor-pointer px-4 py-3 text-sm font-medium">
+                Transaction lines used
+                <span class="ml-2 font-normal text-slate-500">
+                    @if ($summaryMs !== null)
+                        {{ number_format($sourceSummary['n']) }} lines ·
+                        net {{ $money($sourceSummary['net_dollars']) }} ·
+                        counted in {{ number_format($summaryMs, 0) }} ms
+                    @else
+                        skipped
+                    @endif
+                </span>
+            </summary>
+            <div class="border-t border-slate-200 px-4 py-3">
+                @if ($summaryMs === null)
+                    <p class="text-sm text-slate-600">
+                        Skipped: the report took over {{ number_format($diagnosticsBudgetMs, 0) }} ms, and
+                        counting the lines is a second pass over the same rows.
+                        <a href="{{ request()->fullUrlWithQuery(['force_diagnostics' => 1]) }}"
+                           class="text-blue-700 underline">Count them anyway</a>.
+                    </p>
+                @else
+                    <p class="mb-3 text-xs text-slate-600">
+                        Every journal line the report consumed, counted with the report's own scope
+                        predicate — same farm, same basis, same period, same horizon rule. The
+                        <strong>Actual/Forecast split</strong> is the column to read: a period
+                        straddling the horizon should show both, and an unexpected zero on either
+                        side usually means the horizon has silently excluded a date range.
+                    </p>
+
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full text-xs">
+                            <thead class="bg-slate-50 text-slate-600">
+                            <tr>
+                                <th class="px-2 py-1 text-left font-medium">Account</th>
+                                <th class="px-2 py-1 text-left font-medium">Section</th>
+                                <th class="px-2 py-1 text-right font-medium">Actual</th>
+                                <th class="px-2 py-1 text-right font-medium">Forecast</th>
+                                <th class="px-2 py-1 text-right font-medium">Lines</th>
+                                <th class="px-2 py-1 text-left font-medium">First</th>
+                                <th class="px-2 py-1 text-left font-medium">Last</th>
+                                <th class="px-2 py-1 text-right font-medium">Net $</th>
+                            </tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-100">
+                            @foreach ($lineBreakdown as $b)
+                                <tr>
+                                    <td class="px-2 py-1 whitespace-nowrap">{{ $b['account_name'] }}</td>
+                                    <td class="px-2 py-1 text-slate-500 whitespace-nowrap">{{ $b['report_group_label'] }}</td>
+                                    <td class="px-2 py-1 text-right tabular-nums">{{ number_format((int) $b['n_actuals']) }}</td>
+                                    <td class="px-2 py-1 text-right tabular-nums {{ (int) $b['n_forecast'] > 0 ? 'text-violet-700' : 'text-slate-300' }}">
+                                        {{ number_format((int) $b['n_forecast']) }}
+                                    </td>
+                                    <td class="px-2 py-1 text-right font-medium tabular-nums">{{ number_format((int) $b['n']) }}</td>
+                                    <td class="px-2 py-1 text-slate-500 whitespace-nowrap">{{ $b['first_date'] }}</td>
+                                    <td class="px-2 py-1 text-slate-500 whitespace-nowrap">{{ $b['last_date'] }}</td>
+                                    <td class="px-2 py-1 text-right tabular-nums">{{ $money((float) $b['net_dollars']) }}</td>
+                                </tr>
+                            @endforeach
+                            </tbody>
+                            <tfoot class="border-t-2 border-slate-300 bg-slate-50 font-semibold">
+                            <tr>
+                                <td class="px-2 py-1" colspan="4">
+                                    {{ count($lineBreakdown) }} accounts ·
+                                    {{ $sourceSummary['n_trackers'] }} trackers ·
+                                    {{ $sourceSummary['n_groups'] }} groups
+                                </td>
+                                <td class="px-2 py-1 text-right tabular-nums">{{ number_format($sourceSummary['n']) }}</td>
+                                <td class="px-2 py-1" colspan="2"></td>
+                                <td class="px-2 py-1 text-right tabular-nums">{{ $money($sourceSummary['net_dollars']) }}</td>
+                            </tr>
+                            </tfoot>
+                        </table>
+                    </div>
+
+                    <h3 class="mt-4 mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        Individual lines
+                    </h3>
+
+                    @if ($sourceRowsSkipped)
+                        <p class="text-sm text-slate-600">
+                            Listing skipped &mdash; {{ number_format($sourceSummary['n']) }} lines in scope,
+                            over the {{ number_format($sourceListingMaxRows) }} limit. The counts above
+                            cover every line; only the sample is missing.
+                            <a href="{{ request()->fullUrlWithQuery(['force_source_rows' => 1]) }}"
+                               class="text-blue-700 underline">List anyway</a>.
+                        </p>
+                    @elseif (empty($sourceRows))
+                        <p class="text-sm text-slate-500">No lines in scope for this period.</p>
+                    @else
+                        <p class="mb-2 text-xs text-slate-500">
+                            First {{ number_format(count($sourceRows)) }} by date, of
+                            {{ number_format($sourceSummary['n']) }}.
+                        </p>
+                        <div class="max-h-80 overflow-auto rounded border border-slate-200">
+                            <table class="min-w-full text-xs">
+                                <thead class="sticky top-0 bg-slate-50 text-slate-600">
+                                <tr>
+                                    <th class="px-2 py-1 text-left font-medium">Date</th>
+                                    <th class="px-2 py-1 text-left font-medium">Type</th>
+                                    <th class="px-2 py-1 text-left font-medium">Account</th>
+                                    <th class="px-2 py-1 text-left font-medium">Tracker</th>
+                                    <th class="px-2 py-1 text-right font-medium">Amount $</th>
+                                    <th class="px-2 py-1 text-left font-medium">Line</th>
+                                </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-100">
+                                @foreach ($sourceRows as $r)
+                                    <tr>
+                                        <td class="px-2 py-1 whitespace-nowrap tabular-nums">{{ $r['date'] }}</td>
+                                        <td class="px-2 py-1">
+                                            <span class="rounded px-1.5 py-0.5
+                                                         {{ $r['type'] === 'actuals' ? 'bg-slate-100 text-slate-700' : 'bg-violet-100 text-violet-800' }}">
+                                                {{ $r['type'] }}
+                                            </span>
+                                        </td>
+                                        <td class="px-2 py-1 whitespace-nowrap">{{ $r['account_name'] }}</td>
+                                        <td class="px-2 py-1 font-mono text-slate-500 whitespace-nowrap">{{ $r['tracker_id'] }}</td>
+                                        <td class="px-2 py-1 text-right tabular-nums {{ (float) $r['amount_dollars'] < 0 ? 'text-red-700' : '' }}">
+                                            {{ number_format((float) $r['amount_dollars'], 2) }}
+                                        </td>
+                                        <td class="px-2 py-1 font-mono text-slate-400 whitespace-nowrap">{{ $r['line_id'] }}</td>
+                                    </tr>
+                                @endforeach
+                                </tbody>
+                            </table>
+                        </div>
+                    @endif
+                @endif
+            </div>
+        </details>
+
         {{-- ---------- columnar engine ---------- --}}
         <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm" open>
             <summary class="cursor-pointer px-4 py-3 text-sm font-medium">

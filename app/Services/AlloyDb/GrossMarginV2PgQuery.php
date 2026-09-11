@@ -79,6 +79,54 @@ final class GrossMarginV2PgQuery
         ];
     }
 
+    /**
+     * @return list<array<string, mixed>>
+     */
+    public function lineBreakdown(
+        string $farmId,
+        string $periodFrom,
+        string $periodTo,
+        string $horizon,
+        string $basis = 'cash',
+    ): array {
+        return array_map(
+            static fn (object $row): array => (array) $row,
+            $this->db->select($this->builder->buildLineBreakdownSql(), [
+                'farm_id' => $farmId,
+                'basis' => $basis,
+                'period_from' => $periodFrom,
+                'period_to' => $periodTo,
+                'horizon' => $horizon,
+                'horizon2' => $horizon,
+            ])
+        );
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    public function sourceRows(
+        string $farmId,
+        string $periodFrom,
+        string $periodTo,
+        string $horizon,
+        string $basis = 'cash',
+        int $limit = 200,
+    ): array {
+        return array_map(
+            static fn (object $row): array => (array) $row,
+            $this->db->select($this->builder->buildSourceRowsSql(), [
+                'farm_id' => $farmId,
+                'basis' => $basis,
+                'period_from' => $periodFrom,
+                'period_to' => $periodTo,
+                'horizon' => $horizon,
+                'horizon2' => $horizon,
+                'row_limit' => $limit,
+            ])
+        );
+    }
+
     public function sql(): string
     {
         return $this->builder->build();

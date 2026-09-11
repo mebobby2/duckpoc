@@ -27,6 +27,18 @@ class AlloyDbGrossMarginController extends Controller
      */
     private const float DIAGNOSTICS_BUDGET_MS = 2_000.0;
 
+    /** Sample journal lines shown when the listing is affordable. */
+    private const int SOURCE_ROW_LIMIT = 200;
+
+    /**
+     * Above this many lines in scope, the sample listing is skipped.
+     *
+     * The breakdown is an aggregate and stays affordable at any volume; the
+     * sample has to sort by date across everything in scope to return its first
+     * 200, which is a different cost entirely.
+     */
+    private const int SOURCE_LISTING_MAX_ROWS = 5_000_000;
+
     public function __invoke(Request $request): View
     {
         $db = DB::connection('alloydb');
@@ -50,6 +62,9 @@ class AlloyDbGrossMarginController extends Controller
         $sourceSummary = ['n' => 0, 'n_groups' => 0, 'n_trackers' => 0, 'net_dollars' => 0.0];
         $plan = null;
         $diagnosticsAffordable = true;
+        $lineBreakdown = [];
+        $sourceRows = [];
+        $sourceRowsSkipped = false;
 
         if ($farm === null) {
             $error = 'No farm loaded. Run: php artisan alloydb:setup --fresh --columnar';
@@ -65,6 +80,17 @@ class AlloyDbGrossMarginController extends Controller
                 if ($diagnosticsAffordable) {
                     $startedAt = microtime(true);
                     $sourceSummary = $query->sourceRowSummary($farm['farm_id'], $periodFrom, $periodTo, $horizon, $basis);
+                    $lineBreakdown = $query->lineBreakdown($farm['farm_id'], $periodFrom, $periodTo, $horizon, $basis);
+
+                    $sourceRowsSkipped = $sourceSummary['n'] > self::SOURCE_LISTING_MAX_ROWS
+                        && !$request->boolean('force_source_rows');
+
+                    if (!$sourceRowsSkipped) {
+                        $sourceRows = $query->sourceRows(
+                            $farm['farm_id'], $periodFrom, $periodTo, $horizon, $basis, self::SOURCE_ROW_LIMIT
+                        );
+                    }
+
                     $summaryMs = (microtime(true) - $startedAt) * 1000;
                 }
 
@@ -111,6 +137,11 @@ class AlloyDbGrossMarginController extends Controller
             'diagnosticsAffordable' => $diagnosticsAffordable,
             'diagnosticsBudgetMs' => self::DIAGNOSTICS_BUDGET_MS,
             'plan' => $plan,
+            'lineBreakdown' => $lineBreakdown,
+            'sourceRows' => $sourceRows,
+            'sourceRowsSkipped' => $sourceRowsSkipped,
+            'sourceRowLimit' => self::SOURCE_ROW_LIMIT,
+            'sourceListingMaxRows' => self::SOURCE_LISTING_MAX_ROWS,
             'columnar' => $profiler->columnarState(),
             'trackerBreakdown' => $farm === null ? [] : $this->trackerBreakdown($db, $farm['farm_id']),
         ]);

@@ -221,6 +221,79 @@ final class GrossMarginV2PgSqlBuilder
             SQL;
     }
 
+    /**
+     * Per-account breakdown of the journal lines the report consumed.
+     *
+     * The single total answers "how much was scanned"; this answers "where did
+     * it come from", which is what catches a wrong horizon or a missing
+     * account. The actuals/forecast split is the one to watch: a period
+     * straddling the horizon should show both, and a column of zeros on either
+     * side usually means the horizon has silently excluded a range.
+     */
+    public function buildLineBreakdownSql(): string
+    {
+        $fp = self::FIXED_POINT;
+
+        return <<<SQL
+            SELECT
+                a.account_name,
+                a.report_group_label,
+                count(*) FILTER (WHERE tl.type = 'actuals')  AS n_actuals,
+                count(*) FILTER (WHERE tl.type = 'forecast') AS n_forecast,
+                count(*) AS n,
+                min(tl.date) AS first_date,
+                max(tl.date) AS last_date,
+                sum(tl.amount) / {$fp}.0 AS net_dollars
+            FROM transaction_lines tl
+            JOIN accounts a ON a.account_id = tl.account_id
+            WHERE tl.farm_id = :farm_id
+              AND tl.basis   = :basis
+              AND a.report_group IS NOT NULL
+              AND tl.date BETWEEN CAST(:period_from AS DATE) AND CAST(:period_to AS DATE)
+              AND (
+                    (tl.date <= CAST(:horizon AS DATE) AND tl.type = 'actuals')
+                 OR (tl.date >  CAST(:horizon2 AS DATE) AND tl.type = 'forecast')
+              )
+            GROUP BY a.account_name, a.report_group_label, a.report_group_order, a.line_order
+            ORDER BY a.report_group_order, a.line_order
+            SQL;
+    }
+
+    /**
+     * Individual journal lines, for reading rather than aggregating.
+     *
+     * Ordered by date alone. A tie-breaker on `line_id` would force the sort to
+     * read a column the report itself never touches, which on the lake side
+     * turned a 500-row debug listing into a full column scan.
+     */
+    public function buildSourceRowsSql(): string
+    {
+        $fp = self::FIXED_POINT;
+
+        return <<<SQL
+            SELECT
+                tl.line_id,
+                tl.date,
+                tl.type,
+                a.account_name,
+                a.report_group_label,
+                tl.tracker_id,
+                tl.amount / {$fp}.0 AS amount_dollars
+            FROM transaction_lines tl
+            JOIN accounts a ON a.account_id = tl.account_id
+            WHERE tl.farm_id = :farm_id
+              AND tl.basis   = :basis
+              AND a.report_group IS NOT NULL
+              AND tl.date BETWEEN CAST(:period_from AS DATE) AND CAST(:period_to AS DATE)
+              AND (
+                    (tl.date <= CAST(:horizon AS DATE) AND tl.type = 'actuals')
+                 OR (tl.date >  CAST(:horizon2 AS DATE) AND tl.type = 'forecast')
+              )
+            ORDER BY tl.date
+            LIMIT :row_limit
+            SQL;
+    }
+
     public function buildSourceRowCountSql(): string
     {
         $fp = self::FIXED_POINT;
