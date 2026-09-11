@@ -154,6 +154,13 @@ final class AlloyDbSchema
             );
         }
 
+        // `_add` is a no-op on a column already registered, so after a reload it
+        // leaves the previous snapshot in memory — the store reported 1.3 KB for
+        // a million rows because it still held the 620-row version. Refreshing
+        // rebuilds it against current heap contents, and without this every
+        // capacity and bytes-per-row figure on the report page is a fiction.
+        $this->db->statement("SELECT google_columnar_engine_refresh('transaction_lines')");
+
         return array_map(
             static fn (object $row): array => (array) $row,
             $this->db->select(

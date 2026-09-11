@@ -299,7 +299,14 @@ final class AlloyDbSeeder
                     -- Spread across the month so a line reads as an individual
                     -- transaction rather than a monthly lump.
                     (m.month_start + ((g.n % 28) * INTERVAL '1 day'))::DATE,
-                    {$sign}(({$base} + (EXTRACT(MONTH FROM m.month_start)::INT * 400)) * {$fp} / {$perMonth})::BIGINT,
+                    -- NUMERIC then ROUND, deliberately. Postgres `/` on two
+                    -- integers is integer division and truncates, where DuckDB
+                    -- divides truly and its CAST to BIGINT rounds. Left as
+                    -- integer arithmetic this lands one cent low on every line,
+                    -- which at 1,736 lines a month put the monthly total 0.17
+                    -- out — small enough to look like noise and large enough to
+                    -- make the two engines disagree.
+                    {$sign}ROUND(({$base} + (EXTRACT(MONTH FROM m.month_start)::INT * 400))::NUMERIC * {$fp} / {$perMonth})::BIGINT,
                     ?
                 FROM generate_series(
                     DATE '{$year}-01-01',
