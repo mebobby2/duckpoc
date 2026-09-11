@@ -147,7 +147,9 @@
                 </p>
                 <p class="mt-0.5 text-xs text-slate-400">
                     using {{ $bytes($used) }} of the {{ $columnar['budget_mb'] }} MB budget
-                    @if ($pct < 100)&mdash; {{ number_format(100 - $pct, 0) }}% spare@endif
+                    @if ($pct < 100)
+                        &mdash; {{ number_format(100 - $pct, 0) }}% spare
+                    @endif
                 </p>
             </div>
         </div>
