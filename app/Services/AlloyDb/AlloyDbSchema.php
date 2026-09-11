@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\AlloyDb;
 
 use Illuminate\Database\ConnectionInterface;
+use Throwable;
 
 /**
  * The AlloyDB side of the comparison: the same facts and dimensions the DuckDB
@@ -147,6 +148,27 @@ final class AlloyDbSchema
     }
 
     /**
+     * Fraction of the table's heap blocks held in the column store, or null if
+     * the engine is not reporting.
+     */
+    private function coverage(): ?float
+    {
+        try {
+            $row = $this->db->selectOne(
+                "SELECT block_count_in_cc, total_block_count
+                 FROM g_columnar_relations
+                 WHERE relation_name = 'transaction_lines'"
+            );
+        } catch (Throwable) {
+            return null;
+        }
+
+        $total = (int) ($row->total_block_count ?? 0);
+
+        return $total > 0 ? ((int) $row->block_count_in_cc) / $total : null;
+    }
+
+    /**
      * Loads the report's columns into the in-memory column store.
      *
      * Returns the reported size so a caller can compare it against
@@ -165,12 +187,22 @@ final class AlloyDbSchema
             );
         }
 
-        // `_add` is a no-op on a column already registered, so after a reload it
-        // leaves the previous snapshot in memory — the store reported 1.3 KB for
-        // a million rows because it still held the 620-row version. Refreshing
-        // rebuilds it against current heap contents, and without this every
-        // capacity and bytes-per-row figure on the report page is a fiction.
-        $this->db->statement("SELECT google_columnar_engine_refresh('transaction_lines')");
+        // Refresh only when the adds did not already populate the store.
+        //
+        // Two behaviours have to be reconciled. `_add` populates a column that
+        // was not registered before, but is a no-op on one that was — so after
+        // a reload the store keeps the previous snapshot (it reported 1.3 KB
+        // for a million rows because it still held the 620-row version).
+        // Refreshing fixes that, but on a fresh registration it rebuilds
+        // everything a second time: at 500M rows that was six more full passes
+        // over the heap, roughly doubling a 25-minute job for nothing.
+        //
+        // Coverage tells the two cases apart. Blocks in the store below the
+        // table's total means the store is stale or was truncated, and a
+        // refresh is warranted; at full coverage the adds have already done it.
+        if (($this->coverage() ?? 0.0) < 0.999) {
+            $this->db->statement("SELECT google_columnar_engine_refresh('transaction_lines')");
+        }
 
         return array_map(
             static fn (object $row): array => (array) $row,

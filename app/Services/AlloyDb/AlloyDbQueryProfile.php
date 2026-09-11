@@ -73,8 +73,17 @@ final class AlloyDbQueryProfile
         $plan = $root['Plan'] ?? [];
 
         $nodes = [];
-        $buffers = ['shared_hit' => 0, 'shared_read' => 0, 'temp_written' => 0];
-        $this->walk($plan, $nodes, $buffers);
+        $this->walk($plan, $nodes);
+
+        // Read from the ROOT node only. Postgres reports buffer counters
+        // cumulatively — each node includes its children — so summing the tree
+        // multiplies the leaf's reads by its depth. That produced 117.9M reads
+        // on a 10.1M-block table and made a single scan look like twelve.
+        $buffers = [
+            'shared_hit' => (int) ($plan['Shared Hit Blocks'] ?? 0),
+            'shared_read' => (int) ($plan['Shared Read Blocks'] ?? 0),
+            'temp_written' => (int) ($plan['Temp Written Blocks'] ?? 0),
+        ];
 
         $columnar = array_values(array_filter(
             $nodes,
@@ -95,9 +104,8 @@ final class AlloyDbQueryProfile
     /**
      * @param array<string, mixed> $plan
      * @param list<string> $nodes
-     * @param array{shared_hit: int, shared_read: int, temp_written: int} $buffers
      */
-    private function walk(array $plan, array &$nodes, array &$buffers): void
+    private function walk(array $plan, array &$nodes): void
     {
         $label = (string) ($plan['Node Type'] ?? '');
 
@@ -109,13 +117,9 @@ final class AlloyDbQueryProfile
             $nodes[] = $label;
         }
 
-        $buffers['shared_hit'] += (int) ($plan['Shared Hit Blocks'] ?? 0);
-        $buffers['shared_read'] += (int) ($plan['Shared Read Blocks'] ?? 0);
-        $buffers['temp_written'] += (int) ($plan['Temp Written Blocks'] ?? 0);
-
         foreach ($plan['Plans'] ?? [] as $child) {
             if (is_array($child)) {
-                $this->walk($child, $nodes, $buffers);
+                $this->walk($child, $nodes);
             }
         }
     }

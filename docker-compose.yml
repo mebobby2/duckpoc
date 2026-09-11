@@ -96,7 +96,18 @@ services:
     volumes:
       - duckpoc-alloydb-data:/var/lib/postgresql/data
     shm_size: 2gb
-    # All three are postmaster-context, so they cannot be set from a session —
+    # enable_configuration_persistence is on because without it the engine
+    # forgets WHICH columns to hold across a restart: the registration is
+    # dropped, g_columnar_relations comes back empty, and a refresh returns
+    # false with "Container does not exist". The in-memory data cannot survive a
+    # restart either way, but with persistence on the engine knows what to
+    # rebuild rather than silently holding nothing.
+    #
+    # Note these are a folded YAML scalar: a '#' line inside the command block
+    # is passed to postgres as an argument, which fails with
+    # `invalid argument: "#"`. Comments go here, above the key.
+    #
+    # All are postmaster-context, so they cannot be set from a session —
     # they belong here rather than in ALTER SYSTEM so the configuration lives in
     # the repo instead of inside a Docker volume.
     #
@@ -109,7 +120,8 @@ services:
     # "how many bytes per row does the column store need".
     command: >
       -c google_columnar_engine.enabled=on
-      -c google_columnar_engine.memory_size_in_mb=1024
+      -c google_columnar_engine.memory_size_in_mb=4096
+      -c google_columnar_engine.enable_configuration_persistence=on
       -c shared_buffers=2GB
       -c max_wal_size=8GB
       -c checkpoint_timeout=30min
