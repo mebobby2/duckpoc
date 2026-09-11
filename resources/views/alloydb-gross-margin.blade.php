@@ -143,8 +143,11 @@
                 </p>
                 <p class="mt-1 text-xs {{ $partial ? 'text-red-700' : 'text-slate-500' }}">
                     {{ number_format($columnar['blocks_in_store']) }} of
-                    {{ number_format($columnar['blocks_total']) }} blocks ·
-                    store {{ number_format($pct, 0) }}% of budget
+                    {{ number_format($columnar['blocks_total']) }} blocks held
+                </p>
+                <p class="mt-0.5 text-xs text-slate-400">
+                    using {{ $bytes($used) }} of the {{ $columnar['budget_mb'] }} MB budget
+                    @if ($pct < 100)&mdash; {{ number_format(100 - $pct, 0) }}% spare@endif
                 </p>
             </div>
         </div>
