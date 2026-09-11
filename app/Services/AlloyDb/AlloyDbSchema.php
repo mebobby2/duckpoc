@@ -121,12 +121,23 @@ final class AlloyDbSchema
             SQL);
     }
 
+    public function dropIndex(): void
+    {
+        $this->db->statement('DROP INDEX IF EXISTS transaction_lines_scope_idx');
+    }
+
     /**
-     * Built after loading, not before: maintaining a btree during a 500M-row
+     * Built after loading, not before: maintaining a btree through a 500M-row
      * insert costs far more than one sorted build at the end.
+     *
+     * `maintenance_work_mem` is raised for the build only. At the 64 MB default
+     * a 500M-row sort spills to disk in many passes; the setting is session
+     * scoped, so this does not change anything for queries.
      */
     public function index(): void
     {
+        $this->db->statement("SET maintenance_work_mem = '2GB'");
+        $this->db->statement("SET max_parallel_maintenance_workers = 4");
         $this->db->statement(
             'CREATE INDEX IF NOT EXISTS transaction_lines_scope_idx
              ON transaction_lines (farm_id, basis, date)'

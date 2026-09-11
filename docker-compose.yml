@@ -111,6 +111,8 @@ services:
       -c google_columnar_engine.enabled=on
       -c google_columnar_engine.memory_size_in_mb=1024
       -c shared_buffers=2GB
+      -c max_wal_size=8GB
+      -c checkpoint_timeout=30min
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d duckpoc"]
       interval: 5s

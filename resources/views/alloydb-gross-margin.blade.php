@@ -131,16 +131,20 @@
                 $used = $columnar['used_bytes'];
                 $budget = $columnar['budget_mb'] * 1024 * 1024;
                 $pct = $budget > 0 ? ($used / $budget) * 100 : 0;
+                $coverage = $columnar['coverage'];
+                $partial = $coverage !== null && $coverage < 0.999;
             @endphp
-            <div class="rounded-lg border {{ $pct > 80 ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-white' }} p-4 shadow-sm">
-                <p class="text-xs font-medium uppercase tracking-wide {{ $pct > 80 ? 'text-amber-700' : 'text-slate-500' }}">
-                    Column store
+            <div class="rounded-lg border {{ $partial ? 'border-red-300 bg-red-50' : 'border-slate-200 bg-white' }} p-4 shadow-sm">
+                <p class="text-xs font-medium uppercase tracking-wide {{ $partial ? 'text-red-700' : 'text-slate-500' }}">
+                    Table in memory
                 </p>
-                <p class="mt-1 text-2xl font-semibold tabular-nums {{ $pct > 80 ? 'text-amber-900' : '' }}">
-                    {{ number_format($pct, 1) }}%
+                <p class="mt-1 text-2xl font-semibold tabular-nums {{ $partial ? 'text-red-900' : '' }}">
+                    @if ($coverage === null)&mdash;@else{{ number_format($coverage * 100, 1) }}%@endif
                 </p>
-                <p class="mt-1 text-xs {{ $pct > 80 ? 'text-amber-700' : 'text-slate-500' }}">
-                    {{ $bytes($used) }} of {{ $columnar['budget_mb'] }} MB in memory
+                <p class="mt-1 text-xs {{ $partial ? 'text-red-700' : 'text-slate-500' }}">
+                    {{ number_format($columnar['blocks_in_store']) }} of
+                    {{ number_format($columnar['blocks_total']) }} blocks ·
+                    store {{ number_format($pct, 0) }}% of budget
                 </p>
             </div>
         </div>
@@ -358,8 +362,21 @@
                     The column store is <strong>memory-resident</strong> with a fixed budget, so
                     capacity — not disk — is what limits it. A query whose columns no longer fit
                     falls back to scanning the row store: same answers, far slower, no error.
-                    The ratio of store size to row count is what predicts the ceiling at any volume.
                 </p>
+
+                @if ($columnar['coverage'] !== null && $columnar['coverage'] < 0.999)
+                    <p class="mb-3 rounded border-l-4 border-red-400 bg-red-50 px-3 py-2 text-xs text-red-900">
+                        <strong>Only {{ number_format($columnar['coverage'] * 100, 1) }}% of the
+                        table is in memory.</strong>
+                        The store filled up and stopped, so the remaining
+                        {{ number_format((1 - $columnar['coverage']) * 100, 1) }}% is read from the
+                        heap on every query. Read this figure rather than the budget percentage —
+                        a store at 88% of its budget can still hold under a third of the table.
+                        Full coverage needs roughly
+                        {{ number_format($columnar['coverage'] > 0 ? $columnar['budget_mb'] / $columnar['coverage'] / 1024 : 0, 1) }} GB
+                        at this volume.
+                    </p>
+                @endif
 
                 @if (empty($columnar['columns']))
                     <p class="text-sm text-slate-500">

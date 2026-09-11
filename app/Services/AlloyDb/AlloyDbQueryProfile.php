@@ -166,7 +166,11 @@ final class AlloyDbQueryProfile
     /**
      * State of the in-memory column store.
      *
-     * @return array{columns: list<array<string, mixed>>, used_bytes: int, budget_mb: int, table_bytes: int, row_estimate: int}
+     * @return array{
+     *     columns: list<array<string, mixed>>, used_bytes: int, budget_mb: int,
+     *     table_bytes: int, row_estimate: int,
+     *     blocks_in_store: int, blocks_total: int, coverage: float|null
+     * }
      */
     public function columnarState(): array
     {
@@ -203,12 +207,36 @@ final class AlloyDbQueryProfile
                     (SELECT reltuples::BIGINT FROM pg_class WHERE relname = 'transaction_lines') AS rows"
         );
 
+        // Coverage, not capacity, is the number that matters — and they can
+        // disagree completely. On the 500M farm the store sat at 88% of its
+        // budget, which reads as healthy, while holding only 31% of the
+        // table's blocks: it had run out of room and stopped. Everything
+        // outside those blocks is read from the heap, so a store that looks
+        // nearly full can still be mostly useless.
+        $blocksInStore = 0;
+        $blocksTotal = 0;
+
+        try {
+            $relation = $this->db->selectOne(
+                "SELECT block_count_in_cc, total_block_count
+                 FROM g_columnar_relations
+                 WHERE relation_name = 'transaction_lines'"
+            );
+            $blocksInStore = (int) ($relation->block_count_in_cc ?? 0);
+            $blocksTotal = (int) ($relation->total_block_count ?? 0);
+        } catch (Throwable) {
+            // Engine off, or the view unavailable on this version.
+        }
+
         return [
             'columns' => $columns,
             'used_bytes' => $used,
             'budget_mb' => (int) ($budget->setting ?? 0),
             'table_bytes' => (int) ($table->bytes ?? 0),
             'row_estimate' => (int) ($table->rows ?? 0),
+            'blocks_in_store' => $blocksInStore,
+            'blocks_total' => $blocksTotal,
+            'coverage' => $blocksTotal > 0 ? $blocksInStore / $blocksTotal : null,
         ];
     }
 }

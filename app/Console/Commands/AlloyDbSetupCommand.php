@@ -43,6 +43,11 @@ class AlloyDbSetupCommand extends Command
 
         $started = microtime(true);
 
+        // Dropped for the duration of the load, rebuilt below. Cheap to do
+        // even at demo scale, and at bulk scale it is the difference between a
+        // sorted build and maintaining a btree per inserted row.
+        $schema->dropIndex();
+
         try {
             $result = (new AlloyDbSeeder($connection, $farmId, $region, $rows))->seed();
         } catch (Throwable $e) {
