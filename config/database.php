@@ -44,6 +44,27 @@ return [
             'transaction_mode' => 'DEFERRED',
         ],
 
+        /*
+         * AlloyDB Omni — PostgreSQL 17 with Google's columnar engine.
+         *
+         * Exists to answer whether ONE database can serve both the app and its
+         * reports, collapsing MySQL + Mongo + the DuckLake catalog. Reached
+         * through pdo_pgsql, so unlike DuckDB there is no FFI in the path.
+         */
+        'alloydb' => [
+            'driver' => 'pgsql',
+            'host' => env('ALLOYDB_HOST', 'alloydb'),
+            'port' => env('ALLOYDB_PORT', '5432'),
+            'database' => env('ALLOYDB_DATABASE', 'duckpoc'),
+            'username' => env('ALLOYDB_USERNAME', 'postgres'),
+            'password' => env('ALLOYDB_PASSWORD', 'duckpoc'),
+            'charset' => 'utf8',
+            'prefix' => '',
+            'prefix_indexes' => true,
+            'search_path' => 'public',
+            'sslmode' => 'prefer',
+        ],
+
         'mysql' => [
             'driver' => 'mysql',
             'url' => env('DB_URL'),

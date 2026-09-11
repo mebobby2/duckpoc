@@ -43,6 +43,53 @@ services:
       timeout: 3s
       retries: 20
 
+  # AlloyDB Omni: PostgreSQL 17 plus Google's in-memory columnar engine, run
+  # locally so it can be measured on the same hardware as the DuckDB path.
+  #
+  # The comparison it exists to settle: DuckDB+DuckLake keeps reporting inside
+  # the app process but needs a lake, a catalog and manual maintenance, while
+  # AlloyDB could serve the app AND its reports from one Postgres — collapsing
+  # MySQL, Mongo and the DuckLake catalog into a single system.
+  #
+  # Omni's documented sizing is 8 GB RAM per CPU. Docker currently has 17.25 GB
+  # total and is also hosting MySQL, MinIO and the app, so this is deliberately
+  # given few CPUs rather than many; raise both together if the columnar engine
+  # needs a bigger store.
+  #
+  # /dev/shm is enlarged because the columnar engine keeps its column store in
+  # shared memory, and Docker's 64 MB default silently caps it.
+  alloydb:
+    image: google/alloydbomni:17.5.0
+    environment:
+      POSTGRES_PASSWORD: duckpoc
+      POSTGRES_DB: duckpoc
+    ports:
+      # 5433, not 5432 — leaves the default free for any local Postgres.
+      - "5433:5432"
+    volumes:
+      - duckpoc-alloydb-data:/var/lib/postgresql/data
+    shm_size: 2gb
+    # All three are postmaster-context, so they cannot be set from a session —
+    # they belong here rather than in ALTER SYSTEM so the configuration lives in
+    # the repo instead of inside a Docker volume.
+    #
+    # shared_buffers is pinned because Omni otherwise sizes it to the whole
+    # container (it came up at 13.4 GB), which over-commits a 17.25 GB Docker VM
+    # that is also running MySQL, MinIO and the app.
+    #
+    # memory_size_in_mb is the columnar engine's in-memory store, and it is THE
+    # dial for the ceiling test: the question is not "can it hold 500M rows" but
+    # "how many bytes per row does the column store need".
+    command: >
+      -c google_columnar_engine.enabled=on
+      -c google_columnar_engine.memory_size_in_mb=1024
+      -c shared_buffers=2GB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d duckpoc"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
   mysql:
     image: mysql:8.0
     environment:
@@ -61,3 +108,4 @@ services:
 volumes:
   duckpoc-minio-data:
   duckpoc-mysql-data:
+  duckpoc-alloydb-data:
