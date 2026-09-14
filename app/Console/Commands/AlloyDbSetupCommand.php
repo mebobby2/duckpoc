@@ -43,10 +43,18 @@ class AlloyDbSetupCommand extends Command
 
         $started = microtime(true);
 
-        // Dropped for the duration of the load, rebuilt below. Cheap to do
-        // even at demo scale, and at bulk scale it is the difference between a
-        // sorted build and maintaining a btree per inserted row.
-        $schema->dropIndex();
+        // Only for bulk loads. Dropping the index needs an ACCESS EXCLUSIVE lock
+        // on the whole table, which the columnar engine's background rebuild
+        // blocks — a 620-row demo seed sat waiting on that lock for ten minutes
+        // and looked like a hang. At bulk scale the drop is still worth it,
+        // because maintaining a btree per inserted row costs far more than one
+        // sorted build afterwards.
+        $bulkLoad = $rows >= 1_000_000;
+
+        if ($bulkLoad) {
+            $this->line('  dropping the index for the load…');
+            $schema->dropIndex();
+        }
 
         try {
             $result = (new AlloyDbSeeder($connection, $farmId, $region, $rows))->seed();
@@ -63,7 +71,7 @@ class AlloyDbSetupCommand extends Command
             microtime(true) - $started,
         ));
 
-        $this->info('Indexing and analysing…');
+        $this->info($bulkLoad ? 'Rebuilding the index and analysing…' : 'Analysing…');
         $started = microtime(true);
         $schema->index();
         $this->line(sprintf('  done in %.1fs', microtime(true) - $started));

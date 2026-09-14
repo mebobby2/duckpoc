@@ -1,12 +1,15 @@
-# Two stacks, selected with Compose profiles:
+# Three stacks, selected with Compose profiles. Each is one storage backend,
+# so a measurement can never be attributed to the wrong one:
 #
-#   docker compose --profile duckdb  up -d    app 8080 (GCS) · app 8081 (MinIO) · minio · mysql
-#   docker compose --profile alloydb up -d    app 8082 · alloydb · mysql
+#   docker compose --profile gcs     up -d    app 8080 · mysql            DuckLake on gs://
+#   docker compose --profile minio   up -d    app 8081 · minio · mysql    DuckLake on s3://
+#   docker compose --profile alloydb up -d    app 8082 · alloydb          PostgreSQL, no lake
 #   docker compose --profile '*'     up -d    everything
 #
+# Combine with repeated flags: --profile gcs --profile minio
+#
 # Every service carries a profile, so a bare `docker compose up` starts nothing
-# — say which stack you want. A service listed in both profiles (mysql) starts
-# for either.
+# — say which stack you want.
 #
 # One constraint worth knowing: depends_on cannot cross a profile boundary. A
 # service in profile A that depends on a service only in profile B fails the
@@ -14,7 +17,7 @@
 # self-contained.
 services:
   app:
-    profiles: [duckdb]
+    profiles: [gcs]
     build:
       context: .
       dockerfile: docker/php/Dockerfile
@@ -27,7 +30,8 @@ services:
       # extension_directory explicitly, but this covers Composer's cache too.
       HOME: /tmp
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
     ports:
       # 8080, not 8000 — Docker already holds 8000 on this machine.
       - "8080:8000"
@@ -47,7 +51,7 @@ services:
   # and the page silently serves GCS while claiming to be MinIO. That cost a
   # round of wrong conclusions; verify a backend switch by stopping the backend.
   app-minio:
-    profiles: [duckdb]
+    profiles: [minio]
     build:
       context: .
       dockerfile: docker/php/Dockerfile
@@ -58,8 +62,10 @@ services:
       HOME: /tmp
       DUCKDB_STORAGE: s3
     depends_on:
-      - mysql
-      - minio
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_started
     ports:
       - "8081:8000"
     command: php artisan serve --host=0.0.0.0 --port=8000 --no-reload
@@ -78,8 +84,18 @@ services:
     working_dir: /app
     environment:
       HOME: /tmp
+      # No MySQL in this stack at all — that is the proposition being tested.
+      #
+      # The report only ever reads DB::connection('alloydb'), but Laravel's own
+      # plumbing was the thing keeping MySQL alive: .env sets SESSION_DRIVER,
+      # CACHE_STORE and QUEUE_CONNECTION to 'database', so every request hit
+      # MySQL before reaching a controller. Those move to file/sync here, and
+      # the default connection becomes AlloyDB.
+      DB_CONNECTION: alloydb
+      SESSION_DRIVER: file
+      CACHE_STORE: file
+      QUEUE_CONNECTION: sync
     depends_on:
-      - mysql
       - alloydb
     ports:
       - "8082:8000"
@@ -91,7 +107,7 @@ services:
   # localhost is FASTER than co-located GCS would be, so it gives an optimistic
   # floor rather than a realistic production figure.
   minio:
-    profiles: [duckdb]
+    profiles: [minio]
     image: minio/minio:latest
     command: server /data --console-address ":9011"
     environment:
@@ -171,7 +187,7 @@ services:
       retries: 30
 
   mysql:
-    profiles: [duckdb, alloydb]
+    profiles: [gcs, minio]
     image: mysql:8.0
     environment:
       MYSQL_DATABASE: duckpoc
@@ -185,6 +201,15 @@ services:
       - "3308:3306"
     volumes:
       - duckpoc-mysql-data:/var/lib/mysql
+    # Without this, depends_on only waits for the container to start, not for
+    # MySQL to accept connections — and since sessions and cache are
+    # database-backed, the first page load after `up -d` returns a 500 that
+    # looks like a broken profile rather than a cold start.
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uduckpoc -ppassword --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
 
 volumes:
   duckpoc-minio-data:
