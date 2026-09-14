@@ -12,16 +12,24 @@ FROM php:8.3-cli
 # the DuckDB path above: Postgres needs a core extension compiled in, while
 # DuckDB needs FFI plus a community binding plus a shared library. Both are one
 # line here, but only one of them puts a foreign runtime inside the web tier.
+#
+# ext-mongodb is for the baseline stack that reproduces Figured's current
+# topology. It is a PECL extension rather than a bundled one, so it needs
+# libssl-dev and pkg-config to build against the system OpenSSL.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libffi-dev \
         libzip-dev \
         libsqlite3-dev \
         libpq-dev \
+        libssl-dev \
+        pkg-config \
         unzip \
         git \
         default-mysql-client \
         postgresql-client \
     && docker-php-ext-install ffi pdo_mysql pdo_sqlite pdo_pgsql bcmath zip \
+    && pecl install mongodb \
+    && docker-php-ext-enable mongodb \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

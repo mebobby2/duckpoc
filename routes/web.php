@@ -4,6 +4,7 @@ use App\Http\Controllers\CashFlowReportController;
 use App\Http\Controllers\GrossMarginReportController;
 use App\Http\Controllers\AlloyDbGrossMarginController;
 use App\Http\Controllers\GrossMarginV2ReportController;
+use App\Http\Controllers\MongoGrossMarginController;
 use App\Http\Controllers\TrackerCashFlowReportController;
 use Illuminate\Support\Facades\Route;
 
@@ -13,3 +14,4 @@ Route::get('/tracker-cashflow', TrackerCashFlowReportController::class)->name('t
 Route::get('/gross-margin', GrossMarginReportController::class)->name('gross-margin');
 Route::get('/gross-margin-v2', GrossMarginV2ReportController::class)->name('gross-margin-v2');
 Route::get('/alloydb/gross-margin', AlloyDbGrossMarginController::class)->name('alloydb-gross-margin');
+Route::get('/mongo/gross-margin', MongoGrossMarginController::class)->name('mongo-gross-margin');

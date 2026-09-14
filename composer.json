@@ -9,6 +9,7 @@
         "php": "^8.3",
         "laravel/framework": "^13.17",
         "laravel/tinker": "^3.0",
+        "mongodb/mongodb": "^2.0",
         "satur.io/duckdb": "*",
         "satur.io/duckdb-auto": "*"
     },
