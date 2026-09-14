@@ -65,27 +65,50 @@ final class GrossMarginV2PgSqlBuilder
             -- dimension column is attached. Joining names onto every journal
             -- line first and aggregating afterwards builds an intermediate wide
             -- enough to exhaust memory and spill; this leaves ~600 rows.
-            monthly_by_account AS MATERIALIZED (
+            -- Grouped on RAW COLUMNS so the columnar engine can do the
+            -- aggregation itself, and with no join, because either one pushes
+            -- the work back into Postgres's row-at-a-time executor.
+            --
+            -- Measured on the 500M-row farm, same filters, same output:
+            --   GROUP BY date_trunc('month', date)  ->  40,687 ms, no pushdown
+            --   GROUP BY date (raw column)          ->   2,740 ms, pushdown
+            --
+            -- The engine can only evaluate grouping keys it can read directly
+            -- from the column store; `date_trunc(...)` is a function call, so
+            -- the whole aggregate moves above the scan and 500M rows stream
+            -- through the executor one at a time. Grouping by the raw date
+            -- keeps it inside the scan and leaves ~16k rows to roll up, which
+            -- the plan confirms with 'Rows Aggregated by Columnar Scan'.
+            --
+            -- The account filter moves out of the scan for the same reason: a
+            -- semi-join between the scan and the aggregate blocks pushdown too.
+            -- Applying it to ~16k rows afterwards is equivalent, because every
+            -- account is either in scope for the whole query or not at all.
+            by_day AS MATERIALIZED (
                 SELECT
-                    date_trunc('month', tl.date)::DATE AS month_start,
+                    tl.date,
                     tl.account_id,
                     SUM(tl.amount) AS amount_raw,
-                    -- Counted here rather than by a second query. This CTE
-                    -- already visits every journal line in scope, so the count
-                    -- is free; asking for it separately means scanning the
-                    -- table twice, which is why the standalone version had to
-                    -- be suppressed above two seconds and went missing on
-                    -- exactly the farms where it mattered most.
                     count(*) AS line_count
                 FROM transaction_lines tl
                 WHERE tl.farm_id = :farm_id
                   AND tl.basis   = :basis
-                  AND tl.account_id IN (SELECT account_id FROM account_scope)
                   AND tl.date BETWEEN CAST(:period_from2 AS DATE) AND CAST(:period_to2 AS DATE)
                   AND (
                         (tl.date <= CAST(:horizon2 AS DATE) AND tl.type = 'actuals')
                      OR (tl.date >  CAST(:horizon3 AS DATE) AND tl.type = 'forecast')
                   )
+                GROUP BY 1, 2
+            ),
+
+            monthly_by_account AS MATERIALIZED (
+                SELECT
+                    date_trunc('month', d.date)::DATE AS month_start,
+                    d.account_id,
+                    SUM(d.amount_raw) AS amount_raw,
+                    SUM(d.line_count) AS line_count
+                FROM by_day d
+                WHERE d.account_id IN (SELECT account_id FROM account_scope)
                 GROUP BY 1, 2
             ),
 
