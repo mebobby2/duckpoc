@@ -41,6 +41,7 @@ granularity halved it again. See
 | DuckDB | Queried via [`satur.io/duckdb`](https://github.com/satur-io/duckdb-php) (FFI binding to the official C API) | No first-party PHP client exists; this is the most-adopted community one (148k+ installs) |
 | DuckLake | A DuckDB extension, attached at runtime | Catalog/table format over Parquet in GCS |
 | GCS | Data files (`gs://…`), authenticated via HMAC keys | See gotcha below — this is **not** service-account JSON auth |
+| AlloyDB Omni | PostgreSQL 17 + Google's in-memory columnar engine, via `pdo_pgsql` | The alternative being tested: one database serving the app *and* its reports, with no lake and no catalog |
 
 ## Quick start
 
@@ -902,6 +903,121 @@ and applied in `DuckLakeConnectionFactory`. Worth ~25% on a cold process, ~11%
 through the warm page — but a development-environment artifact, not an
 architectural finding.
 
+## AlloyDB Omni — the comparison, and the one rule that decides it
+
+Run with `docker compose --profile alloydb up -d`; report at
+`/alloydb/gross-margin` on `:8082`. PostgreSQL 17 plus Google's in-memory
+columnar engine, holding the same farms as the lake, returning byte-identical
+output — verified across four farm/period combinations so a timing difference
+is attributable to the engine and not to a rewrite.
+
+### Porting cost was almost nothing
+
+Four changes in ~200 lines of SQL:
+
+```
+strftime(x, '%Y-%m')  ->  to_char(x, 'YYYY-MM')
+INTERVAL 1 MONTH      ->  INTERVAL '1 month'
+month(x)              ->  EXTRACT(MONTH FROM x)
+$param                ->  :param
+```
+
+`GROUPING SETS`, `GROUPING()`, `any_value()` (PG16+) and `WITH … AS
+MATERIALIZED` (PG12+) are all native, so the nine CTEs and the
+aggregate-before-join ordering carried over unchanged.
+
+### GROUP BY a raw column, never an expression
+
+**This is the finding.** The columnar engine pushes aggregation down only when
+it can read the grouping key directly from the column store. A function call in
+the `GROUP BY` moves the whole aggregate above the scan, and every row then
+streams through Postgres's row-at-a-time executor.
+
+Measured on the 500M-row farm, identical filters, identical output:
+
+| grouping key | pushdown | time |
+|---|---|---|
+| `date_trunc('month', date)` — an expression | none | **40,687 ms** |
+| `date` — a raw column | `Rows Aggregated by Columnar Scan` | **2,740 ms** |
+
+A join between the scan and the aggregate blocks it for the same reason, so the
+account semi-join has to move out of the hot path too. Applying it afterwards is
+equivalent, because an account is either in scope for the whole query or not at
+all.
+
+`GrossMarginV2PgSqlBuilder` is written that way: `by_day` groups on `(date,
+account_id)` inside the columnar scan, and `monthly_by_account` rolls those
+~16k rows up to months. **The full-span report went from 147,697 ms to
+2,605 ms — 57x — with no extra memory and no hardware change.**
+
+Read it off the plan rather than inferring it from timing. `EXPLAIN (ANALYZE,
+BUFFERS)` shows `Rows Aggregated by Columnar Scan` when pushdown fires, and the
+report page reports the same thing as a badge.
+
+Two results that map the boundary: a bare `count(*)` with no `GROUP BY` runs in
+**34 ms** over 500M rows, and `GROUP BY account_id` — also a raw column — in
+1,753 ms.
+
+### Where it lands against the lake
+
+Same farms, same windows, same host, identical output:
+
+| | lake / MinIO | AlloyDB |
+|---|---|---|
+| 500M farm, full span | ~2.9 s | **2.6 s** |
+| 500M farm, 2 months | 171–220 ms | **119 ms** |
+| 1M farm, full span | 65–67 ms | 240 ms |
+
+Competitive at 500M, behind on the small farm. Worth remembering that the 500M
+single-farm shape is 625x Figured's largest real farm and penalises the lake's
+own strengths too — one farm is 99.8% of that table, so no index has any
+selectivity.
+
+### The case against is operational, not speed
+
+- **Two SIGSEGVs in a few hours**, on an idle machine. The image ships
+  `restart_after_crash=off`, so a segfault shuts the whole instance down and it
+  stays down until someone restarts it. Specifically Omni 17.5.0 on aarch64;
+  managed AlloyDB on x86 is a different build and may not do this.
+- **~25 minutes of warmup after every restart** — populating the store is one
+  full table scan per column, six of them. The store is memory-resident and
+  cannot be persisted; `enable_configuration_persistence` only makes the engine
+  remember *what* to rebuild. Reports run at heap-scan speed throughout.
+- **~20x the storage.** 80 GB (77 GB heap + 3.4 GB index) against ~4 GB of
+  Parquet for the same 500M rows, because Postgres stores repeated text inline
+  per row where Parquet dictionary-encodes it. Hot database storage, no cheap
+  cold tier.
+- **The column store is table-wide**, not per farm, so farms compete for one
+  fixed pool. Loading a second farm consumes budget the first one's reports
+  depend on, and a large arrival can evict another farm's columns and silently
+  drop it to heap scans.
+
+### Capacity: read coverage, not the budget
+
+The two disagree, and only one predicts behaviour. At a 1 GB budget the store
+sat at 88% *of budget* — which reads as healthy — while holding **31% of the
+table's blocks**: it had filled up and stopped. Everything outside those blocks
+is read from the heap.
+
+`g_columnar_relations.block_count_in_cc / total_block_count` is the number to
+watch; the report page shows it as **Table in memory**. At ~5.8 bytes per row,
+500M rows needs ~2.9 GB, so the budget was raised to 4 GB to reach full
+coverage.
+
+### Two traps in the tooling
+
+- **`google_columnar_engine_add` is a no-op on a column already registered.**
+  After reloading a table it keeps the previous snapshot — it reported 1.3 KB
+  for a million rows because it still held a 620-row version. A refresh fixes
+  that, but on a *fresh* registration the adds have already populated the store
+  and refreshing rebuilds it a second time: six more full passes, roughly
+  doubling a 25-minute job. `AlloyDbSchema::columnarize()` refreshes only when
+  coverage is short.
+- **Dropping an index needs an ACCESS EXCLUSIVE lock**, which the columnar
+  engine's background rebuild holds. A 620-row demo seed blocked on it for ten
+  minutes and then full-scanned 501M rows to delete 620. `alloydb:setup` drops
+  the index only for bulk loads (>= 1M rows).
+
 ## Real gotchas hit while building this (all fixed, documented here so they don't get rediscovered)
 
 0. **`catalog.sqlite` is not SQLite, and deleting it orphans the whole lake.**
@@ -1182,7 +1298,24 @@ if either errors.
 - The report rendering in a browser end to end, over real GCS-backed DuckLake, in ~400 ms per request including the full DuckDB setup/attach cycle
 - **Tracker-count independence**: per-tracker Cash Flow sections resolved by grouping one scan, with the 1/10/50 curve flat (~5% for 50x the trackers, measured worst-case-first in fresh processes) and the generated SQL byte-identical across tracker counts
 
+**Verified for AlloyDB Omni, same farms and byte-identical output:**
+- The Gross Margin V2 query ported to PostgreSQL 17 with four dialect changes,
+  output identical to the lake across four farm/period combinations
+- Aggregate pushdown fires on a raw grouping column and not on an expression —
+  40,687 ms vs 2,740 ms on the same 500M rows, read off the plan rather than
+  inferred from timing
+- Column store capacity and coverage measured separately; ~5.8 bytes per row,
+  100% coverage of 501M rows at a 4 GB budget
+- Two SIGSEGVs, each shutting the instance down because the image ships
+  `restart_after_crash=off`
+
 **Not yet verified:**
+- **Whether managed AlloyDB on x86 shares Omni's aarch64 instability.** Both
+  crashes were on the local container build; the hosted service is a different
+  build and this PoC has not touched it
+- **AlloyDB under concurrency.** As with the lake, every figure here is one
+  query at a time — and with a table-wide memory pool, concurrent reports across
+  farms are exactly where contention would show
 - **Sorting by date within a partition to enable row-group pruning** — the
   single largest untested lever for narrow report windows. See "Big-farm
   findings" above for the diagnostic and the predicted effect
