@@ -1474,14 +1474,19 @@ it costs nothing to pull.
 
 ### The scaling curve — and where the wall actually is
 
-| Farm | Lines | Report | Per million | Throughput |
-|---|---|---|---|---|
-| `gm-dairy-farm-1m` | 999,980 | 1,346 ms | 1.35 s | 745k docs/sec |
-| `gm-dairy-farm-10m` | 9,999,980 | 14,717 ms | 1.47 s | 680k docs/sec |
-| `mongo-gm-dairy-farm-25m` | 24,999,596 | 40,666 ms | 1.63 s | 615k docs/sec |
+| Farm | Lines | Naive pipeline | Per million | Covered pipeline | Per million |
+|---|---|---|---|---|---|
+| `gm-dairy-farm-1m` | 999,980 | 1,346 ms | 1.35 s | **975 ms** | 0.98 s |
+| `gm-dairy-farm-10m` | 9,999,980 | 14,717 ms | 1.47 s | **9,640 ms** | 0.96 s |
+| `mongo-gm-dairy-farm-25m` | 24,999,596 | 40,666 ms | 1.63 s | **23,772 ms** | 0.95 s |
 
-PHP stayed at 2.1 ms at all three volumes. Every millisecond of the growth is
-Mongo.
+PHP stayed at ~2.5 ms at all three volumes and in both pipelines. Every
+millisecond of the growth is Mongo.
+
+The **covered pipeline is what the code now ships** — see "Giving Mongo its best
+shot" below. It is 1.4-1.7x faster, and the improvement widens with volume
+because it removes the cause of the degradation rather than just the constant:
+per-million cost goes from rising (1.35 -> 1.63) to flat (0.98 -> 0.95).
 
 **It is CPU-bound on one core, not IO-bound.** Sampled during the 25M
 aggregation: **101% CPU on a 16-core machine**, and container block reads flat
@@ -1513,11 +1518,56 @@ measured line at 1.63 s/million, and it is still rising:
 
 | | extrapolated Mongo | measured AlloyDB | measured lake |
 |---|---|---|---|
-| 500M | ~13.6 min | — | — |
-| 1B | ~27 min | 3.3 s | 3.9 s |
+| 500M | ~8 min | — | — |
+| 1B | ~16 min | 3.3 s | 3.9 s |
 
-The interactive threshold — 5 s for a page — lands at about **3.5M journal
+The interactive threshold — 5 s for a page — lands at about **5M journal
 lines**, before virtual journals are charged for at all.
+
+### Giving Mongo its best shot
+
+Before quoting any of the numbers above as "Mongo's ceiling", the pipeline was
+tuned. Measured on the 25M farm, actuals bucket, medians of four runs:
+
+| variant | median |
+|---|---|
+| naive — fetching scan, `$in`, `$dateToString` | 27,546 ms |
+| `$year`/`$month` instead of `$dateToString` | 25,473 ms |
+| drop the date bucketing entirely (floor) | 23,461 ms |
+| `$match` + `count` only, no field access | 16,368 ms |
+| **covered scan + `$project` + `$year`/`$month`** | **15,364 ms** |
+| covered, and also dropping the `$in` | 13,590 ms |
+
+Two things fall out of that table.
+
+**Expression tuning is nearly pointless.** Swapping `$dateToString` for
+`$year`/`$month` buys 7%, and removing the date bucketing *altogether* buys only
+15%. A pipeline that does nothing but match and count still costs 16.4 s. The
+cost is walking documents, not computing over them.
+
+**Not fetching the documents is the whole game.** The `covering_gm` index
+carries every field the pipeline touches, so the scan is answered from index
+keys — `PROJECTION_COVERED <- IXSCAN`, `docsExamined: 0`. That halves the
+fetching scan's 26.0 s. It works because the report reads six fields out of a
+~253-byte document; Mongo otherwise materialises all of it to reach them.
+
+It also explains why per-million cost stopped degrading. The naive scan pushes
+9.3 GB of documents past a 4 GB WiredTiger cache; the covered scan touches only
+a 0.18 GB index, which stays resident at any volume this PoC reaches.
+
+Three caveats that stop this being a free lunch:
+
+- **The index is report-shaped.** It covers Gross Margin V2's six fields. A
+  report needing a seventh field falls back to fetching, silently. Figured runs
+  many report types, so this is one index per report shape, each of which has to
+  be maintained on every write.
+- **It does not change the asymptote.** Still single-threaded, still ~0.95 s per
+  million, still one core out of sixteen. It moves the wall from ~3.5M lines to
+  ~5M, it does not remove it.
+- **The `$in` was left in place.** Dropping it buys a further 13%, and
+  `classify()` already discards out-of-scope accounts so the output would be
+  identical — but Figured's real query does filter by account, and a baseline
+  that quietly removes work the real system does is not a baseline.
 
 ### Why loading is slow, and why that is a real finding
 

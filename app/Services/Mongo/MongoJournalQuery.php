@@ -87,7 +87,7 @@ final class MongoJournalQuery
 
             foreach ($cursor as $row) {
                 $accountId = (string) $row['_id']['account_id'];
-                $month = (string) $row['_id']['month'];
+                $month = sprintf('%04d-%02d', (int) $row['_id']['year'], (int) $row['_id']['month']);
                 $key = $accountId.'|'.$month;
 
                 // Buckets are disjoint by construction, so a key cannot repeat
@@ -168,6 +168,16 @@ final class MongoJournalQuery
                     // cannot be joined, so its primary keys are marshalled into
                     // the query as a literal $in. On a farm with a large chart
                     // of accounts this predicate is itself a payload.
+                    //
+                    // It is not free — measured at 15,364 ms against 13,590 ms
+                    // without it on the 25M farm, because a range predicate on
+                    // `date` already owns the index bounds and the $in can only
+                    // be applied as a filter over the keys the range selects.
+                    // Kept anyway: `classify()` discards out-of-scope accounts
+                    // regardless, so this could be dropped for 13% — but
+                    // Figured's real query does filter by account, and a
+                    // baseline that quietly removes work the real system does
+                    // is not a baseline.
                     'account_id' => ['$in' => $accountIds],
                     'date' => [
                         '$gte' => new UTCDateTime(strtotime($from.' 00:00:00') * 1000),
@@ -175,14 +185,31 @@ final class MongoJournalQuery
                     ],
                 ],
             ],
+            // Present so the scan can be answered from `covering_gm` alone.
+            // Without it Mongo fetches each matching document to build the
+            // group key, and on the 25M farm that is the difference between
+            // 15,364 ms and 26,028 ms. It has to name only indexed fields and
+            // suppress _id, or coverage is lost and the FETCH returns silently.
+            [
+                '$project' => [
+                    'account_id' => 1,
+                    'date' => 1,
+                    'amount' => 1,
+                    '_id' => 0,
+                ],
+            ],
             [
                 '$group' => [
                     '_id' => [
                         'account_id' => '$account_id',
-                        // Bucketed in the $group key rather than in a preceding
-                        // $project. One stage less to stream 500M documents
-                        // through, and identical output.
-                        'month' => ['$dateToString' => ['format' => '%Y-%m', 'date' => '$date']],
+                        // $year/$month rather than $dateToString, and the
+                        // 'YYYY-MM' string is reassembled in PHP over the ~600
+                        // grouped rows instead of being formatted once per
+                        // document. Worth about 7% on its own; the reason to
+                        // prefer it is that string formatting is the one piece
+                        // of per-document work the covering index cannot remove.
+                        'year' => ['$year' => '$date'],
+                        'month' => ['$month' => '$date'],
                     ],
                     'amount_raw' => ['$sum' => '$amount'],
                     'line_count' => ['$sum' => 1],
