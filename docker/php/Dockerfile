@@ -7,14 +7,21 @@ FROM php:8.3-cli
 # ext-bcmath is optional for duckdb-php (used for big-integer results); we install
 # it anyway since Figured's own fixed-point money math (values stored ×10,000)
 # benefits from arbitrary-precision arithmetic when ported into this PoC.
+#
+# pdo_pgsql is for the AlloyDB Omni comparison. Worth noting the contrast with
+# the DuckDB path above: Postgres needs a core extension compiled in, while
+# DuckDB needs FFI plus a community binding plus a shared library. Both are one
+# line here, but only one of them puts a foreign runtime inside the web tier.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libffi-dev \
         libzip-dev \
         libsqlite3-dev \
+        libpq-dev \
         unzip \
         git \
         default-mysql-client \
-    && docker-php-ext-install ffi pdo_mysql pdo_sqlite bcmath zip \
+        postgresql-client \
+    && docker-php-ext-install ffi pdo_mysql pdo_sqlite pdo_pgsql bcmath zip \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

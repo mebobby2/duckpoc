@@ -1,5 +1,23 @@
+# Three stacks, selected with Compose profiles. Each is one storage backend,
+# so a measurement can never be attributed to the wrong one:
+#
+#   docker compose --profile gcs     up -d    app 8080 · mysql            DuckLake on gs://
+#   docker compose --profile minio   up -d    app 8081 · minio · mysql    DuckLake on s3://
+#   docker compose --profile alloydb up -d    app 8082 · alloydb          PostgreSQL, no lake
+#   docker compose --profile '*'     up -d    everything
+#
+# Combine with repeated flags: --profile gcs --profile minio
+#
+# Every service carries a profile, so a bare `docker compose up` starts nothing
+# — say which stack you want.
+#
+# One constraint worth knowing: depends_on cannot cross a profile boundary. A
+# service in profile A that depends on a service only in profile B fails the
+# whole project with "depends on undefined service", so each group has to be
+# self-contained.
 services:
   app:
+    profiles: [gcs]
     build:
       context: .
       dockerfile: docker/php/Dockerfile
@@ -12,7 +30,8 @@ services:
       # extension_directory explicitly, but this covers Composer's cache too.
       HOME: /tmp
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
     ports:
       # 8080, not 8000 — Docker already holds 8000 on this machine.
       - "8080:8000"
@@ -21,12 +40,74 @@ services:
     # `docker compose run --rm app <command>`, which overrides this.
     command: php artisan serve --host=0.0.0.0 --port=8000
 
+  # The same app, pinned to MinIO instead of GCS, so both storage backends are
+  # servable side by side: 8080 reads gs://, 8081 reads s3://.
+  #
+  # --no-reload is load-bearing, not a preference. `artisan serve` spawns a
+  # `php -S` child and filters its environment through a hardcoded allowlist
+  # (ServeCommand::$passthroughVariables), forwarding anything else as `false`
+  # — i.e. explicitly unset. Without this flag DUCKDB_STORAGE never reaches the
+  # process that handles requests, the child falls back to the config default,
+  # and the page silently serves GCS while claiming to be MinIO. That cost a
+  # round of wrong conclusions; verify a backend switch by stopping the backend.
+  app-minio:
+    profiles: [minio]
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      HOME: /tmp
+      DUCKDB_STORAGE: s3
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    ports:
+      - "8081:8000"
+    command: php artisan serve --host=0.0.0.0 --port=8000 --no-reload
+
+  # The app pointed at AlloyDB. Same image as the others — the AlloyDB report
+  # reads its own connection, so nothing here switches a driver — but it keeps
+  # that traffic off the lake instances and lets the AlloyDB stack run without
+  # MinIO or a GCS bucket.
+  app-alloydb:
+    profiles: [alloydb]
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      HOME: /tmp
+      # No MySQL in this stack at all — that is the proposition being tested.
+      #
+      # The report only ever reads DB::connection('alloydb'), but Laravel's own
+      # plumbing was the thing keeping MySQL alive: .env sets SESSION_DRIVER,
+      # CACHE_STORE and QUEUE_CONNECTION to 'database', so every request hit
+      # MySQL before reaching a controller. Those move to file/sync here, and
+      # the default connection becomes AlloyDB.
+      DB_CONNECTION: alloydb
+      SESSION_DRIVER: file
+      CACHE_STORE: file
+      QUEUE_CONNECTION: sync
+    depends_on:
+      - alloydb
+    ports:
+      - "8082:8000"
+    command: php artisan serve --host=0.0.0.0 --port=8000 --no-reload
+
   # S3-compatible object storage on the same host, so the report can be
   # measured without the ~8 ms Auckland->Sydney round trip that dominates every
   # GCS number in this PoC. It is a latency control, not a production proposal:
   # localhost is FASTER than co-located GCS would be, so it gives an optimistic
   # floor rather than a realistic production figure.
   minio:
+    profiles: [minio]
     image: minio/minio:latest
     command: server /data --console-address ":9011"
     environment:
@@ -43,7 +124,70 @@ services:
       timeout: 3s
       retries: 20
 
+  # AlloyDB Omni: PostgreSQL 17 plus Google's in-memory columnar engine, run
+  # locally so it can be measured on the same hardware as the DuckDB path.
+  #
+  # The comparison it exists to settle: DuckDB+DuckLake keeps reporting inside
+  # the app process but needs a lake, a catalog and manual maintenance, while
+  # AlloyDB could serve the app AND its reports from one Postgres — collapsing
+  # MySQL, Mongo and the DuckLake catalog into a single system.
+  #
+  # Omni's documented sizing is 8 GB RAM per CPU. Docker currently has 17.25 GB
+  # total and is also hosting MySQL, MinIO and the app, so this is deliberately
+  # given few CPUs rather than many; raise both together if the columnar engine
+  # needs a bigger store.
+  #
+  # /dev/shm is enlarged because the columnar engine keeps its column store in
+  # shared memory, and Docker's 64 MB default silently caps it.
+  alloydb:
+    profiles: [alloydb]
+    image: google/alloydbomni:17.5.0
+    environment:
+      POSTGRES_PASSWORD: duckpoc
+      POSTGRES_DB: duckpoc
+    ports:
+      # 5433, not 5432 — leaves the default free for any local Postgres.
+      - "5433:5432"
+    volumes:
+      - duckpoc-alloydb-data:/var/lib/postgresql/data
+    shm_size: 2gb
+    # enable_configuration_persistence is on because without it the engine
+    # forgets WHICH columns to hold across a restart: the registration is
+    # dropped, g_columnar_relations comes back empty, and a refresh returns
+    # false with "Container does not exist". The in-memory data cannot survive a
+    # restart either way, but with persistence on the engine knows what to
+    # rebuild rather than silently holding nothing.
+    #
+    # Note these are a folded YAML scalar: a '#' line inside the command block
+    # is passed to postgres as an argument, which fails with
+    # `invalid argument: "#"`. Comments go here, above the key.
+    #
+    # All are postmaster-context, so they cannot be set from a session —
+    # they belong here rather than in ALTER SYSTEM so the configuration lives in
+    # the repo instead of inside a Docker volume.
+    #
+    # shared_buffers is pinned because Omni otherwise sizes it to the whole
+    # container (it came up at 13.4 GB), which over-commits a 17.25 GB Docker VM
+    # that is also running MySQL, MinIO and the app.
+    #
+    # memory_size_in_mb is the columnar engine's in-memory store, and it is THE
+    # dial for the ceiling test: the question is not "can it hold 500M rows" but
+    # "how many bytes per row does the column store need".
+    command: >
+      -c google_columnar_engine.enabled=on
+      -c google_columnar_engine.memory_size_in_mb=4096
+      -c google_columnar_engine.enable_configuration_persistence=on
+      -c shared_buffers=2GB
+      -c max_wal_size=8GB
+      -c checkpoint_timeout=30min
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d duckpoc"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
   mysql:
+    profiles: [gcs, minio]
     image: mysql:8.0
     environment:
       MYSQL_DATABASE: duckpoc
@@ -57,7 +201,17 @@ services:
       - "3308:3306"
     volumes:
       - duckpoc-mysql-data:/var/lib/mysql
+    # Without this, depends_on only waits for the container to start, not for
+    # MySQL to accept connections — and since sessions and cache are
+    # database-backed, the first page load after `up -d` returns a 500 that
+    # looks like a broken profile rather than a cold start.
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uduckpoc -ppassword --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
 
 volumes:
   duckpoc-minio-data:
   duckpoc-mysql-data:
+  duckpoc-alloydb-data:

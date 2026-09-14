@@ -44,18 +44,89 @@ granularity halved it again. See
 
 ## Quick start
 
+The stack is split into three groups, one per storage backend, selected with
+Compose profiles. **A bare `docker compose up` starts nothing** — every service
+carries a profile, so you have to say which stack you want.
+
 ```bash
 docker compose build
-docker compose up -d                 # mysql + the report viewer on :8080
 
+docker compose --profile gcs     up -d   # :8080  DuckLake on gs://   + mysql
+docker compose --profile minio   up -d   # :8081  DuckLake on s3://   + minio + mysql
+docker compose --profile alloydb up -d   # :8082  PostgreSQL 17, no lake, no MySQL
+docker compose --profile '*'     up -d   # everything
+
+docker compose --profile gcs --profile minio up -d   # combine with repeated flags
+```
+
+| profile | port | engine | storage |
+|---|---|---|---|
+| `gcs` | 8080 | DuckDB + DuckLake | `gs://` — carries the real ~8 ms Tasman round trip |
+| `minio` | 8081 | DuckDB + DuckLake | `s3://` on localhost — the no-network control |
+| `alloydb` | 8082 | PostgreSQL 17 + columnar engine | none; rows live in the database |
+
+GCS and MinIO are deliberately **separate** profiles rather than one "duckdb"
+group. They are the same engine over different storage, and the whole point of
+running both is to isolate network latency — so a timing should never be
+ambiguous about which backend produced it.
+
+Then open **http://localhost:8080** (or `:8081` / `:8082`) — the root is an
+index of the available reports, linking to each viewer.
+
+### Seeding the lakehouse stack
+
+```bash
 docker compose run --rm app php artisan duckdb:cashflow:schema   # create tables
 docker compose run --rm app php artisan duckdb:cashflow:seed     # seed the oracle scenario
 docker compose run --rm app php artisan duckdb:cashflow:run      # run + parity-check
 docker compose run --rm app php artisan duckdb:cashflow:flush    # write inlined rows out to Parquet
 ```
 
-Then open **http://localhost:8080** — the root is an index of the available
-reports, linking to each viewer.
+### Seeding the AlloyDB stack
+
+```bash
+docker compose --profile alloydb run --rm app-alloydb \
+    php artisan alloydb:setup --farm=gm-dairy-farm --fresh --columnar
+```
+
+`--columnar` populates the in-memory column store, which is what makes the
+report fast — and is rebuilt from scratch on every restart, because it is
+memory-resident. The report page's **Table in memory** card shows coverage;
+below 100% the engine is falling back to heap scans.
+
+### Two things that will bite you
+
+**Stop with the wildcard.** `docker compose down` without a profile leaves
+profiled containers running, so a previous group keeps answering on its ports
+and it looks as though the profile you just started is broken — or worse, a
+measurement gets attributed to the wrong backend:
+
+```bash
+docker compose --profile '*' down
+```
+
+**`depends_on` cannot cross a profile boundary.** A service in one profile that
+depends on a service only in another fails the *whole project* with
+`depends on undefined service: invalid compose project`. Each group has to be
+self-contained, which is why the two stacks share nothing.
+
+### Why the AlloyDB stack has no MySQL
+
+That is the proposition under test: one database holding the operational
+records *and* reporting on them, rather than a lake plus a catalog plus a
+relational store. `AlloyDbSeeder` generates farms, accounts, trackers, milk
+production, stock movements and journals straight into PostgreSQL, and the
+report reads only that connection.
+
+Getting there needed more than dropping the dependency. Laravel's own plumbing
+was keeping MySQL alive: `.env` sets `SESSION_DRIVER`, `CACHE_STORE` and
+`QUEUE_CONNECTION` to `database`, so every request touched MySQL before
+reaching a controller. `app-alloydb` overrides those to `file`/`sync` and
+points `DB_CONNECTION` at `alloydb`.
+
+The lake reports (`/cashflow`, `/gross-margin-v2`) will not work on `:8082` —
+they need MySQL for dimensions and a bucket for facts. Use `:8080` or `:8081`
+for those.
 
 ### The report viewer
 
