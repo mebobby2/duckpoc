@@ -178,7 +178,7 @@ final class AlloyDbSchema
      *
      * @return list<array<string, mixed>>
      */
-    public function columnarize(): array
+    public function columnarize(bool $forceRefresh = false): array
     {
         foreach (self::COLUMNAR_COLUMNS as $column) {
             $this->db->statement(
@@ -200,7 +200,14 @@ final class AlloyDbSchema
         // Coverage tells the two cases apart. Blocks in the store below the
         // table's total means the store is stale or was truncated, and a
         // refresh is warranted; at full coverage the adds have already done it.
-        if (($this->coverage() ?? 0.0) < 0.999) {
+        // `$forceRefresh` exists because the coverage check is not trustworthy
+        // straight after a bulk load. Following a 1B-row insert it read as
+        // complete and skipped the refresh — the columnar step reported
+        // "done in 0.0s" — while the store actually held 40.4% of the table.
+        // `total_block_count` evidently lags the heap until statistics catch
+        // up, so a caller that knows the data just changed says so explicitly
+        // rather than asking.
+        if ($forceRefresh || ($this->coverage() ?? 0.0) < 0.999) {
             $this->db->statement("SELECT google_columnar_engine_refresh('transaction_lines')");
         }
 

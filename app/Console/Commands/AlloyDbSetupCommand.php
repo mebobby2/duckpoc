@@ -79,7 +79,7 @@ class AlloyDbSetupCommand extends Command
         if ($this->option('columnar')) {
             $this->info('Populating the columnar engine…');
             $started = microtime(true);
-            $columns = $schema->columnarize();
+            $columns = $schema->columnarize(forceRefresh: $bulkLoad);
             $this->line(sprintf('  done in %.1fs', microtime(true) - $started));
 
             foreach ($columns as $column) {
