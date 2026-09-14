@@ -175,7 +175,7 @@ services:
     # "how many bytes per row does the column store need".
     command: >
       -c google_columnar_engine.enabled=on
-      -c google_columnar_engine.memory_size_in_mb=4096
+      -c google_columnar_engine.memory_size_in_mb=9216
       -c google_columnar_engine.enable_configuration_persistence=on
       -c shared_buffers=2GB
       -c max_wal_size=8GB
