@@ -1472,6 +1472,53 @@ outside the database than this baseline does. `report_mongo_duration` ÷
 `report_duration` from production Prometheus is the number that settles it, and
 it costs nothing to pull.
 
+### The scaling curve — and where the wall actually is
+
+| Farm | Lines | Report | Per million | Throughput |
+|---|---|---|---|---|
+| `gm-dairy-farm-1m` | 999,980 | 1,346 ms | 1.35 s | 745k docs/sec |
+| `gm-dairy-farm-10m` | 9,999,980 | 14,717 ms | 1.47 s | 680k docs/sec |
+| `mongo-gm-dairy-farm-25m` | 24,999,596 | 40,666 ms | 1.63 s | 615k docs/sec |
+
+PHP stayed at 2.1 ms at all three volumes. Every millisecond of the growth is
+Mongo.
+
+**It is CPU-bound on one core, not IO-bound.** Sampled during the 25M
+aggregation: **101% CPU on a 16-core machine**, and container block reads flat
+at 1.07 GB for the whole scan. MongoDB runs a pipeline on an unsharded
+collection single-threaded, so a report gets one core no matter how large the
+box. DuckDB spends 16 threads on the same work and AlloyDB uses parallel
+workers over a columnar scan — which is most of the 21x.
+
+The other half is that Mongo must materialise and decode all ~253 bytes of each
+document to read the two fields the pipeline sums. There is no projection
+pushdown to storage and no columnar path, so the cost scales with document size
+rather than with the number of fields actually used.
+
+**The expected cache cliff did not appear, and the reason matters.** At 25M the
+collection is 9.3 GB against a 4 GB WiredTiger cache, so the cache is missing
+constantly — yet degradation was only 21% per million from 1M to 25M. Block IO
+says why: nothing was read from disk. The whole 9.3 GB collection fits in the
+16.8 GB Docker VM's page cache, so a WiredTiger miss is a memcpy and a
+decompress, not a seek.
+
+So this measured the **cache-miss-but-RAM-resident** regime, not the disk
+regime. A genuine cliff needs a collection larger than host RAM — beyond roughly
+65M documents here. That test has not been run.
+
+The practical consequence cuts the other way from the usual intuition: because
+the bottleneck is single-threaded BSON decode rather than IO, **more RAM does
+not help and more cores do not help a single report**. Extrapolating the
+measured line at 1.63 s/million, and it is still rising:
+
+| | extrapolated Mongo | measured AlloyDB | measured lake |
+|---|---|---|---|
+| 500M | ~13.6 min | — | — |
+| 1B | ~27 min | 3.3 s | 3.9 s |
+
+The interactive threshold — 5 s for a page — lands at about **3.5M journal
+lines**, before virtual journals are charged for at all.
+
 ### Why loading is slow, and why that is a real finding
 
 The Postgres and DuckDB seeders generate rows *inside* the engine from
