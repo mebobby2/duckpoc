@@ -117,6 +117,25 @@
                 running unmodified on a different engine
             </p>
         </a>
+
+        <a href="{{ route('mongo-gross-margin') }}"
+           class="block rounded-lg border border-slate-300 bg-slate-50 p-5 shadow-sm hover:border-slate-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Gross Margin V2 — MongoDB baseline</h2>
+                <span class="rounded bg-slate-200 px-2 py-0.5 text-xs font-medium text-slate-800">
+                    the current stack
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                The same report on the topology Figured runs today: journals in MongoDB, dimensions
+                in MySQL, and PHP joining them because no query can span the two. Not a fourth
+                candidate &mdash; the baseline the other three are measured against.
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: the Mongo / MySQL / PHP time split · 1&ndash;4 bucketed aggregations ·
+                the roll-up, stock chain and per-unit margins rebuilt as PHP loops
+            </p>
+        </a>
     </div>
 
     <section class="mt-10 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">

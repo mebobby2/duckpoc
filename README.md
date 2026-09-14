@@ -45,7 +45,7 @@ granularity halved it again. See
 
 ## Quick start
 
-The stack is split into three groups, one per storage backend, selected with
+The stack is split into four groups, one per storage backend, selected with
 Compose profiles. **A bare `docker compose up` starts nothing** — every service
 carries a profile, so you have to say which stack you want.
 
@@ -55,6 +55,7 @@ docker compose build
 docker compose --profile gcs     up -d   # :8080  DuckLake on gs://   + mysql
 docker compose --profile minio   up -d   # :8081  DuckLake on s3://   + minio + mysql
 docker compose --profile alloydb up -d   # :8082  PostgreSQL 17, no lake, no MySQL
+docker compose --profile mongo   up -d   # :8083  MongoDB + MySQL — the current stack
 docker compose --profile '*'     up -d   # everything
 
 docker compose --profile gcs --profile minio up -d   # combine with repeated flags
@@ -65,14 +66,20 @@ docker compose --profile gcs --profile minio up -d   # combine with repeated fla
 | `gcs` | 8080 | DuckDB + DuckLake | `gs://` — carries the real ~8 ms Tasman round trip |
 | `minio` | 8081 | DuckDB + DuckLake | `s3://` on localhost — the no-network control |
 | `alloydb` | 8082 | PostgreSQL 17 + columnar engine | none; rows live in the database |
+| `mongo` | 8083 | MongoDB 7 + MySQL + PHP | journals in Mongo, dimensions in MySQL |
 
 GCS and MinIO are deliberately **separate** profiles rather than one "duckdb"
 group. They are the same engine over different storage, and the whole point of
 running both is to isolate network latency — so a timing should never be
 ambiguous about which backend produced it.
 
-Then open **http://localhost:8080** (or `:8081` / `:8082`) — the root is an
-index of the available reports, linking to each viewer.
+The `mongo` profile is the **baseline**, not a fourth candidate. It reproduces
+what Figured runs today so the other three have something to be measured
+against, and it shares MySQL with the lake profiles on purpose — see
+"The MongoDB baseline" below.
+
+Then open **http://localhost:8080** (or `:8081` / `:8082` / `:8083`) — the root
+is an index of the available reports, linking to each viewer.
 
 ### Seeding the lakehouse stack
 
@@ -82,6 +89,20 @@ docker compose run --rm app php artisan duckdb:cashflow:seed     # seed the orac
 docker compose run --rm app php artisan duckdb:cashflow:run      # run + parity-check
 docker compose run --rm app php artisan duckdb:cashflow:flush    # write inlined rows out to Parquet
 ```
+
+### Seeding the MongoDB baseline
+
+```bash
+docker compose --profile mongo run --rm app-mongo \
+    php artisan mongo:setup --farm=gm-dairy-farm --fresh
+
+docker compose --profile mongo run --rm app-mongo \
+    php artisan mongo:setup --farm=gm-dairy-farm-1m --region=gm-bulk --rows=1000000
+```
+
+`--fresh` drops the journal collection. Dimensions are **upserted** into the
+shared MySQL rather than replaced, so seeding this stack cannot pull the
+dimension rows out from under the `gcs` / `minio` profiles.
 
 ### Seeding the AlloyDB stack
 
@@ -1365,3 +1386,194 @@ Phased per the architecture conversation this PoC came out of. **Phase 0
 6. **Phase 5 — The additive derived-facts Parquet layer for BigQuery** /
    practice-wide benchmarking, built on report logic now proven correct on
    the hard case, not just the easy one.
+
+## The MongoDB baseline — what the current stack actually costs
+
+Added so the other three numbers mean something. Before this, the PoC could say
+"DuckDB does the Gross Margin report in 62 ms" without being able to say what it
+was faster *than*.
+
+The `mongo` profile reproduces Figured's topology rather than porting the SQL:
+
+- **Journals in MongoDB.** One document per line, indexed `(farm_id, basis, date)`.
+- **Dimensions in MySQL.** Accounts, trackers, milk production, stock movements —
+  the same tables the lake profiles read, in the same database.
+- **PHP in between**, because no query can span the two.
+
+It shares MySQL with the `gcs` and `minio` profiles deliberately. Giving it a
+private copy would have quietly removed the constraint under test.
+
+### The Mongo half is smaller than people assume
+
+`MongoJournalQuery` mirrors `QueryMongoReportDataService`: the period is
+partitioned by budget type and one aggregation is issued per non-empty bucket —
+**at most four for a whole report, independent of tracker count**. The pipeline
+is two stages, `$match` then `$group`, and it returns
+`(account_id, month) → sum` with no names, no ordering and no structure.
+
+No `$lookup`, because `accounts` is in another database. No `$setWindowFields`,
+because the stock movements it would run over are in that same other database.
+Mongo is a sum-by-key engine here, which is all this topology lets it be — and
+worth being precise about, because "Mongo can't do window functions" is false
+(it has had them since 5.0) while "the data isn't there to window over" is true.
+
+### Everything else moved into PHP
+
+| Step | DuckDB / AlloyDB | Baseline |
+|---|---|---|
+| Attach account names | `JOIN account_scope` | `classify()` |
+| Account / group / section subtotals | `GROUPING SETS` | `rollUp()` |
+| Gross margin line | derived CTE | `marginRows()` |
+| Livestock running balance | `SUM(...) OVER (...)` | `stockUnits()` |
+| Per-unit margin | projection | `emit()` |
+
+Output is **identical to AlloyDB cell for cell**, verified at both scales
+(22 rows × 12 months on the demo farm, 22 × 48 on the 1M farm). AlloyDB was
+already verified against the lake, so all three agree transitively.
+
+### Measured, `gm-dairy-farm-1m`, 2024-01-01 → 2027-12-31, horizon 2026-08-31
+
+999,980 journal lines in scope, same farm and period on both engines:
+
+| | MongoDB baseline | AlloyDB |
+|---|---|---|
+| Report time | **1,346 ms** | **62 ms** |
+| ↳ Mongo | 1,341 ms (99.7%) | — |
+| ↳ MySQL | 2.1 ms (0.2%) | — |
+| ↳ PHP | 2.0 ms (0.2%) | — |
+| Load time | 5.3 s (190k docs/sec) | ~1 s |
+| Storage | 253 MB + 20 MB index | — |
+| Bytes per journal line | ~253 B | — |
+
+**21× on the same data and the same hardware.**
+
+### The result that corrects the hypothesis
+
+Going in, the expectation was that PHP would dominate — that the assembly layer,
+not Mongo, was the ceiling. On this report it does not: PHP is 0.2% of the run,
+because Mongo returns only ~600 grouped rows however many lines it aggregated.
+The roll-up, the stock chain and the sort are all O(accounts × months).
+
+So for Gross Margin V2, **the engine is the constraint**, and the 21× is real.
+
+The honest caveat, which belongs next to that number: this reproduces *this
+report's* PHP half, not Figured's whole pipeline. Two real costs are absent —
+
+- **Virtual journals.** Figured synthesises journal lines at report time from
+  business rules (`VirtualJournalsService`, tracked as `report_vj_duration`). No
+  engine in this PoC does that work, so no stack here is charged for it.
+- **Per-tracker assembly.** V2 keeps query count independent of tracker count,
+  but tracker count still multiplies in-process section assignment and
+  formatting. This farm has five trackers; a 50-tracker farm would not scale the
+  Mongo half at all and would scale the PHP half linearly.
+
+Both push in the same direction: the real Figured report spends a larger share
+outside the database than this baseline does. `report_mongo_duration` ÷
+`report_duration` from production Prometheus is the number that settles it, and
+it costs nothing to pull.
+
+### The scaling curve — and where the wall actually is
+
+| Farm | Lines | Naive pipeline | Per million | Covered pipeline | Per million |
+|---|---|---|---|---|---|
+| `gm-dairy-farm-1m` | 999,980 | 1,346 ms | 1.35 s | **975 ms** | 0.98 s |
+| `gm-dairy-farm-10m` | 9,999,980 | 14,717 ms | 1.47 s | **9,640 ms** | 0.96 s |
+| `mongo-gm-dairy-farm-25m` | 24,999,596 | 40,666 ms | 1.63 s | **23,772 ms** | 0.95 s |
+
+PHP stayed at ~2.5 ms at all three volumes and in both pipelines. Every
+millisecond of the growth is Mongo.
+
+The **covered pipeline is what the code now ships** — see "Giving Mongo its best
+shot" below. It is 1.4-1.7x faster, and the improvement widens with volume
+because it removes the cause of the degradation rather than just the constant:
+per-million cost goes from rising (1.35 -> 1.63) to flat (0.98 -> 0.95).
+
+**It is CPU-bound on one core, not IO-bound.** Sampled during the 25M
+aggregation: **101% CPU on a 16-core machine**, and container block reads flat
+at 1.07 GB for the whole scan. MongoDB runs a pipeline on an unsharded
+collection single-threaded, so a report gets one core no matter how large the
+box. DuckDB spends 16 threads on the same work and AlloyDB uses parallel
+workers over a columnar scan — which is most of the 21x.
+
+The other half is that Mongo must materialise and decode all ~253 bytes of each
+document to read the two fields the pipeline sums. There is no projection
+pushdown to storage and no columnar path, so the cost scales with document size
+rather than with the number of fields actually used.
+
+**The expected cache cliff did not appear, and the reason matters.** At 25M the
+collection is 9.3 GB against a 4 GB WiredTiger cache, so the cache is missing
+constantly — yet degradation was only 21% per million from 1M to 25M. Block IO
+says why: nothing was read from disk. The whole 9.3 GB collection fits in the
+16.8 GB Docker VM's page cache, so a WiredTiger miss is a memcpy and a
+decompress, not a seek.
+
+So this measured the **cache-miss-but-RAM-resident** regime, not the disk
+regime. A genuine cliff needs a collection larger than host RAM — beyond roughly
+65M documents here. That test has not been run.
+
+The practical consequence cuts the other way from the usual intuition: because
+the bottleneck is single-threaded BSON decode rather than IO, **more RAM does
+not help and more cores do not help a single report**. Extrapolating the
+measured line at 1.63 s/million, and it is still rising:
+
+| | extrapolated Mongo | measured AlloyDB | measured lake |
+|---|---|---|---|
+| 500M | ~8 min | — | — |
+| 1B | ~16 min | 3.3 s | 3.9 s |
+
+The interactive threshold — 5 s for a page — lands at about **5M journal
+lines**, before virtual journals are charged for at all.
+
+### Giving Mongo its best shot
+
+Before quoting any of the numbers above as "Mongo's ceiling", the pipeline was
+tuned. Measured on the 25M farm, actuals bucket, medians of four runs:
+
+| variant | median |
+|---|---|
+| naive — fetching scan, `$in`, `$dateToString` | 27,546 ms |
+| `$year`/`$month` instead of `$dateToString` | 25,473 ms |
+| drop the date bucketing entirely (floor) | 23,461 ms |
+| `$match` + `count` only, no field access | 16,368 ms |
+| **covered scan + `$project` + `$year`/`$month`** | **15,364 ms** |
+| covered, and also dropping the `$in` | 13,590 ms |
+
+Two things fall out of that table.
+
+**Expression tuning is nearly pointless.** Swapping `$dateToString` for
+`$year`/`$month` buys 7%, and removing the date bucketing *altogether* buys only
+15%. A pipeline that does nothing but match and count still costs 16.4 s. The
+cost is walking documents, not computing over them.
+
+**Not fetching the documents is the whole game.** The `covering_gm` index
+carries every field the pipeline touches, so the scan is answered from index
+keys — `PROJECTION_COVERED <- IXSCAN`, `docsExamined: 0`. That halves the
+fetching scan's 26.0 s. It works because the report reads six fields out of a
+~253-byte document; Mongo otherwise materialises all of it to reach them.
+
+It also explains why per-million cost stopped degrading. The naive scan pushes
+9.3 GB of documents past a 4 GB WiredTiger cache; the covered scan touches only
+a 0.18 GB index, which stays resident at any volume this PoC reaches.
+
+Three caveats that stop this being a free lunch:
+
+- **The index is report-shaped.** It covers Gross Margin V2's six fields. A
+  report needing a seventh field falls back to fetching, silently. Figured runs
+  many report types, so this is one index per report shape, each of which has to
+  be maintained on every write.
+- **It does not change the asymptote.** Still single-threaded, still ~0.95 s per
+  million, still one core out of sixteen. It moves the wall from ~3.5M lines to
+  ~5M, it does not remove it.
+- **The `$in` was left in place.** Dropping it buys a further 13%, and
+  `classify()` already discards out-of-scope accounts so the output would be
+  identical — but Figured's real query does filter by account, and a baseline
+  that quietly removes work the real system does is not a baseline.
+
+### Why loading is slow, and why that is a real finding
+
+The Postgres and DuckDB seeders generate rows *inside* the engine from
+`generate_series`, so nothing crosses a client connection. Mongo has no
+server-side generator, so every document is pushed from PHP — 190k docs/sec
+here. That is a property of the topology, not a handicap imposed on it, and it
+is the same reason a full reload of production data is a very different
+proposition on each of these stacks.

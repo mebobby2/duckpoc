@@ -4,6 +4,7 @@
 #   docker compose --profile gcs     up -d    app 8080 · mysql            DuckLake on gs://
 #   docker compose --profile minio   up -d    app 8081 · minio · mysql    DuckLake on s3://
 #   docker compose --profile alloydb up -d    app 8082 · alloydb          PostgreSQL, no lake
+#   docker compose --profile mongo   up -d    app 8083 · mongo · mysql    Figured's own topology
 #   docker compose --profile '*'     up -d    everything
 #
 # Combine with repeated flags: --profile gcs --profile minio
@@ -101,6 +102,62 @@ services:
       - "8082:8000"
     command: php artisan serve --host=0.0.0.0 --port=8000 --no-reload
 
+  # The baseline stack: Mongo for journals, MySQL for dimensions, PHP for
+  # everything else. This is not a fourth engine to compare — it is a
+  # reproduction of what Figured runs today, so the other three have something
+  # to be measured against.
+  #
+  # It reuses the SAME MySQL as the lake profiles, holding the same accounts,
+  # trackers, milk production and stock movements. That is the point: Figured
+  # splits facts from dimensions across two datastores, and no single query can
+  # span them. Giving this stack its own private copy would quietly remove the
+  # constraint under test.
+  app-mongo:
+    profiles: [mongo]
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    volumes:
+      - .:/app
+    working_dir: /app
+    environment:
+      HOME: /tmp
+      MONGO_URI: mongodb://mongo:27017
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    ports:
+      - "8083:8000"
+    command: php artisan serve --host=0.0.0.0 --port=8000 --no-reload
+
+  # MongoDB 7, matching the major version figured-webapp runs, so the available
+  # aggregation stages are the same ones production could use.
+  #
+  # wiredTigerCacheSizeGB is pinned because Mongo otherwise claims half of
+  # (container RAM - 1 GB), which on this machine collides with AlloyDB's column
+  # store and MySQL's buffer pool when profiles run side by side. 4 GB is also
+  # roughly the working set the hero farms need, so a cache-resident run is
+  # still reachable — the interesting comparison is against a warm engine, not
+  # a starved one.
+  mongo:
+    profiles: [mongo]
+    image: mongo:7.0
+    command: ["--wiredTigerCacheSizeGB", "4"]
+    ports:
+      # 27019, not 27017/27018 — figured-webapp owns both (app and test).
+      # Running this stack while cross-checking against the real Figured
+      # reports is the normal case, not the exception.
+      - "27019:27017"
+    volumes:
+      - duckpoc-mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
   # S3-compatible object storage on the same host, so the report can be
   # measured without the ~8 ms Auckland->Sydney round trip that dominates every
   # GCS number in this PoC. It is a latency control, not a production proposal:
@@ -187,7 +244,7 @@ services:
       retries: 30
 
   mysql:
-    profiles: [gcs, minio]
+    profiles: [gcs, minio, mongo]
     image: mysql:8.0
     environment:
       MYSQL_DATABASE: duckpoc
@@ -212,6 +269,7 @@ services:
       retries: 30
 
 volumes:
+  duckpoc-mongo-data:
   duckpoc-minio-data:
   duckpoc-mysql-data:
   duckpoc-alloydb-data:
