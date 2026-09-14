@@ -69,7 +69,14 @@ final class GrossMarginV2PgSqlBuilder
                 SELECT
                     date_trunc('month', tl.date)::DATE AS month_start,
                     tl.account_id,
-                    SUM(tl.amount) AS amount_raw
+                    SUM(tl.amount) AS amount_raw,
+                    -- Counted here rather than by a second query. This CTE
+                    -- already visits every journal line in scope, so the count
+                    -- is free; asking for it separately means scanning the
+                    -- table twice, which is why the standalone version had to
+                    -- be suppressed above two seconds and went missing on
+                    -- exactly the farms where it mattered most.
+                    count(*) AS line_count
                 FROM transaction_lines tl
                 WHERE tl.farm_id = :farm_id
                   AND tl.basis   = :basis
@@ -197,6 +204,10 @@ final class GrossMarginV2PgSqlBuilder
             )
 
             SELECT
+                -- One scalar over the materialised CTE (~600 rows), repeated on
+                -- every output row. Costs nothing and cannot disagree with the
+                -- report, because it is the report's own scan being counted.
+                (SELECT sum(line_count) FROM monthly_by_account) AS lines_processed,
                 m.interval_index,
                 m.month,
                 m.column_basis,

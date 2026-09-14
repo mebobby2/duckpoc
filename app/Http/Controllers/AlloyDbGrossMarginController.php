@@ -63,6 +63,7 @@ class AlloyDbGrossMarginController extends Controller
         $plan = null;
         $diagnosticsAffordable = true;
         $lineBreakdown = [];
+        $linesProcessed = null;
         $sourceRows = [];
         $sourceRowsSkipped = false;
 
@@ -73,6 +74,12 @@ class AlloyDbGrossMarginController extends Controller
                 $startedAt = microtime(true);
                 $rows = $query->run($farm['farm_id'], $periodFrom, $periodTo, $horizon, $basis);
                 $elapsedMs = (microtime(true) - $startedAt) * 1000;
+
+                // Carried out of the report itself, so it is available at any
+                // volume — unlike the breakdown below, which is a second scan.
+                $linesProcessed = isset($rows[0]['lines_processed'])
+                    ? (int) $rows[0]['lines_processed']
+                    : null;
 
                 $diagnosticsAffordable = $elapsedMs < self::DIAGNOSTICS_BUDGET_MS
                     || $request->boolean('force_diagnostics');
@@ -137,6 +144,7 @@ class AlloyDbGrossMarginController extends Controller
             'diagnosticsAffordable' => $diagnosticsAffordable,
             'diagnosticsBudgetMs' => self::DIAGNOSTICS_BUDGET_MS,
             'plan' => $plan,
+            'linesProcessed' => $linesProcessed,
             'lineBreakdown' => $lineBreakdown,
             'sourceRows' => $sourceRows,
             'sourceRowsSkipped' => $sourceRowsSkipped,

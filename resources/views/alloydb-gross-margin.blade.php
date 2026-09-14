@@ -115,15 +115,18 @@
                 </p>
             </div>
             <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Transaction lines</p>
+                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Lines processed</p>
                 <p class="mt-1 text-2xl font-semibold tabular-nums">
-                    @if ($summaryMs !== null){{ number_format($sourceSummary['n']) }}@else&mdash;@endif
+                    @if ($linesProcessed !== null)
+                        {{ number_format($linesProcessed) }}
+                    @else
+                        &mdash;
+                    @endif
                 </p>
                 <p class="mt-1 text-xs text-slate-500">
+                    journal lines aggregated by the report
                     @if ($summaryMs !== null)
-                        {{ $sourceSummary['n_groups'] }} groups · {{ $sourceSummary['n_trackers'] }} trackers
-                    @else
-                        skipped &mdash; report over {{ number_format($diagnosticsBudgetMs, 0) }} ms
+                        · {{ $sourceSummary['n_groups'] }} groups · {{ $sourceSummary['n_trackers'] }} trackers
                     @endif
                 </p>
             </div>
@@ -225,22 +228,32 @@
             <summary class="cursor-pointer px-4 py-3 text-sm font-medium">
                 Transaction lines used
                 <span class="ml-2 font-normal text-slate-500">
+                    @if ($linesProcessed !== null)
+                        {{ number_format($linesProcessed) }} lines
+                    @endif
                     @if ($summaryMs !== null)
-                        {{ number_format($sourceSummary['n']) }} lines ·
-                        net {{ $money($sourceSummary['net_dollars']) }} ·
-                        counted in {{ number_format($summaryMs, 0) }} ms
+                        · net {{ $money($sourceSummary['net_dollars']) }}
+                        · breakdown in {{ number_format($summaryMs, 0) }} ms
                     @else
-                        skipped
+                        · breakdown skipped
                     @endif
                 </span>
             </summary>
             <div class="border-t border-slate-200 px-4 py-3">
                 @if ($summaryMs === null)
                     <p class="text-sm text-slate-600">
-                        Skipped: the report took over {{ number_format($diagnosticsBudgetMs, 0) }} ms, and
-                        counting the lines is a second pass over the same rows.
+                        @if ($linesProcessed !== null)
+                            The report aggregated
+                            <strong class="tabular-nums">{{ number_format($linesProcessed) }}</strong>
+                            journal lines &mdash; counted inside the report's own scan, so it is exact
+                            and costs nothing.
+                        @endif
+                    </p>
+                    <p class="mt-2 text-sm text-slate-600">
+                        The per-account breakdown below is skipped: it is a second pass over the same
+                        rows, and the report took over {{ number_format($diagnosticsBudgetMs, 0) }} ms.
                         <a href="{{ request()->fullUrlWithQuery(['force_diagnostics' => 1]) }}"
-                           class="text-blue-700 underline">Count them anyway</a>.
+                           class="text-blue-700 underline">Run it anyway</a>.
                     </p>
                 @else
                     <p class="mb-3 text-xs text-slate-600">
