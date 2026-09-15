@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Services\CashFlow\CashFlowSchema;
+use App\Services\CashFlow\GrossMarginV2NestedSeeder;
 use App\Services\CashFlow\GrossMarginV2Seeder;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -21,6 +22,7 @@ class DuckDbGmV2SeedCommand extends Command
         {--bulk : Seed the volume variant (gm-dairy-farm-1m) instead of the demo farm}
         {--huge : Seed the large variant (gm-dairy-farm-500m)}
         {--mega : Seed the billion-row variant (gm-dairy-farm-1b)}
+        {--nested : Write to the nested `transactions` table (one row per transaction with a lines list) instead of the flat one}
         {--raw : Seed the non-aggregated variant — 500M report lines PLUS the GST, payable and bank lines a real chart of accounts carries}
         {--rows=1000000 : Target REPORT journal lines when --bulk, --huge or --raw is used}';
 
@@ -72,7 +74,12 @@ class DuckDbGmV2SeedCommand extends Command
         $started = microtime(true);
 
         try {
-            (new GrossMarginV2Seeder($db, $alias, $appAlias, $farmId, $region, $rows, $raw))->seed();
+            if ($this->option('nested')) {
+                $schema->createTransactions();
+                (new GrossMarginV2NestedSeeder($db, $alias, $appAlias, $farmId, $region, $rows))->seed();
+            } else {
+                (new GrossMarginV2Seeder($db, $alias, $appAlias, $farmId, $region, $rows, $raw))->seed();
+            }
         } catch (Throwable $e) {
             $this->error('Seed failed: '.$e->getMessage());
 

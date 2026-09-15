@@ -80,11 +80,34 @@ final class AlloyDbSeeder
         ['stock-purchases', 'Stock Purchases', 'EXPENSE', 'tracker_direct_costs', 'livestock_costs', 'Livestock Costs', 5, 4, 'r2-heifers'],
     ];
 
+    /**
+     * The bookkeeping legs each report line drags along, and the accounts they
+     * post to. Mirrors `GrossMarginV2Seeder` exactly so the two engines are
+     * measured on the same shape.
+     *
+     * [suffix, line-id suffix, amount multiple, every nth line]
+     */
+    private const array NON_REPORT_LEGS = [
+        ['gst', '-gst', 0.15, 2],
+        ['accounts-payable', '-ap', -1.15, 1],
+        ['bank', '-bank', 1.15, 1],
+    ];
+
+    /** [suffix, name, class, category] — receivable substitutes for payable on revenue. */
+    private const array NON_REPORT_ACCOUNTS = [
+        ['gst', 'GST', 'LIABILITY', 'current_liability'],
+        ['accounts-payable', 'Accounts Payable', 'LIABILITY', 'current_liability'],
+        ['accounts-receivable', 'Accounts Receivable', 'ASSET', 'current_asset'],
+        ['bank', 'Farm Current Account', 'ASSET', 'current_asset'],
+    ];
+
     public function __construct(
         private readonly ConnectionInterface $db,
         private readonly string $farmId,
         private readonly string $region,
         private readonly int $bulkRows = 0,
+        /** Emit the GST/payable/bank lines a real chart of accounts carries. */
+        private readonly bool $withNonReportLines = false,
     ) {
     }
 
@@ -143,6 +166,22 @@ final class AlloyDbSeeder
                 'display_order' => $order,
             ]], ['tracker_id']);
             $count++;
+        }
+
+        if ($this->withNonReportLines) {
+            foreach (self::NON_REPORT_ACCOUNTS as [$suffix, $name, $class, $category]) {
+                $this->db->table('accounts')->upsert([[
+                    'account_id' => 'gm-'.$suffix,
+                    'account_name' => $name,
+                    'account_class' => $class,
+                    'account_category' => $category,
+                    'report_group' => null,
+                    'report_group_label' => null,
+                    'report_group_order' => 0,
+                    'line_order' => 0,
+                ]], ['account_id']);
+                $count++;
+            }
         }
 
         $count += $this->seedMilkProduction();
@@ -280,9 +319,10 @@ final class AlloyDbSeeder
     private function insertAccountLines(string $accountId, string $trackerId, string $class, int $perMonth): void
     {
         $fp = self::FIXED_POINT;
-        $sign = $class === 'REVENUE' ? '-' : '';
+        $signMult = $class === 'REVENUE' ? -1 : 1;
         $base = $class === 'REVENUE' ? 9_000 : 6_000;
         $horizon = self::HORIZON_DATE;
+        $legs = $this->legValues($accountId, $class);
 
         // One statement per year, so no single insert has to materialise the
         // whole span at bulk volumes.
@@ -292,8 +332,8 @@ final class AlloyDbSeeder
                     (farm_id, farm_type, region, line_id, account_id, type, basis, date, amount, tracker_id)
                 SELECT
                     ?, 'dairy', ?,
-                    ? || to_char(m.month_start, 'YYYYMM') || '-' || g.n::TEXT,
-                    ?,
+                    ? || to_char(m.month_start, 'YYYYMM') || '-' || g.n::TEXT || leg.id_suffix,
+                    leg.account_id,
                     CASE WHEN m.month_start <= DATE '{$horizon}' THEN 'actuals' ELSE 'forecast' END,
                     'cash',
                     -- Spread across the month so a line reads as an individual
@@ -302,20 +342,51 @@ final class AlloyDbSeeder
                     -- NUMERIC then ROUND, deliberately. Postgres `/` on two
                     -- integers is integer division and truncates, where DuckDB
                     -- divides truly and its CAST to BIGINT rounds. Left as
-                    -- integer arithmetic this lands one cent low on every line,
-                    -- which at 1,736 lines a month put the monthly total 0.17
-                    -- out — small enough to look like noise and large enough to
-                    -- make the two engines disagree.
-                    {$sign}ROUND(({$base} + (EXTRACT(MONTH FROM m.month_start)::INT * 400))::NUMERIC * {$fp} / {$perMonth})::BIGINT,
-                    ?
+                    -- integer arithmetic this lands one cent low on every line.
+                    -- The multiple is applied before the division so the report
+                    -- leg (1.0) stays bit-identical to a farm seeded without
+                    -- bookkeeping lines.
+                    ({$signMult} * ROUND(({$base} + (EXTRACT(MONTH FROM m.month_start)::INT * 400))::NUMERIC * {$fp} * leg.amount_multiple / {$perMonth}))::BIGINT,
+                    -- Only the report leg belongs to a tracker; Figured's
+                    -- payable and bank lines carry an empty tracking array.
+                    CASE WHEN leg.id_suffix = '' THEN ?::TEXT ELSE NULL END
                 FROM generate_series(
                     DATE '{$year}-01-01',
                     DATE '{$year}-12-01',
                     INTERVAL '1 month'
                 ) AS m(month_start)
                 CROSS JOIN generate_series(0, {$perMonth} - 1) AS g(n)
-                SQL, [$this->farmId, $this->region, $accountId.'-', $accountId, $trackerId]);
+                CROSS JOIN (VALUES {$legs}) AS leg(account_id, id_suffix, amount_multiple, every_nth)
+                WHERE g.n % leg.every_nth = 0
+                SQL, [$this->farmId, $this->region, $accountId.'-', $trackerId]);
         }
+    }
+
+    /**
+     * The legs each report line expands into, as a Postgres VALUES list.
+     *
+     * Without `withNonReportLines` this is a single identity leg, so the farms
+     * seeded before the bookkeeping lines existed keep exactly the shape and
+     * output they had.
+     */
+    private function legValues(string $accountId, string $class): string
+    {
+        if (!$this->withNonReportLines) {
+            return "('{$accountId}', '', 1.0, 1)";
+        }
+
+        $rows = ["('{$accountId}', '', 1.0, 1)"];
+
+        foreach (self::NON_REPORT_LEGS as [$suffix, $idSuffix, $multiple, $everyNth]) {
+            if ($suffix === 'accounts-payable' && $class === 'REVENUE') {
+                $suffix = 'accounts-receivable';
+                $idSuffix = '-ar';
+            }
+
+            $rows[] = sprintf("('gm-%s', '%s', %s, %d)", $suffix, $idSuffix, $multiple, $everyNth);
+        }
+
+        return implode(', ', $rows);
     }
 
     /**

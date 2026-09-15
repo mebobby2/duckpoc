@@ -1653,3 +1653,56 @@ Both framings agree, which the earlier comparison could not claim: it put
 chaff-free PoC data against Figured's chaff-laden data and reported ~90x. The
 honest figure is **~70x**, and it is now apples to apples whichever way the
 lines are counted.
+
+## Nested vs flat — what Figured's document shape costs a columnar engine
+
+Figured stores one document per TRANSACTION with a nested `lines[]` array: an
+invoice is one document carrying its expense line, its GST line and its payable
+line. Every table in this PoC stores one row per LINE. That difference was
+assumed immaterial and never tested — "there is no array to unwind, so the step
+is inapplicable rather than skipped".
+
+That assumption was worth checking, because the report's filtering column
+(`account_id`) lives INSIDE the nesting. Nothing can be skipped until the list
+is expanded, and `UNNEST` is the relational `$unwind`.
+
+`gm-dairy-farm-500M-non-aggregated` now exists in both layouts, holding
+**exactly the same 1,749,999,212 lines**:
+
+| layout | rows scanned | Parquet | fact aggregation |
+|---|---|---|---|
+| `transaction_lines` (flat) | 1,749,999,212 rows | 17,311 MB | **11,277 ms** |
+| `transactions` (nested) | 499,999,724 txns x 3.5 lines | **9,671 MB** | **22,495 ms** |
+
+Aggregates identical, 812 groups either way. Three cold runs each.
+
+### The trade
+
+**Nesting halves the storage and doubles the query.** 44% smaller on disk,
+1.99x slower to read.
+
+Both halves have the same cause. Packing 3.5 lines into one row amortises the
+per-row overhead — the transaction's farm, basis, date and type are stored once
+instead of 3.5 times, and Parquet's dictionary encoding does the rest. But the
+same packing puts `account_id` behind a list indirection, so the scan has to
+materialise 1.75B struct values out of 500M list values before it can decide
+what to discard.
+
+That is the same trade Mongo makes, which is why the earlier Mongo numbers
+looked the way they did: Figured's nested documents buy a density advantage of
+roughly 2.3x and give most of it back expanding lines the report throws away.
+
+### What it means for a migration
+
+**Normalise on the way in.** Nothing forces a lake to copy Mongo's shape —
+`lines[]` exists because Mongo is a document store, not because the data is
+naturally nested. Writing one row per journal line during migration is trivial
+and worth 2x on every report afterwards, at the price of 79% more Parquet.
+
+So the flat layout everywhere else in this PoC is not a benchmark convenience.
+It is the correct design choice, and this is the measurement that says so
+rather than assuming it.
+
+The nested table is kept because the question will be asked again, and because
+a lift-and-shift migration that preserved the document shape would land on the
+22,495 ms column rather than the 11,277 ms one.

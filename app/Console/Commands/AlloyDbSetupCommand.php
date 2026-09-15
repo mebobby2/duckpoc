@@ -17,6 +17,7 @@ class AlloyDbSetupCommand extends Command
         {--region=gm-waikato : Region recorded on the farm}
         {--rows=0 : Target journal lines (0 = demo scale, one line per account-month)}
         {--fresh : Recreate the schema, dropping whatever is there}
+        {--raw : Also emit the GST, payable and bank lines a real chart of accounts carries (~3.5x the rows)}
         {--columnar : Populate the in-memory columnar engine after loading}';
 
     protected $description = 'Load a farm into AlloyDB: schema, dimensions, journals, and optionally the columnar engine';
@@ -38,7 +39,11 @@ class AlloyDbSetupCommand extends Command
         $this->info(sprintf(
             'Loading %s%s — everything in Postgres, nothing read from MySQL',
             $farmId,
-            $rows > 0 ? sprintf(' — target %s journal lines', number_format($rows)) : ' — demo scale',
+            $rows > 0 ? sprintf(
+                ' — target %s report lines%s',
+                number_format($rows),
+                $this->option('raw') ? sprintf(' (~%s rows with bookkeeping legs)', number_format((int) ($rows * 3.5))) : '',
+            ) : ' — demo scale',
         ));
 
         $started = microtime(true);
@@ -57,7 +62,7 @@ class AlloyDbSetupCommand extends Command
         }
 
         try {
-            $result = (new AlloyDbSeeder($connection, $farmId, $region, $rows))->seed();
+            $result = (new AlloyDbSeeder($connection, $farmId, $region, $rows, (bool) $this->option('raw')))->seed();
         } catch (Throwable $e) {
             $this->error('Load failed: '.$e->getMessage());
 

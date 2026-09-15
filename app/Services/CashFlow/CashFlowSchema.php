@@ -187,6 +187,67 @@ final class CashFlowSchema
             SQL);
     }
 
+    /**
+     * The same facts as `transaction_lines`, shaped the way Figured stores them.
+     *
+     * Figured's Mongo collection holds one document per TRANSACTION with a
+     * nested `lines[]` array — an invoice is one document carrying its expense
+     * line, its GST line and its payable line together. Every other table in
+     * this PoC holds one row per LINE, which is the natural relational shape
+     * and the one a columnar engine wants.
+     *
+     * That difference was assumed to be immaterial and never tested. It is not
+     * obviously immaterial: on the Mongo side it decides how many documents
+     * have to be decoded, and the report's filtering column (`account_id`)
+     * lives INSIDE the nesting, so it cannot be used to skip anything until
+     * after the list is expanded. `UNNEST` is the relational `$unwind`, and
+     * this table exists so its cost can be measured rather than argued about.
+     *
+     * `basis`, `date` and `type` stay at transaction level because every leg of
+     * a generated transaction shares them — which is also true of a real
+     * invoice. `account_id`, `amount` and `tracker_id` vary per line and so
+     * live in the struct, exactly where they make the scan work harder.
+     */
+    public function createTransactions(): void
+    {
+        // Created once and left alone. Dropping here instead would take every
+        // other nested farm with it, and the partition key can only be set at
+        // creation — so a re-create is not a no-op even when the DDL matches.
+        foreach ($this->db->query(
+            "SELECT count(*) AS n FROM information_schema.tables
+             WHERE table_name = 'transactions' AND table_catalog = '{$this->alias}'"
+        )->rows(true) as $row) {
+            if ((int) (string) $row['n'] > 0) {
+                return;
+            }
+        }
+
+        $this->db->query(<<<SQL
+            CREATE TABLE {$this->alias}.transactions (
+                farm_id VARCHAR NOT NULL,
+                farm_type VARCHAR NOT NULL,
+                region VARCHAR NOT NULL,
+                transaction_id VARCHAR NOT NULL,
+                type VARCHAR NOT NULL,
+                basis VARCHAR NOT NULL,
+                date DATE NOT NULL,
+                lines STRUCT(
+                    line_id VARCHAR,
+                    account_id VARCHAR,
+                    amount BIGINT,
+                    tracker_id VARCHAR
+                )[] NOT NULL
+            )
+            SQL);
+
+        // Same partition key as the flat table, so a timing difference between
+        // the two is the nesting and not the pruning.
+        $this->db->query(<<<SQL
+            ALTER TABLE {$this->alias}.transactions
+            SET PARTITIONED BY (farm_id, basis, year(date))
+            SQL);
+    }
+
     private function createTransactionLines(): void
     {
         $this->db->query(<<<SQL

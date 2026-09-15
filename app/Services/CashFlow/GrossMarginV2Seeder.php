@@ -205,6 +205,38 @@ final class GrossMarginV2Seeder
         $this->seedJournals();
     }
 
+    /**
+     * The accounts that fan out, as [suffix, class, tracker suffix].
+     *
+     * Milk is excluded: a dairy farm gets one payout a month from its
+     * processor, so those two accounts stay one line per month derived from
+     * actual production rather than being inflated.
+     *
+     * @return list<array{0: string, 1: string, 2: string}>
+     */
+    public static function reportAccounts(): array
+    {
+        $out = [];
+
+        foreach (self::ACCOUNTS as [$suffix, , $class, , , , , , $trackerSuffix]) {
+            if ($suffix !== 'milk-current' && $suffix !== 'milk-deferred') {
+                $out[] = [$suffix, $class, $trackerSuffix];
+            }
+        }
+
+        return $out;
+    }
+
+    public static function payoutPerKgMs(): int
+    {
+        return self::PAYOUT_PER_KG_MS;
+    }
+
+    public static function yearCount(): int
+    {
+        return self::YEARS;
+    }
+
     public static function firstYear(): int
     {
         return self::FIRST_YEAR;
