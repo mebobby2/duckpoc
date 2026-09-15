@@ -43,6 +43,27 @@ final class GrossMarginV2Seeder
     public const string MEGA_FARM_ID = 'gm-dairy-farm-1b';
     public const string MEGA_REGION = 'gm-mega';
 
+    /**
+     * The same 500M report lines as HUGE, plus the bookkeeping lines a real
+     * chart of accounts carries — GST, the payable/receivable side, and the
+     * bank payment settling it.
+     *
+     * Exists because every other farm here is unrealistically pure: 100% of
+     * its lines are accounts the Gross Margin report actually sums. Measured on
+     * Figured's own seeded dairy farm, only ~28% are. The other ~72% are
+     * Accounts Payable, Farm Current Account and GST — lines the report reads
+     * and immediately discards.
+     *
+     * So the engines have been handed 3.5x more relevant data per row than the
+     * system they are being compared against. This farm removes that
+     * advantage. The report output is IDENTICAL to the 500M farm's, because
+     * the added accounts carry no `report_group` and `account_scope` excludes
+     * them — which is exactly what makes the comparison clean: same answer,
+     * same useful rows, 3.5x the rows scanned to reach it.
+     */
+    public const string RAW_FARM_ID = 'gm-dairy-farm-500M-non-aggregated';
+    public const string RAW_REGION = 'gm-raw';
+
     private const int FIXED_POINT = 10000;
 
     /**
@@ -108,6 +129,43 @@ final class GrossMarginV2Seeder
         ['stock-purchases', 'Stock Purchases', 'EXPENSE', 'tracker_direct_costs', 'livestock_costs', 'Livestock Costs', 5, 4, 'r2-heifers'],
     ];
 
+    /**
+     * The bookkeeping accounts, and the leg each one contributes per report line.
+     *
+     * [suffix, name, class, category, is_gst, is_bank, line-id suffix, amount multiple, every nth line]
+     *
+     * Multiples are relative to the report line's own amount, at a 15% GST
+     * rate. `every nth` is why GST appears on half the lines rather than all of
+     * them: on the measured Figured farm the ratios per report line are 0.48
+     * GST, 1.11 payable and 0.95 bank, and reproducing that mix is the whole
+     * point — a uniform three-legs-per-line would land at 25% report lines
+     * instead of the ~28% real data shows.
+     *
+     * These are NOT a balanced double entry. Nothing in this PoC reports a
+     * balance sheet, so the legs are shaped to reproduce the account
+     * DISTRIBUTION and the volume, not to sum to zero. Anything that starts
+     * caring about balance needs a real journal model, not this.
+     */
+    private const array NON_REPORT_LEGS = [
+        ['gst', '-gst', 0.15, 2],
+        ['accounts-payable', '-ap', -1.15, 1],
+        ['bank', '-bank', 1.15, 1],
+    ];
+
+    /**
+     * The accounts those legs post to. [suffix, name, class, category, is_gst, is_bank]
+     *
+     * Receivable is here but absent from the legs above: it substitutes for
+     * payable on revenue accounts, so it is posted to without being a leg of
+     * its own.
+     */
+    private const array NON_REPORT_ACCOUNTS = [
+        ['gst', 'GST', 'LIABILITY', 'current_liability', true, false],
+        ['accounts-payable', 'Accounts Payable', 'LIABILITY', 'current_liability', false, false],
+        ['accounts-receivable', 'Accounts Receivable', 'ASSET', 'current_asset', false, false],
+        ['bank', 'Farm Current Account', 'ASSET', 'current_asset', false, true],
+    ];
+
     public function __construct(
         private readonly DuckDB $db,
         private readonly string $alias,
@@ -130,6 +188,8 @@ final class GrossMarginV2Seeder
          * the report less realistic at the same time.
          */
         private readonly int $bulkRows = 0,
+        /** See RAW_FARM_ID — emits the bookkeeping lines alongside each report line. */
+        private readonly bool $withNonReportLines = false,
     ) {
     }
 
@@ -137,6 +197,7 @@ final class GrossMarginV2Seeder
     {
         $this->clearExisting();
         $this->seedAccounts();
+        $this->seedNonReportAccounts();
         $this->seedFarm();
         $this->seedTrackers();
         $this->seedMilkProduction();
@@ -199,6 +260,37 @@ final class GrossMarginV2Seeder
         }
 
         DB::table('accounts')->insert($rows);
+    }
+
+    /**
+     * Upserted rather than guarded like `seedAccounts()`, and always run.
+     *
+     * The accounts table is shared across every gm farm, so these rows may
+     * already exist from an earlier seed of a different farm. Adding them is
+     * harmless to the other farms: `report_group` is NULL, so `account_scope`
+     * skips them and no existing report can change. Only a farm seeded with
+     * `withNonReportLines` ever posts to them.
+     */
+    private function seedNonReportAccounts(): void
+    {
+        if (!$this->withNonReportLines) {
+            return;
+        }
+
+        foreach (self::NON_REPORT_ACCOUNTS as [$suffix, $name, $class, $category, $isGst, $isBank]) {
+            DB::table('accounts')->upsert([[
+                'account_id' => 'gm-'.$suffix,
+                'account_name' => $name,
+                'account_class' => $class,
+                'account_category' => $category,
+                'report_group' => null,
+                'report_group_label' => null,
+                'report_group_order' => 0,
+                'line_order' => 0,
+                'is_gst_account' => $isGst,
+                'is_default_bank_account' => $isBank,
+            ]], ['account_id']);
+        }
     }
 
     private function seedFarm(): void
@@ -369,9 +461,9 @@ final class GrossMarginV2Seeder
     private function insertAccountLines(string $accountId, string $trackerId, string $class): void
     {
         $fp = self::FIXED_POINT;
-        $sign = $class === 'REVENUE' ? '-' : '';
-        $base = $class === 'REVENUE' ? 9_000 : 6_000;
+        $signMult = $class === 'REVENUE' ? -1 : 1;
         $perMonth = $this->linesPerAccountMonth();
+        $legs = $this->legValues($accountId, $class);
 
         // One insert per year, so each writes into exactly one partition.
         for ($year = self::FIRST_YEAR; $year <= self::lastYear(); $year++) {
@@ -380,27 +472,79 @@ final class GrossMarginV2Seeder
                     (farm_id, farm_type, region, line_id, account_id, type, basis, date, amount, tracker_id)
                 SELECT
                     '{$this->farmId()}', '{$this->farmType()}', '{$this->region()}',
-                    '{$accountId}-' || strftime(m.month_start, '%Y%m') || '-' || g.n,
-                    '{$accountId}',
+                    '{$accountId}-' || strftime(m.month_start, '%Y%m') || '-' || g.n || leg.id_suffix,
+                    leg.account_id,
                     CASE WHEN m.month_start <= DATE '{$this->horizonDate()}' THEN 'actuals' ELSE 'forecast' END,
                     'cash',
                     -- Spread across the month so a line is a plausible
                     -- individual transaction rather than a monthly lump.
                     (m.month_start + INTERVAL (CAST(g.n % 28 AS INTEGER)) DAY)::DATE,
-                    {$sign}(CAST(({$base} + (month(m.month_start) * 400)) * {$fp} / {$perMonth} AS BIGINT)),
-                    '{$trackerId}'
+                    -- Division stays last so the report leg (multiple 1.0) is
+                    -- bit-identical to what the farms without bookkeeping lines
+                    -- hold. That identity is the correctness check: this farm's
+                    -- report must match the 500M farm's figure for figure.
+                    CAST({$signMult} * (({$fp} * ({$this->baseAmount($class)} + (month(m.month_start) * 400))) * leg.amount_multiple) / {$perMonth} AS BIGINT),
+                    -- Only the report leg belongs to a tracker. Figured's
+                    -- payable and bank lines carry an empty tracking array, and
+                    -- a tracker here would put bookkeeping into a tracker's
+                    -- per-unit margin.
+                    CASE WHEN leg.id_suffix = '' THEN '{$trackerId}' ELSE NULL END
                 FROM generate_series(
                     DATE '{$year}-01-01',
                     DATE '{$year}-12-01',
                     INTERVAL 1 MONTH
                 ) AS m(month_start)
                 CROSS JOIN range(0, {$perMonth}) AS g(n)
+                CROSS JOIN ({$legs}) AS leg(account_id, id_suffix, amount_multiple, every_nth)
+                WHERE g.n % leg.every_nth = 0
                 SQL);
         }
     }
 
+    private function baseAmount(string $class): int
+    {
+        return $class === 'REVENUE' ? 9_000 : 6_000;
+    }
+
+    /**
+     * The legs each report line expands into, as a SQL VALUES list.
+     *
+     * Without `withNonReportLines` this is a single identity leg, so the
+     * generated SQL keeps exactly the shape and output it had before the
+     * bookkeeping lines existed — the other four farms are untouched.
+     *
+     * Revenue posts its counterparty to receivables rather than payables,
+     * which costs nothing to get right and stops the data being obviously
+     * fictional to anyone who opens it.
+     */
+    private function legValues(string $accountId, string $class): string
+    {
+        if (!$this->withNonReportLines) {
+            return "VALUES ('{$accountId}', '', 1.0, 1)";
+        }
+
+        $rows = ["('{$accountId}', '', 1.0, 1)"];
+
+        foreach (self::NON_REPORT_LEGS as [$suffix, $idSuffix, $multiple, $everyNth]) {
+            if ($suffix === 'accounts-payable' && $class === 'REVENUE') {
+                $suffix = 'accounts-receivable';
+                $idSuffix = '-ar';
+            }
+
+            $rows[] = sprintf("('gm-%s', '%s', %s, %d)", $suffix, $idSuffix, $multiple, $everyNth);
+        }
+
+        return 'VALUES '.implode(', ', $rows);
+    }
+
     /**
      * How many lines each non-milk account gets per month.
+     *
+     * Counts REPORT lines only. With `withNonReportLines` the farm ends up
+     * with roughly 3.5x this many rows in total, because each report line
+     * drags its bookkeeping legs along. That is deliberate: asking for 500M
+     * means "the same report-relevant volume as the 500M farm", so the two are
+     * an A/B on chaff rather than on useful data.
      *
      * Derived from the requested total rather than configured directly, so a
      * caller asks for "a million rows" and does not have to work out the

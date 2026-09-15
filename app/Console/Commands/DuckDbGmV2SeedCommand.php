@@ -21,7 +21,8 @@ class DuckDbGmV2SeedCommand extends Command
         {--bulk : Seed the volume variant (gm-dairy-farm-1m) instead of the demo farm}
         {--huge : Seed the large variant (gm-dairy-farm-500m)}
         {--mega : Seed the billion-row variant (gm-dairy-farm-1b)}
-        {--rows=1000000 : Target journal lines when --bulk or --huge is used}';
+        {--raw : Seed the non-aggregated variant — 500M report lines PLUS the GST, payable and bank lines a real chart of accounts carries}
+        {--rows=1000000 : Target REPORT journal lines when --bulk, --huge or --raw is used}';
 
     protected $description = 'Seed a mixed milk + livestock dairy farm for the Gross Margin V2 report';
 
@@ -37,16 +38,19 @@ class DuckDbGmV2SeedCommand extends Command
 
         $mega = (bool) $this->option('mega');
         $huge = (bool) $this->option('huge');
-        $bulk = $mega || $huge || (bool) $this->option('bulk');
+        $raw = (bool) $this->option('raw');
+        $bulk = $mega || $huge || $raw || (bool) $this->option('bulk');
         $rows = $bulk ? max(1, (int) $this->option('rows')) : 0;
 
         $farmId = match (true) {
+            $raw => GrossMarginV2Seeder::RAW_FARM_ID,
             $mega => GrossMarginV2Seeder::MEGA_FARM_ID,
             $huge => GrossMarginV2Seeder::HUGE_FARM_ID,
             $bulk => GrossMarginV2Seeder::BULK_FARM_ID,
             default => GrossMarginV2Seeder::FARM_ID,
         };
         $region = match (true) {
+            $raw => GrossMarginV2Seeder::RAW_REGION,
             $mega => GrossMarginV2Seeder::MEGA_REGION,
             $huge => GrossMarginV2Seeder::HUGE_REGION,
             $bulk => GrossMarginV2Seeder::BULK_REGION,
@@ -58,13 +62,17 @@ class DuckDbGmV2SeedCommand extends Command
             $farmId,
             GrossMarginV2Seeder::firstYear(),
             GrossMarginV2Seeder::lastYear(),
-            $bulk ? sprintf(', target %s journal lines', number_format($rows)) : '',
+            $bulk ? sprintf(
+                ', target %s report lines%s',
+                number_format($rows),
+                $raw ? sprintf(' (~%s rows with bookkeeping legs)', number_format((int) ($rows * 3.5))) : '',
+            ) : '',
         ));
 
         $started = microtime(true);
 
         try {
-            (new GrossMarginV2Seeder($db, $alias, $appAlias, $farmId, $region, $rows))->seed();
+            (new GrossMarginV2Seeder($db, $alias, $appAlias, $farmId, $region, $rows, $raw))->seed();
         } catch (Throwable $e) {
             $this->error('Seed failed: '.$e->getMessage());
 

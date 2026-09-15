@@ -1577,3 +1577,79 @@ server-side generator, so every document is pushed from PHP — 190k docs/sec
 here. That is a property of the topology, not a handicap imposed on it, and it
 is the same reason a full reload of production data is a very different
 proposition on each of these stacks.
+
+## The non-aggregated farm — what the chaff actually costs
+
+Every other farm in this PoC is unrealistically pure: 100% of its journal lines
+are accounts the Gross Margin report sums. Measured on Figured's own seeded
+dairy farm, only **27.7%** are. The rest are Accounts Payable, Farm Current
+Account and GST — lines the report reads and immediately discards, because
+double-entry means one expense line drags a payable, a GST and a bank line
+along behind it.
+
+So the engines here had been handed 3.5x more relevant data per row than the
+system they were being compared against. `gm-dairy-farm-500M-non-aggregated`
+removes that advantage.
+
+### The farm
+
+```bash
+docker compose --profile minio exec app-minio \
+    php artisan duckdb:gm2:seed --raw --rows=500000000
+```
+
+`--rows` counts **report** lines, so this is the same report-relevant volume as
+`gm-dairy-farm-500m` with the bookkeeping lines added on top:
+
+| | rows | report lines | ratio |
+|---|---|---|---|
+| `gm-dairy-farm-500m` | 499,999,724 | 499,999,724 | 100% |
+| `gm-dairy-farm-500M-non-aggregated` | 1,749,999,212 | ~500M | **28.6%** |
+
+28.6% against Figured's measured 27.7%. Seeded in 790 s.
+
+### The result
+
+Same period, same horizon, three cold runs each:
+
+| farm | median | output |
+|---|---|---|
+| `gm-dairy-farm-500m` | 5,290 ms | 996 cells |
+| `gm-dairy-farm-500M-non-aggregated` | **9,846 ms** | 996 cells, **identical** |
+
+The reports match cell for cell, because the bookkeeping accounts carry no
+`report_group` and `account_scope` excludes them. Same answer, same useful
+rows, 3.5x the rows scanned to reach it — which is what makes this an A/B on
+chaff rather than on data.
+
+**Chaff costs 1.86x for 3.5x the rows.** Sub-linear, but not free, and not the
+"nearly free" this PoC predicted before measuring.
+
+### Why it is not free, and how it could be
+
+The scan still reads `account_id`, `date`, `basis`, `type` and `farm_id` for
+every one of the 1.75B rows in order to decide what to discard. Only `amount`
+is spared. Columnar storage means unread columns cost nothing — but the columns
+the predicate needs are not unread.
+
+Row-group skipping does not help either, because the chaff is **interleaved**
+with the report lines: the generator emits a report line and its legs together,
+so every row group holds a mix and none can be skipped wholesale. Sorting the
+partition by `account_id` would make row groups homogeneous and should collapse
+most of the 1.86x. That is untested, and belongs with the other unexplored
+ordering work noted under row group size.
+
+### What this changes
+
+The headline comparison, restated on consistent data. Figured V2's measured
+volumes are total lines including chaff, so the PoC's had to be too:
+
+| basis | Figured V2 | DuckDB + DuckLake | ratio |
+|---|---|---|---|
+| total lines scanned | 25.0M in 10,182 ms | 1.75B in 9,846 ms | **~70x** |
+| report-relevant lines | ~6.9M | ~500M | **~72x** |
+
+Both framings agree, which the earlier comparison could not claim: it put
+chaff-free PoC data against Figured's chaff-laden data and reported ~90x. The
+honest figure is **~70x**, and it is now apples to apples whichever way the
+lines are counted.
