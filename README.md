@@ -1781,3 +1781,89 @@ file, so the check that was run proved nothing, and request count rather than
 bytes is what drives lake cost. And clustered data appears to compress better
 (the table grew ~8.2 GB for 1.75B clustered rows against a ~5.3 bytes/row
 average before), which is an inference from a delta rather than a measurement.
+
+## Phase 3 — Overdraft interest
+
+Done, and it is the first report here that a window function cannot express.
+
+Every other report in this PoC is a projection or a prefix sum. Overdraft
+interest is a genuine **recurrence**: the cash balance it charges against
+excludes interest, so the running total of interest already accrued has to be
+subtracted to find the true overdrawn position.
+
+```
+P(n)   = closing(n) - cum(n-1)
+cum(n) = cum(n-1) + (P(n) < 0 ? -P(n) * rate : 0)
+```
+
+Month N's interest raises month N+1's charge base, and the `P(n) < 0` branch
+depends on `cum` itself — so `WITH RECURSIVE` is the only way to write it.
+Figured does the same thing imperatively, with `$interestRunningTotal` carried
+across a `foreach`.
+
+### Parity
+
+`php artisan duckdb:overdraft` seeds `overdraft-oracle-farm` and checks the
+result against Figured's own committed tests (`OverdraftTest`,
+`OverdraftInterestTest`). The scenario is theirs: one $1,000 expense, nothing
+afterwards, so the closing balance sits flat at -$1,000 for twelve months. Flat
+is the point — any growth in the charge can only be interest compounding on
+itself.
+
+At 5% annual the accrual matches **cell for cell**:
+
+```
+41666, 41840, 42014, 42189, 42365, 42541,
+42719, 42897, 43075, 43255, 43435, 43616
+```
+
+Summing to 511,612, which is the other half of Figured's pinned final balance
+of -10,511,612.
+
+`--all-terms` checks the distribution. Interest accrues every month whatever
+the term, so the posted amounts must always sum to the accrued amounts:
+
+| term | posts in months |
+|---|---|
+| monthly | 1–12 |
+| bi-monthly | 2,4,6,8,10,12 |
+| quarterly | 3,6,9,12 |
+| semi-annual | 6,12 |
+| annual | 12 |
+
+All conserved.
+
+### Three things worth recording
+
+**DOUBLE is enough.** Figured's arithmetic is bcmath at scale 14, truncating,
+and DuckDB's doubles diverge from it around the tenth significant digit
+(43616.67626065 against 43616.67626058). It does not matter: only the *posted*
+amount is truncated to an integer, and the divergence is far below one unit.
+No DECIMAL gymnastics were needed, which was not obvious going in.
+
+**The repayment calendar has an off-by-one that looks right.** Figured builds it
+as `(start_month + i - 1) mod 12` for i = step, 2*step, …, 12. Drop the `- 1`
+and a quarterly overdraft starting in April posts in July rather than June —
+still four evenly spaced months, still plausible, still wrong. The four cases
+pinned by `OverdraftRepaymentMonthTest` are the check.
+
+**Conservation caught a bug that per-month assertions would not.** The bucket
+index came from a window over *preceding* rows, which returns NULL rather than
+0 for the first month. Month one then partitioned on its own and its accrual
+never reached the posting month that should have carried it. Every month that
+did post still looked correct; only the total gave it away.
+
+### Known gaps
+
+- **GST.** The movement CTE treats GST as an ordinary account, where the Cash
+  Flow report inverts the whole GST section. The oracle carries no GST lines, so
+  this is untested either way.
+- **The split (horizon) interval.** Figured skips the interval whose type is
+  `actualsForecast` entirely. The PoC's month grid has no such interval, so
+  there is nothing to skip — but a period straddling the horizon on a monthly
+  grid needs checking against `testBiMonthlyOverdraftWithSplitHorizon`.
+- **Scenarios, multi-farm, reporting groups.** Out of scope here; the
+  `overdrafts` table deliberately omits `budget_id` and `budget_type`.
+- **The interest is not fed back into the Cash Flow report.** Figured emits
+  virtual journals that land on the closing balance, the P&L and the balance
+  sheet. This computes the number; wiring it back is the remaining work.
