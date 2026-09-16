@@ -192,6 +192,18 @@
                     <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300 font-medium">{{ $cell($sumInt) }}</td>
                 </tr>
 
+                <tr class="text-slate-600">
+                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">
+                        Accrued, not yet charged
+                        <span class="ml-1 text-xs text-slate-400">liability</span>
+                    </td>
+                    @foreach ($rows as $r)
+                        @php $v = (float) (string) $r['accrued_not_charged']; @endphp
+                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ abs($v) < 0.005 ? 'text-slate-300' : 'text-amber-700' }}">{{ $cell($v) }}</td>
+                    @endforeach
+                    <td class="border-l-2 border-slate-300"></td>
+                </tr>
+
                 <tr class="border-t-2 border-slate-300 bg-slate-50 font-semibold">
                     <td class="sticky left-0 bg-slate-50 px-3 py-1.5 whitespace-nowrap">Closing Balance</td>
                     @foreach ($rows as $r)
@@ -266,6 +278,13 @@
             <strong>Interest accrued</strong> happens every month; <strong>Interest &middot;
             Overdraft</strong> is what is actually posted, which depends on the repayment term.
             Change the term above and the accrued row stays identical while the posted row moves.
+            <br><br>
+            <span class="font-medium text-slate-900">If the balance looks frozen, check the term.</span>
+            On anything but monthly, no cash moves between repayment months, so the closing balance
+            is flat by design — it is a <em>cash</em> position and nothing has been paid. The debt is
+            still growing, and <strong>Accrued, not yet charged</strong> is where it shows: it climbs
+            every month and resets to zero when the bucket is charged. On an annual term that is
+            eleven flat months and one step, which is also exactly what Figured does.
         </div>
     @endif
 

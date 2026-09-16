@@ -333,6 +333,14 @@ final class OverdraftSqlBuilder
                 s.accrued_posted / {$fp}.0 AS interest_accrued,
                 CASE WHEN s.is_posting_month THEN s.bucket_total / {$fp}.0 END AS interest_posted,
                 (s.movement - s.posted_amount) / {$fp}.0 AS net_cash_movement_after_interest,
+                -- Interest the farmer has accrued but not yet been charged.
+                -- Without this the balance looks frozen between repayment
+                -- months on any non-monthly term: the debt is growing every
+                -- month and nothing on a cash view says so. Resets to zero at
+                -- each posting month, when the bucket is flushed to cash.
+                (SUM(s.accrued_posted) OVER (ORDER BY s.n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                 - SUM(s.posted_amount) OVER (ORDER BY s.n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))
+                    / {$fp}.0 AS accrued_not_charged,
                 (s.farm_opening
                     + SUM(s.movement - s.posted_amount) OVER (
                           ORDER BY s.n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))
