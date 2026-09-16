@@ -156,6 +156,25 @@
                 repayment-term distribution that must conserve the accrual
             </p>
         </a>
+
+        <a href="{{ route('alloydb-overdraft') }}"
+           class="block rounded-lg border border-slate-200 bg-white p-5 shadow-sm hover:border-slate-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Overdraft interest — AlloyDB</h2>
+                <span class="rounded bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800">
+                    parity with Figured
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                The same recursive CTE on PostgreSQL 17. <code class="rounded bg-slate-100 px-1">WITH
+                RECURSIVE</code>, <code class="rounded bg-slate-100 px-1">LATERAL</code> and window
+                frames ported unchanged &mdash; only date functions and parameter syntax differed.
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: the same recurrence on a second engine &middot; columnar coverage on a
+                report with no selective predicate to prune with
+            </p>
+        </a>
     </div>
 
     <section class="mt-10 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">

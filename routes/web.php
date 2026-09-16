@@ -3,6 +3,7 @@
 use App\Http\Controllers\CashFlowReportController;
 use App\Http\Controllers\GrossMarginReportController;
 use App\Http\Controllers\AlloyDbGrossMarginController;
+use App\Http\Controllers\AlloyDbOverdraftController;
 use App\Http\Controllers\GrossMarginV2ReportController;
 use App\Http\Controllers\MongoGrossMarginController;
 use App\Http\Controllers\OverdraftReportController;
@@ -18,3 +19,5 @@ Route::get('/alloydb/gross-margin', AlloyDbGrossMarginController::class)->name('
 Route::get('/mongo/gross-margin', MongoGrossMarginController::class)->name('mongo-gross-margin');
 Route::get('/overdraft', OverdraftReportController::class)->name('overdraft');
 Route::post('/overdraft/config', [OverdraftReportController::class, 'save'])->name('overdraft.save');
+Route::get('/alloydb/overdraft', AlloyDbOverdraftController::class)->name('alloydb-overdraft');
+Route::post('/alloydb/overdraft/config', [AlloyDbOverdraftController::class, 'save'])->name('alloydb-overdraft.save');

@@ -40,6 +40,7 @@ final class AlloyDbSchema
 
     public function create(): void
     {
+        $this->db->statement('DROP TABLE IF EXISTS overdrafts');
         $this->db->statement('DROP TABLE IF EXISTS transaction_lines');
         $this->db->statement('DROP TABLE IF EXISTS tracker_stock_movements');
         $this->db->statement('DROP TABLE IF EXISTS tracker_milk_production');
@@ -51,7 +52,12 @@ final class AlloyDbSchema
             CREATE TABLE farms (
                 farm_id   TEXT PRIMARY KEY,
                 farm_type TEXT NOT NULL,
-                region    TEXT NOT NULL
+                region    TEXT NOT NULL,
+                -- The bank position the cash flow's running balance starts
+                -- from. The lake's farms table has carried this since Phase 1;
+                -- AlloyDB did not need it until overdraft interest, which
+                -- charges against that balance.
+                opening_balance BIGINT NOT NULL DEFAULT 0
             )
             SQL);
 
@@ -67,6 +73,25 @@ final class AlloyDbSchema
                 line_order         SMALLINT NOT NULL DEFAULT 0
             )
             SQL);
+
+        // Overdraft configuration for Phase 3. Mirrors the lake's `overdrafts`
+        // table, minus the same four things: scenarios, the legacy
+        // `utilisation` column, the always-identical account id, and bitemporal
+        // versioning. `overdraft_limit` is stored but unused by the interest
+        // calculation — it drives the limit/headroom rows, which are a separate
+        // mechanism.
+        $this->db->statement(<<<'SQL'
+            CREATE TABLE overdrafts (
+                id           BIGSERIAL PRIMARY KEY,
+                farm_id      TEXT NOT NULL,
+                rate         INTEGER NOT NULL,
+                overdraft_limit BIGINT NOT NULL DEFAULT 0,
+                start_date   DATE NOT NULL,
+                payment_term TEXT NOT NULL DEFAULT 'interest_only_monthly'
+            )
+            SQL);
+
+        $this->db->statement('CREATE INDEX overdrafts_farm_start_idx ON overdrafts (farm_id, start_date)');
 
         $this->db->statement(<<<'SQL'
             CREATE TABLE trackers (

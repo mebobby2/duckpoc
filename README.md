@@ -1927,3 +1927,39 @@ practice-wide run would join the recursive term on `(farm_id, n)` so N
 independent recurrences advance together. That should be cheaper per farm than
 looping — 120 iterations of N rows rather than 120×N iterations — but nobody has
 measured it, and it is the shape Phase 5 needs.
+
+### Phase 3 on AlloyDB
+
+The same report ported to PostgreSQL 17, at the same parity, on
+`/alloydb/overdraft`. `php artisan alloydb:overdraft` checks it, and
+`--all-terms` checks the distribution.
+
+**The recursion ported unchanged.** `WITH RECURSIVE`, `LATERAL` and window
+frames are standard and needed no translation at all. What differed was
+cosmetic, and the same list the Gross Margin port produced:
+
+| DuckDB | PostgreSQL |
+|---|---|
+| `strftime(x, '%Y-%m')` | `to_char(x, 'YYYY-MM')` |
+| `month(x)` | `EXTRACT(MONTH FROM x)::INT` |
+| `INTERVAL 1 MONTH` | `INTERVAL '1 month'` |
+| `range(0, n)` | `generate_series` |
+| `DOUBLE` | `DOUBLE PRECISION` |
+| `$param` | `:param` |
+
+Two schema additions were needed: an `overdrafts` table, and an
+`opening_balance` column on `farms`. The lake has carried the latter since
+Phase 1; AlloyDB had no use for it until a report charged interest against the
+bank position.
+
+**One deliberate difference from the Gross Margin port.** That one moves the
+account filter out of the scan, because a semi-join there blocks columnar
+pushdown. This one has no account filter to move: overdraft reads the whole
+cash position, so there is nothing selective to push down and nothing for the
+columnar engine to prune — the same reason clustering by account was measured
+at 1.80x for Gross Margin and 1.02x here.
+
+`by_day` still groups on the raw `date` column and rolls up to months
+afterwards, because grouping on `date_trunc()` is a function call on the
+grouping key and moves the whole aggregate above the scan. That rule applies
+whatever the report.
