@@ -5,6 +5,7 @@ use App\Http\Controllers\GrossMarginReportController;
 use App\Http\Controllers\AlloyDbGrossMarginController;
 use App\Http\Controllers\GrossMarginV2ReportController;
 use App\Http\Controllers\MongoGrossMarginController;
+use App\Http\Controllers\OverdraftReportController;
 use App\Http\Controllers\TrackerCashFlowReportController;
 use Illuminate\Support\Facades\Route;
 
@@ -15,3 +16,5 @@ Route::get('/gross-margin', GrossMarginReportController::class)->name('gross-mar
 Route::get('/gross-margin-v2', GrossMarginV2ReportController::class)->name('gross-margin-v2');
 Route::get('/alloydb/gross-margin', AlloyDbGrossMarginController::class)->name('alloydb-gross-margin');
 Route::get('/mongo/gross-margin', MongoGrossMarginController::class)->name('mongo-gross-margin');
+Route::get('/overdraft', OverdraftReportController::class)->name('overdraft');
+Route::post('/overdraft/config', [OverdraftReportController::class, 'save'])->name('overdraft.save');

@@ -136,6 +136,26 @@
                 the roll-up, stock chain and per-unit margins rebuilt as PHP loops
             </p>
         </a>
+
+        <a href="{{ route('overdraft') }}"
+           class="block rounded-lg border border-slate-200 bg-white p-5 shadow-sm hover:border-slate-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Overdraft interest</h2>
+                <span class="rounded bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800">
+                    parity with Figured
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                Phase 3. The first report here a window function cannot express: interest is charged
+                on a balance that excludes interest, so month N's charge raises month N+1's base.
+                One statement, <code class="rounded bg-slate-100 px-1">WITH RECURSIVE</code>, no PHP
+                arithmetic &mdash; matching Figured's own test oracle cell for cell.
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: a genuine recurrence in SQL &middot; compounding on a flat balance &middot;
+                repayment-term distribution that must conserve the accrual
+            </p>
+        </a>
     </div>
 
     <section class="mt-10 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
@@ -145,10 +165,6 @@
                 <span class="font-medium text-slate-900">Livestock valuation</span> — stock is now
                 tracked in <em>head</em>; valuing it in dollars (national standard cost, market value)
                 is the remaining half.
-            </li>
-            <li>
-                <span class="font-medium text-slate-900">Overdraft interest</span> — a virtual
-                journal computed against the Cash Flow output.
             </li>
         </ul>
     </section>
