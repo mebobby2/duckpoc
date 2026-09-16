@@ -1867,3 +1867,63 @@ did post still looked correct; only the total gave it away.
 - **The interest is not fed back into the Cash Flow report.** Figured emits
   virtual journals that land on the closing balance, the P&L and the balance
   sheet. This computes the number; wiring it back is the remaining work.
+
+### Stress testing it — and a limit on the clustering win
+
+Two axes, and the interesting one turns out not to matter.
+
+**The recursion scales linearly and is negligible.** Widening the period on the
+oracle farm, which needs no extra data at all:
+
+| years | months | median |
+|---|---|---|
+| 1 | 12 | 23 ms |
+| 10 | 120 | 55 ms |
+| 30 | 360 | 121 ms |
+| 100 | 1,200 | 370 ms |
+| 250 | 3,000 | 1,023 ms |
+
+About **0.33 ms per month** on top of ~19 ms fixed. A recursive CTE is a
+sequential loop — it cannot parallelise the way every other report here does
+across row groups — so this was the cost worth being suspicious of. At any
+period a farmer would actually ask for it is irrelevant: a ten-year report
+spends 55 ms in the recursion.
+
+**Volume is the whole cost.** One overdraft config row and a negative opening
+balance turn any existing farm into an overdrawn one, so this needed no seeding
+either:
+
+| farm | lines scanned | median |
+|---|---|---|
+| oracle | 1 | 32 ms |
+| `gm-dairy-farm-1m` | 999,980 | 44 ms |
+| `gm-dairy-farm-500m` | 499,999,724 | 3,825 ms |
+| `…-non-aggregated-sorted` | 1,749,999,212 | 13,464 ms |
+
+At 48 months the recursion is ~16 ms of that 13,464 — **0.1%**. The report is an
+ordinary cash-flow scan with a small loop on the end.
+
+**Clustering by account does nothing for this report.** Same two farms, same
+1.75B rows, same period:
+
+| report | interleaved | clustered | |
+|---|---|---|---|
+| Gross Margin V2 | 7,390 ms | 4,101 ms | **1.80x** |
+| Overdraft interest | 12,795 ms | 12,604 ms | 1.02x — noise |
+
+Gross Margin filters to the 14 accounts carrying a `report_group`, so most row
+groups can be skipped on statistics. Overdraft needs the **whole cash
+position** — every account, including the payables, bank and GST lines Gross
+Margin discards — so there is no predicate to prune with and the scan reads
+everything.
+
+That is a real limit on the clustering result, and it generalises: a physical
+layout is tuned to one report's predicate, and a table has only one physical
+order. Clustering by something that helped overdraft would give back the Gross
+Margin win. Layout is a per-workload trade, not a table-wide improvement.
+
+**Still untested:** many farms in one statement. The SQL is single-farm; a
+practice-wide run would join the recursive term on `(farm_id, n)` so N
+independent recurrences advance together. That should be cheaper per farm than
+looping — 120 iterations of N rows rather than 120×N iterations — but nobody has
+measured it, and it is the shape Phase 5 needs.
