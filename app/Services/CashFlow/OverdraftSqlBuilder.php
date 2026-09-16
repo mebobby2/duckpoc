@@ -202,7 +202,8 @@ final class OverdraftSqlBuilder
                 SELECT
                     0 AS n,
                     CAST(0 AS DOUBLE) AS cum,
-                    CAST(0 AS DOUBLE) AS accrued
+                    CAST(0 AS DOUBLE) AS accrued,
+                    CAST(0 AS DOUBLE) AS principal
 
                 UNION ALL
 
@@ -219,7 +220,13 @@ final class OverdraftSqlBuilder
                         WHEN (g.closing - a.cum) < 0
                             THEN -(g.closing - a.cum) * g.monthly_rate
                         ELSE CAST(0 AS DOUBLE)
-                    END
+                    END,
+                    -- The sum the charge is actually computed on, carried out
+                    -- so the report can show it. The closing balance alone
+                    -- explains nothing: on a farm whose cash position never
+                    -- moves it stays flat while the charge climbs, and the
+                    -- link between the two is exactly this subtraction.
+                    g.closing - a.cum
                 FROM accrual a
                 JOIN configured g ON g.n = a.n + 1
             ),
@@ -232,6 +239,7 @@ final class OverdraftSqlBuilder
             posting AS (
                 SELECT
                     g.*,
+                    x.principal,
                     CAST(trunc(x.accrued) AS BIGINT) AS accrued_posted,
                     CASE g.payment_term
                         WHEN 'interest_only_bi_monthly'    THEN 2
@@ -298,6 +306,7 @@ final class OverdraftSqlBuilder
                 d.n AS interval_index,
                 d.month,
                 d.closing / {$fp}.0 AS closing_before_interest,
+                d.principal / {$fp}.0 AS principal,
                 d.accrued_posted / {$fp}.0 AS interest_accrued,
                 CASE WHEN d.is_posting_month THEN d.bucket_total / {$fp}.0 END AS interest_posted,
                 d.payment_term

@@ -143,7 +143,8 @@
                 <thead class="bg-slate-100 text-slate-600">
                 <tr>
                     <th class="px-3 py-2 text-left font-medium">Month</th>
-                    <th class="px-3 py-2 text-right font-medium">Closing balance<br><span class="text-xs font-normal">before interest</span></th>
+                    <th class="px-3 py-2 text-right font-medium">Closing balance<br><span class="text-xs font-normal">cash flow, no interest</span></th>
+                    <th class="px-3 py-2 text-right font-medium">Principal charged<br><span class="text-xs font-normal">closing &minus; interest to date</span></th>
                     <th class="px-3 py-2 text-right font-medium">Interest accrued</th>
                     <th class="px-3 py-2 text-right font-medium">Interest posted</th>
                     @if ($isOracleFarm)
@@ -156,6 +157,7 @@
                 @foreach ($rows as $i => $r)
                     @php
                         $closing = (float) (string) $r['closing_before_interest'];
+                        $principal = (float) (string) $r['principal'];
                         $accrued = (float) (string) $r['interest_accrued'];
                         $posted = $r['interest_posted'] === null ? null : (float) (string) $r['interest_posted'];
                         $expected = $oracle[$i] ?? null;
@@ -163,7 +165,8 @@
                     @endphp
                     <tr class="{{ $posted !== null ? 'bg-blue-50/40' : '' }}">
                         <td class="px-3 py-1.5 whitespace-nowrap">{{ $r['month'] }}</td>
-                        <td class="px-3 py-1.5 text-right tabular-nums {{ $closing < 0 ? 'text-red-700' : '' }}">{{ $money($closing) }}</td>
+                        <td class="px-3 py-1.5 text-right tabular-nums text-slate-500 {{ $closing < 0 ? 'text-red-700' : '' }}">{{ $money($closing) }}</td>
+                        <td class="px-3 py-1.5 text-right tabular-nums font-medium {{ $principal < 0 ? 'text-red-700' : '' }}">{{ $money($principal) }}</td>
                         <td class="px-3 py-1.5 text-right tabular-nums">{{ $money($accrued, 4) }}</td>
                         <td class="px-3 py-1.5 text-right tabular-nums font-medium">{{ $posted === null ? '—' : $money($posted, 4) }}</td>
                         @if ($isOracleFarm)
@@ -188,10 +191,20 @@
 
         <div class="mb-6 rounded-lg border border-slate-200 bg-white p-4 text-sm text-slate-600 shadow-sm">
             <span class="font-medium text-slate-900">What to look for:</span>
-            the closing balance is flat on the oracle farm — one expense, nothing afterwards — yet the
-            interest rises every month. Nothing else in the data is changing, so that growth is
-            interest compounding on itself. Shaded rows are posting months; change the term above and
-            the accrual stays identical while the posting months move, and the totals must still agree.
+            the two balance columns are the whole point. <strong>Closing balance</strong> comes from
+            the cash flow and is flat — one expense, nothing afterwards, so the farm's cash position
+            never moves. <strong>Principal charged</strong> is that balance minus every dollar of
+            interest accrued so far, and it climbs: 1,000.00 → 1,004.17 → 1,008.35. The interest is
+            charged on the second, not the first, which is why the charge grows when nothing in the
+            data does.
+            <br><br>
+            That subtraction is the recurrence. Each month's principal depends on the previous
+            month's interest, so no window function can produce this column — it is why the query
+            uses <code class="rounded bg-slate-100 px-1">WITH RECURSIVE</code>, and Figured does the
+            same thing with an accumulator carried across a loop.
+            <br><br>
+            Shaded rows are posting months. Change the term above and the accrual stays identical
+            while the posting months move; the totals must still agree.
         </div>
     @endif
 
