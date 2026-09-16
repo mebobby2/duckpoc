@@ -6,6 +6,10 @@ namespace App\Http\Controllers;
 
 use App\Services\CashFlow\OverdraftOracleSeeder;
 use App\Services\CashFlow\OverdraftQuery;
+use App\Services\CashFlow\ParquetFileLister;
+use App\Services\CashFlow\QueryProfiler;
+use App\Services\CashFlow\QueryTrace;
+use App\Services\CashFlow\StorageRequestProfile;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -25,6 +29,8 @@ class OverdraftReportController extends Controller
     private const string DEFAULT_PERIOD_FROM = '2024-01-01';
     private const string DEFAULT_PERIOD_TO = '2024-12-31';
     private const string DEFAULT_HORIZON = '2026-08-31';
+
+    private const int SOURCE_ROW_LIMIT = 500;
 
     /** @var list<string> */
     private const array TERMS = [
@@ -51,14 +57,61 @@ class OverdraftReportController extends Controller
         $rows = [];
         $error = null;
         $elapsedMs = null;
+        $files = [];
+        $storage = [];
+        $reportRequests = null;
+        $profile = null;
+        $trace = null;
+        $sourceRows = [];
+        $sourceSummary = [];
+        $sourceRowsMs = null;
 
         if ($farms === []) {
             $error = 'No farm has an overdraft configured. Run: php artisan duckdb:overdraft';
         } else {
             try {
+                $requests = new StorageRequestProfile($db);
+                $requests->startLogging();
+
+                // Armed before the query and read straight after. DuckDB's log
+                // is per-process, so this is the only window in which a browser
+                // request can capture its own trace.
+                $tracer = $request->boolean('trace') ? new QueryTrace($db) : null;
+                $tracer?->start();
+
                 $startedAt = microtime(true);
                 $rows = $query->run($farmId, $periodFrom, $periodTo, $horizon);
                 $elapsedMs = (microtime(true) - $startedAt) * 1000;
+
+                $reportRequests = $requests->connectionEvents();
+
+                // Collected before the diagnostic queries below add their own
+                // events to the same log.
+                $trace = $tracer?->collect();
+
+                $startedAt = microtime(true);
+                $sourceSummary = $query->sourceSummary($farmId, $periodFrom, $periodTo, $horizon);
+                $sourceRows = $query->sourceRows($farmId, $periodFrom, $periodTo, $horizon, self::SOURCE_ROW_LIMIT);
+                $sourceRowsMs = (microtime(true) - $startedAt) * 1000;
+
+                // Catalog metadata only, no data scan, so it stays on at any
+                // volume.
+                $files = (new ParquetFileLister($db, $alias))->forQuery(
+                    ['farm_id' => $farmId, 'farm_type' => 'dairy', 'region' => $this->regionFor($farms, $farmId)],
+                    $periodFrom,
+                    $periodTo,
+                );
+
+                $storage = $requests->summarise($files);
+
+                if ($request->boolean('explain')) {
+                    $profile = (new QueryProfiler($db))->profile($query->sql(), [
+                        'farm_id' => $farmId,
+                        'period_from' => $periodFrom,
+                        'period_to' => $periodTo,
+                        'horizon' => $horizon,
+                    ]);
+                }
             } catch (Throwable $e) {
                 $error = $e->getMessage();
             }
@@ -80,6 +133,15 @@ class OverdraftReportController extends Controller
             'config' => $this->overdraftConfig($farmId),
             'terms' => self::TERMS,
             'oracle' => OverdraftOracleSeeder::expectedMonthly(),
+            'files' => $files,
+            'storage' => $storage,
+            'reportRequests' => $reportRequests,
+            'profile' => $profile,
+            'trace' => $trace,
+            'sourceRows' => $sourceRows,
+            'sourceSummary' => $sourceSummary,
+            'sourceRowsMs' => $sourceRowsMs,
+            'sourceRowLimit' => self::SOURCE_ROW_LIMIT,
             'isOracleFarm' => $farmId === OverdraftOracleSeeder::FARM_ID
                 && $periodFrom === self::DEFAULT_PERIOD_FROM
                 && $periodTo === self::DEFAULT_PERIOD_TO,
@@ -111,6 +173,20 @@ class OverdraftReportController extends Controller
             ]);
 
         return redirect()->route('overdraft', $request->only(['farm_id', 'period_from', 'period_to', 'horizon']));
+    }
+
+    /**
+     * @param list<array<string, mixed>> $farms
+     */
+    private function regionFor(array $farms, string $farmId): string
+    {
+        foreach ($farms as $farm) {
+            if (($farm['farm_id'] ?? null) === $farmId) {
+                return (string) ($farm['region'] ?? '');
+            }
+        }
+
+        return '';
     }
 
     /**

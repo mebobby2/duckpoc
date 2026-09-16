@@ -46,6 +46,66 @@ final class OverdraftSqlBuilder
     ) {
     }
 
+    /**
+     * The journal lines behind the closing balance.
+     *
+     * Same scope predicate as the `movement` CTE, deliberately duplicated
+     * rather than shared: if the two ever drift, the listing stops explaining
+     * the number above it, and a silently wrong explanation is worse than none.
+     * The `cash_effect` column shows the negation the movement applies, because
+     * "why is this expense reducing the balance" is the first question anyone
+     * asks of this table.
+     */
+    public function buildSourceRowsSql(): string
+    {
+        $fp = self::FIXED_POINT;
+
+        return <<<SQL
+            SELECT
+                tl.line_id,
+                tl.date,
+                tl.type,
+                a.account_name,
+                a.account_class,
+                tl.amount / {$fp}.0 AS amount_dollars,
+                -tl.amount / {$fp}.0 AS cash_effect
+            FROM {$this->alias}.transaction_lines tl
+            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
+            WHERE tl.farm_id = \$farm_id
+              AND tl.basis = 'cash'
+              AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
+              AND (
+                    (tl.date <= CAST(\$horizon AS DATE) AND tl.type = 'actuals')
+                 OR (tl.date >  CAST(\$horizon AS DATE) AND tl.type = 'forecast')
+              )
+            ORDER BY tl.date
+            LIMIT \$row_limit
+            SQL;
+    }
+
+    public function buildSourceSummarySql(): string
+    {
+        $fp = self::FIXED_POINT;
+
+        return <<<SQL
+            SELECT
+                count(*) AS n,
+                count(DISTINCT tl.account_id) AS n_accounts,
+                min(tl.date) AS first_date,
+                max(tl.date) AS last_date,
+                SUM(-tl.amount) / {$fp}.0 AS net_cash
+            FROM {$this->alias}.transaction_lines tl
+            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
+            WHERE tl.farm_id = \$farm_id
+              AND tl.basis = 'cash'
+              AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
+              AND (
+                    (tl.date <= CAST(\$horizon AS DATE) AND tl.type = 'actuals')
+                 OR (tl.date >  CAST(\$horizon AS DATE) AND tl.type = 'forecast')
+              )
+            SQL;
+    }
+
     public function build(): string
     {
         $fp = self::FIXED_POINT;
