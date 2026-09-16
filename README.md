@@ -1706,3 +1706,78 @@ rather than assuming it.
 The nested table is kept because the question will be asked again, and because
 a lift-and-shift migration that preserved the document shape would land on the
 22,495 ms column rather than the 11,277 ms one.
+
+## Making the chaff free — clustering by account
+
+The non-aggregated farm showed bookkeeping lines costing 1.86x. That penalty
+turns out to be entirely avoidable, and the fix is in the data layout rather
+than the query.
+
+### Two levers, and neither works alone
+
+Measured on the fact aggregation over 1.75B rows:
+
+| | filter after scan | filter inside scan |
+|---|---|---|
+| **interleaved** | 7,792 ms | 6,460 ms |
+| **clustered by account** | 7,699 ms | **2,835 ms** |
+
+Clustering on its own is worth **nothing** — 7,699 against 7,792 is noise.
+Sorting gives Parquet's row-group statistics something meaningful to describe,
+but if the query never names `account_id` in the scan there is no predicate to
+test them against: the data is prunable and nothing prunes it.
+
+The filter on its own is worth 17%. It avoids hash-aggregating rows it will
+discard, but still has to READ every one, because an interleaved row group
+always contains some report accounts and can never be skipped.
+
+Together they are worth 2.28x. The filter asks the question; the clustering
+makes the answer "no" for most row groups, which are then never read.
+
+**The lake's report already had the filter** — `factScopePredicate()` has always
+carried `tl.account_id IN (SELECT account_id FROM account_scope)`. It is the
+AlloyDB builder that moves it out, because there a semi-join in the scan blocks
+columnar pushdown (40,687 ms against 2,740 ms). So the two builders diverge
+here on purpose, and the lake needed no query change at all.
+
+### The full report
+
+Same period and horizon, three cold runs, output identical in every case:
+
+| farm | rows held | report |
+|---|---|---|
+| `gm-dairy-farm-500m` (no chaff) | 500M | 4,106 ms |
+| `gm-dairy-farm-500M-non-aggregated` | 1.75B | 7,390 ms |
+| `gm-dairy-farm-500M-non-aggregated-sorted` | 1.75B | **4,101 ms** |
+
+**1.80x, and exact parity with the farm that has no bookkeeping lines at all.**
+1.25 billion rows are sitting in the data and costing nothing, because the scan
+never touches them.
+
+### How the clustering is produced
+
+Not with `ORDER BY`. Sorting the cross join has to order 36.5M rows per
+statement at this scale and was OOM-killed — silently, because the command was
+piped through `tail` and the pipeline returned tail's exit code. Only the 44
+milk rows landed and the seed reported success.
+
+Emitting each leg as its own INSERT gives the same physical clustering for
+free: every row a statement writes belongs to one account, so no sort is
+needed. Write cost is 834 s against 790 s, a 5.5% penalty on a one-time load.
+
+### What this means
+
+The chaff finding still stands — a farm with realistic bookkeeping lines holds
+3.5x the rows. What changed is that those rows no longer have to be read, so
+they stop being a tax on every report.
+
+It also sharpens the migration advice: **cluster the fact table by account on
+the way in.** Alongside normalising out Mongo's nesting, that is the second
+layout decision worth making deliberately rather than inheriting.
+
+Two things left open. Whether per-leg inserts fragment partitions into more
+files is unmeasured — `ducklake_table_info` reports one row per table, not per
+file, so the check that was run proved nothing, and request count rather than
+bytes is what drives lake cost. And clustered data appears to compress better
+(the table grew ~8.2 GB for 1.75B clustered rows against a ~5.3 bytes/row
+average before), which is an inference from a delta rather than a measurement.

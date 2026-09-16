@@ -64,6 +64,18 @@ final class GrossMarginV2Seeder
     public const string RAW_FARM_ID = 'gm-dairy-farm-500M-non-aggregated';
     public const string RAW_REGION = 'gm-raw';
 
+    /**
+     * The same farm again, with each insert ordered by account.
+     *
+     * Unsorted, the generator emits a report line immediately followed by its
+     * GST, payable and bank legs, so every Parquet row group holds a mix of all
+     * 18 accounts and the min/max statistics can skip none of them — the scan
+     * reads 1.75B rows to keep 500M. Ordering by account clusters each one into
+     * its own run of row groups, which is what makes statistics able to prune.
+     */
+    public const string RAW_SORTED_FARM_ID = 'gm-dairy-farm-500M-non-aggregated-sorted';
+    public const string RAW_SORTED_REGION = 'gm-rawsorted';
+
     private const int FIXED_POINT = 10000;
 
     /**
@@ -190,6 +202,8 @@ final class GrossMarginV2Seeder
         private readonly int $bulkRows = 0,
         /** See RAW_FARM_ID — emits the bookkeeping lines alongside each report line. */
         private readonly bool $withNonReportLines = false,
+        /** See RAW_SORTED_FARM_ID — clusters each account so row groups can be pruned. */
+        private readonly bool $sortByAccount = false,
     ) {
     }
 
@@ -495,10 +509,18 @@ final class GrossMarginV2Seeder
         $fp = self::FIXED_POINT;
         $signMult = $class === 'REVENUE' ? -1 : 1;
         $perMonth = $this->linesPerAccountMonth();
-        $legs = $this->legValues($accountId, $class);
+        // Clustering by account is done by WRITING each leg separately, not by
+        // sorting. An ORDER BY over the cross join has to sort 36.5M rows per
+        // statement at 500M scale and was killed for memory; emitting one leg
+        // at a time produces the same physical clustering for free, because
+        // every row a statement writes belongs to one account.
+        $legGroups = $this->sortByAccount
+            ? array_map(fn (string $leg): string => $leg, $this->legList($accountId, $class))
+            : [implode(', ', $this->legList($accountId, $class))];
 
         // One insert per year, so each writes into exactly one partition.
         for ($year = self::FIRST_YEAR; $year <= self::lastYear(); $year++) {
+            foreach ($legGroups as $legs) {
             $this->db->query(<<<SQL
                 INSERT INTO {$this->alias}.transaction_lines
                     (farm_id, farm_type, region, line_id, account_id, type, basis, date, amount, tracker_id)
@@ -527,9 +549,10 @@ final class GrossMarginV2Seeder
                     INTERVAL 1 MONTH
                 ) AS m(month_start)
                 CROSS JOIN range(0, {$perMonth}) AS g(n)
-                CROSS JOIN ({$legs}) AS leg(account_id, id_suffix, amount_multiple, every_nth)
+                CROSS JOIN (VALUES {$legs}) AS leg(account_id, id_suffix, amount_multiple, every_nth)
                 WHERE g.n % leg.every_nth = 0
                 SQL);
+            }
         }
     }
 
@@ -549,10 +572,13 @@ final class GrossMarginV2Seeder
      * which costs nothing to get right and stops the data being obviously
      * fictional to anyone who opens it.
      */
-    private function legValues(string $accountId, string $class): string
+    /**
+     * @return list<string> One VALUES row per leg.
+     */
+    private function legList(string $accountId, string $class): array
     {
         if (!$this->withNonReportLines) {
-            return "VALUES ('{$accountId}', '', 1.0, 1)";
+            return ["('{$accountId}', '', 1.0, 1)"];
         }
 
         $rows = ["('{$accountId}', '', 1.0, 1)"];
@@ -566,7 +592,7 @@ final class GrossMarginV2Seeder
             $rows[] = sprintf("('gm-%s', '%s', %s, %d)", $suffix, $idSuffix, $multiple, $everyNth);
         }
 
-        return 'VALUES '.implode(', ', $rows);
+        return $rows;
     }
 
     /**
