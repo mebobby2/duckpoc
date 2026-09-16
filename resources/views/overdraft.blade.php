@@ -138,73 +138,134 @@
     @endif
 
     @if (!empty($rows))
-        <div class="mb-8 overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
+        @php
+            // Rows are line items and columns are months, the way the Planning
+            // Grid shows it. The report is read across a month, not down one.
+            $cell = static function (?float $v, bool $blankZero = false) use ($money): string {
+                if ($v === null || ($blankZero && abs($v) < 0.005)) { return '—'; }
+                return $money($v);
+            };
+        @endphp
+
+        <div class="mb-4 overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
             <table class="min-w-full text-sm">
-                <thead class="bg-slate-100 text-slate-600">
-                <tr>
-                    <th class="px-3 py-2 text-left font-medium">Month</th>
-                    <th class="px-3 py-2 text-right font-medium">Closing balance<br><span class="text-xs font-normal">cash flow, no interest</span></th>
-                    <th class="px-3 py-2 text-right font-medium">Principal charged<br><span class="text-xs font-normal">closing &minus; interest to date</span></th>
-                    <th class="px-3 py-2 text-right font-medium">Interest accrued</th>
-                    <th class="px-3 py-2 text-right font-medium">Interest posted</th>
-                    @if ($isOracleFarm)
-                        <th class="px-3 py-2 text-right font-medium">Figured<br><span class="text-xs font-normal">accrual oracle</span></th>
-                        <th class="px-3 py-2 text-center font-medium">Parity</th>
-                    @endif
+                <thead>
+                <tr class="bg-slate-100">
+                    <th class="sticky left-0 z-10 bg-slate-100 px-3 py-2 text-left font-medium text-slate-600">Row</th>
+                    @foreach ($rows as $r)
+                        <th class="px-3 py-2 text-right font-medium text-slate-700 whitespace-nowrap">{{ $r['month'] }}</th>
+                    @endforeach
+                    <th class="px-3 py-2 text-right font-medium text-slate-700 border-l-2 border-slate-300">Total</th>
                 </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-100">
-                @foreach ($rows as $i => $r)
-                    @php
-                        $closing = (float) (string) $r['closing_before_interest'];
-                        $principal = (float) (string) $r['principal'];
-                        $accrued = (float) (string) $r['interest_accrued'];
-                        $posted = $r['interest_posted'] === null ? null : (float) (string) $r['interest_posted'];
-                        $expected = $oracle[$i] ?? null;
-                        $matches = $expected !== null && (int) round($accrued * 10000) === $expected;
-                    @endphp
-                    <tr class="{{ $posted !== null ? 'bg-blue-50/40' : '' }}">
-                        <td class="px-3 py-1.5 whitespace-nowrap">{{ $r['month'] }}</td>
-                        <td class="px-3 py-1.5 text-right tabular-nums text-slate-500 {{ $closing < 0 ? 'text-red-700' : '' }}">{{ $money($closing) }}</td>
-                        <td class="px-3 py-1.5 text-right tabular-nums font-medium {{ $principal < 0 ? 'text-red-700' : '' }}">{{ $money($principal) }}</td>
-                        <td class="px-3 py-1.5 text-right tabular-nums">{{ $money($accrued, 4) }}</td>
-                        <td class="px-3 py-1.5 text-right tabular-nums font-medium">{{ $posted === null ? '—' : $money($posted, 4) }}</td>
-                        @if ($isOracleFarm)
-                            <td class="px-3 py-1.5 text-right tabular-nums text-slate-500">
-                                {{ $expected === null ? '—' : number_format($expected / 10000, 4) }}
+
+                <tr>
+                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Opening Balance</td>
+                    @foreach ($rows as $r)
+                        @php $v = (float) (string) $r['opening_balance']; @endphp
+                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ $v < 0 ? 'text-red-700' : '' }}">{{ $cell($v) }}</td>
+                    @endforeach
+                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300 text-slate-400">—</td>
+                </tr>
+
+                <tr>
+                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Net Cash Movement</td>
+                    @php $sumMove = 0.0; @endphp
+                    @foreach ($rows as $r)
+                        @php $v = (float) (string) $r['net_cash_movement']; $sumMove += $v; @endphp
+                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ $v < 0 ? 'text-red-700' : '' }}">{{ $cell($v, true) }}</td>
+                    @endforeach
+                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300 {{ $sumMove < 0 ? 'text-red-700' : '' }}">{{ $cell($sumMove) }}</td>
+                </tr>
+
+                <tr class="bg-amber-50/60">
+                    <td class="sticky left-0 bg-amber-50/60 px-3 py-1.5 whitespace-nowrap font-medium">Interest &middot; Overdraft</td>
+                    @php $sumInt = 0.0; @endphp
+                    @foreach ($rows as $r)
+                        @php
+                            $v = $r['interest_posted'] === null ? null : (float) (string) $r['interest_posted'];
+                            $sumInt += $v ?? 0.0;
+                        @endphp
+                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap font-medium">{{ $cell($v) }}</td>
+                    @endforeach
+                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300 font-medium">{{ $cell($sumInt) }}</td>
+                </tr>
+
+                <tr class="border-t-2 border-slate-300 bg-slate-50 font-semibold">
+                    <td class="sticky left-0 bg-slate-50 px-3 py-1.5 whitespace-nowrap">Closing Balance</td>
+                    @foreach ($rows as $r)
+                        @php $v = (float) (string) $r['closing_balance']; @endphp
+                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ $v < 0 ? 'text-red-700' : '' }}">{{ $cell($v) }}</td>
+                    @endforeach
+                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300"></td>
+                </tr>
+
+                <tr><td colspan="{{ count($rows) + 2 }}" class="bg-slate-100 px-3 py-1 text-xs font-medium uppercase tracking-wide text-slate-500">How the charge is derived</td></tr>
+
+                <tr class="text-slate-600">
+                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Closing before interest</td>
+                    @foreach ($rows as $r)
+                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap">{{ $cell((float) (string) $r['closing_before_interest']) }}</td>
+                    @endforeach
+                    <td class="border-l-2 border-slate-300"></td>
+                </tr>
+
+                <tr class="text-slate-600">
+                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Principal charged</td>
+                    @foreach ($rows as $r)
+                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap">{{ $cell((float) (string) $r['principal']) }}</td>
+                    @endforeach
+                    <td class="border-l-2 border-slate-300"></td>
+                </tr>
+
+                <tr class="text-slate-600">
+                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Interest accrued</td>
+                    @php $sumAcc = 0.0; @endphp
+                    @foreach ($rows as $r)
+                        @php $v = (float) (string) $r['interest_accrued']; $sumAcc += $v; @endphp
+                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap">{{ $cell($v, true) }}</td>
+                    @endforeach
+                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300">{{ $cell($sumAcc) }}</td>
+                </tr>
+
+                @if ($isOracleFarm)
+                    <tr class="text-slate-500">
+                        <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Figured oracle</td>
+                        @foreach ($rows as $i => $r)
+                            @php
+                                $exp = $oracle[$i] ?? null;
+                                $ok = $exp !== null && (int) round(((float) (string) $r['interest_accrued']) * 10000) === $exp;
+                            @endphp
+                            <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ $exp === null ? '' : ($ok ? 'text-emerald-700' : 'bg-red-100 text-red-800') }}">
+                                {{ $exp === null ? '—' : number_format($exp / 10000, 4) }}
                             </td>
-                            <td class="px-3 py-1.5 text-center">
-                                @if ($expected === null)
-                                    <span class="text-slate-400">—</span>
-                                @elseif ($matches)
-                                    <span class="rounded bg-emerald-100 px-1.5 py-0.5 text-xs text-emerald-800">match</span>
-                                @else
-                                    <span class="rounded bg-red-100 px-1.5 py-0.5 text-xs text-red-800">differs</span>
-                                @endif
-                            </td>
-                        @endif
+                        @endforeach
+                        <td class="border-l-2 border-slate-300"></td>
                     </tr>
-                @endforeach
+                @endif
+
                 </tbody>
             </table>
         </div>
 
         <div class="mb-6 rounded-lg border border-slate-200 bg-white p-4 text-sm text-slate-600 shadow-sm">
-            <span class="font-medium text-slate-900">What to look for:</span>
-            the two balance columns are the whole point. <strong>Closing balance</strong> comes from
-            the cash flow and is flat — one expense, nothing afterwards, so the farm's cash position
-            never moves. <strong>Principal charged</strong> is that balance minus every dollar of
-            interest accrued so far, and it climbs: 1,000.00 → 1,004.17 → 1,008.35. The interest is
-            charged on the second, not the first, which is why the charge grows when nothing in the
-            data does.
+            <span class="font-medium text-slate-900">Reading it:</span>
+            <strong>Closing Balance</strong> includes the interest, and each month's
+            <strong>Opening Balance</strong> is the previous month's closing — so the charge feeds
+            back into the position it was computed from, which is what Figured's virtual journals do.
             <br><br>
-            That subtraction is the recurrence. Each month's principal depends on the previous
-            month's interest, so no window function can produce this column — it is why the query
-            uses <code class="rounded bg-slate-100 px-1">WITH RECURSIVE</code>, and Figured does the
-            same thing with an accumulator carried across a loop.
+            The three rows under <em>How the charge is derived</em> are the working.
+            <strong>Closing before interest</strong> is the raw cash position and on the oracle farm
+            it never moves. <strong>Principal charged</strong> is that figure minus every dollar of
+            interest accrued so far, and it climbs. The interest is charged on the second, which is
+            why the charge grows when nothing in the data does — and why the query needs
+            <code class="rounded bg-slate-100 px-1">WITH RECURSIVE</code> rather than a window
+            function.
             <br><br>
-            Shaded rows are posting months. Change the term above and the accrual stays identical
-            while the posting months move; the totals must still agree.
+            <strong>Interest accrued</strong> happens every month; <strong>Interest &middot;
+            Overdraft</strong> is what is actually posted, which depends on the repayment term.
+            Change the term above and the accrued row stays identical while the posted row moves.
         </div>
     @endif
 

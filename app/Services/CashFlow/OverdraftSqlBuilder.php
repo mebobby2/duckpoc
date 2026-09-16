@@ -165,6 +165,8 @@ final class OverdraftSqlBuilder
                     m.month_start,
                     m.month,
                     m.month_of_year,
+                    f.opening_balance AS farm_opening,
+                    COALESCE(v.net, 0) AS movement,
                     f.opening_balance
                         + COALESCE(SUM(COALESCE(v.net, 0)) OVER (ORDER BY m.n
                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 0) AS closing
@@ -300,18 +302,44 @@ final class OverdraftSqlBuilder
                         ), 0) AS bucket
                     FROM bucketed b
                 ) b
+            ),
+
+            -- The interest charged back onto the balance, which is what
+            -- Figured's virtual journals do: the posted amount is a cash
+            -- outflow, so it moves the closing balance and therefore the next
+            -- month's opening. Only POSTED amounts land — accrued-but-unposted
+            -- interest is a liability the farmer has not paid yet.
+            --
+            -- A plain window suffices here even though the accrual needed
+            -- recursion: once `posted` exists per month it is a prefix sum, and
+            -- nothing downstream feeds back into it.
+            settled AS (
+                SELECT
+                    d.*,
+                    CASE WHEN d.is_posting_month THEN d.bucket_total ELSE 0 END AS posted_amount
+                FROM distributed d
             )
 
             SELECT
-                d.n AS interval_index,
-                d.month,
-                d.closing / {$fp}.0 AS closing_before_interest,
-                d.principal / {$fp}.0 AS principal,
-                d.accrued_posted / {$fp}.0 AS interest_accrued,
-                CASE WHEN d.is_posting_month THEN d.bucket_total / {$fp}.0 END AS interest_posted,
-                d.payment_term
-            FROM distributed d
-            ORDER BY d.n
+                s.n AS interval_index,
+                s.month,
+                s.farm_opening
+                    + COALESCE(SUM(s.movement - s.posted_amount) OVER (
+                          ORDER BY s.n ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0)
+                    / {$fp}.0 AS opening_balance,
+                s.movement / {$fp}.0 AS net_cash_movement,
+                s.closing / {$fp}.0 AS closing_before_interest,
+                s.principal / {$fp}.0 AS principal,
+                s.accrued_posted / {$fp}.0 AS interest_accrued,
+                CASE WHEN s.is_posting_month THEN s.bucket_total / {$fp}.0 END AS interest_posted,
+                (s.movement - s.posted_amount) / {$fp}.0 AS net_cash_movement_after_interest,
+                (s.farm_opening
+                    + SUM(s.movement - s.posted_amount) OVER (
+                          ORDER BY s.n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))
+                    / {$fp}.0 AS closing_balance,
+                s.payment_term
+            FROM settled s
+            ORDER BY s.n
             SQL;
     }
 }

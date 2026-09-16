@@ -130,7 +130,7 @@ class OverdraftReportController extends Controller
             'elapsedMs' => $elapsedMs,
             'serverMs' => $serverMs,
             'sql' => $error === null ? $query->sql() : null,
-            'config' => $this->overdraftConfig($farmId),
+            'config' => $config = $this->overdraftConfig($farmId),
             'terms' => self::TERMS,
             'oracle' => OverdraftOracleSeeder::expectedMonthly(),
             'files' => $files,
@@ -142,9 +142,15 @@ class OverdraftReportController extends Controller
             'sourceSummary' => $sourceSummary,
             'sourceRowsMs' => $sourceRowsMs,
             'sourceRowLimit' => self::SOURCE_ROW_LIMIT,
+            // The oracle series is pinned to 5% monthly over 2024. Showing it
+            // beside any other configuration would mark correct numbers as
+            // failures the moment someone changes the rate to see what happens
+            // — which is the first thing anyone does on this page.
             'isOracleFarm' => $farmId === OverdraftOracleSeeder::FARM_ID
                 && $periodFrom === self::DEFAULT_PERIOD_FROM
-                && $periodTo === self::DEFAULT_PERIOD_TO,
+                && $periodTo === self::DEFAULT_PERIOD_TO
+                && ($config['rate'] ?? null) === OverdraftOracleSeeder::ORACLE_RATE
+                && ($config['payment_term'] ?? null) === 'interest_only_monthly',
         ]);
     }
 

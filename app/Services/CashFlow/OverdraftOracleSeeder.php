@@ -39,7 +39,7 @@ final class OverdraftOracleSeeder
     private const int EXPENSE = 1_000 * 10000;
 
     /** Annual percentage x 10,000, as Figured stores it: 5% is 50000. */
-    private const int RATE = 50000;
+    public const int ORACLE_RATE = 50000;
 
     public function __construct(
         private readonly DuckDB $db,
@@ -83,7 +83,7 @@ final class OverdraftOracleSeeder
 
         DB::table('overdrafts')->insert([
             'farm_id' => self::FARM_ID,
-            'rate' => self::RATE,
+            'rate' => self::ORACLE_RATE,
             'overdraft_limit' => 0,
             'start_date' => '2024-01-01',
             'payment_term' => $paymentTerm,
