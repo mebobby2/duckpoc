@@ -1963,3 +1963,75 @@ at 1.80x for Gross Margin and 1.02x here.
 afterwards, because grouping on `date_trunc()` is a function call on the
 grouping key and moves the whole aggregate above the scan. That rule applies
 whatever the report.
+
+## Concurrency — the axis every other number here omits
+
+Every other measurement in this README is one query on an idle machine. That is
+the case that flatters a columnar engine most: DuckDB takes all sixteen cores
+for a single scan, so a lone query looks superb and says nothing about what ten
+simultaneous users would get.
+
+`php artisan bench:concurrency --engine= --report= --concurrency= --runs=`
+spawns N worker processes and reports latency percentiles and throughput.
+
+**It measures queries, not HTTP.** `artisan serve` wraps `php -S`, which is
+single-process unless `PHP_CLI_SERVER_WORKERS` is set — it is not. Firing
+concurrent requests at the report pages would queue them at the dev server and
+measure that queue. Production runs PHP-FPM with a worker pool, so separate OS
+processes are the faithful model.
+
+**Workers are processes, not threads**, and not only because ext-pcntl is
+absent. One process sharing a DuckDB handle across "concurrent" queries would
+measure a mutex. Separate processes also model the real asymmetry: **DuckDB is
+embedded, so N concurrent reports mean N instances each wanting every core**,
+while AlloyDB and MongoDB are shared servers scheduling N queries in one
+process. That difference is invisible at concurrency 1.
+
+### The lake cannot currently be tested this way
+
+At `--concurrency=2` the second worker dies:
+
+```
+Failed to attach DuckLake MetaData "__ducklake_metadata_lake" …
+Could not set lock on file "…/catalog.s3.sqlite"
+```
+
+**With the default file catalog, exactly one DuckDB process can attach the
+lake.** The catalog-backend section above already recorded this lock as
+blocking compaction while the web container runs; it is broader than that — it
+blocks a second READER process outright.
+
+Two things stop that being damning. It is a local configuration choice, and
+DuckLake's own recommendation for single-writer PoCs; Postgres and MySQL
+catalogs are both wired up. And production would run the catalog in MySQL,
+which is a server and has no file lock.
+
+But it is not a quick switch: the catalog is the only record of what lives in
+the bucket, so re-pointing it orphans every Parquet file until they are
+re-registered, and the Postgres/MySQL `ATTACH` strings here have never been
+executed against a real server.
+
+### AlloyDB, gross margin, `gm-dairy-farm-1m`
+
+| concurrency | throughput | p50 | p95 |
+|---|---|---|---|
+| 1 | 1.13 req/s | 465 ms | 592 ms |
+| 2 | 2.86 req/s | 545 ms | 559 ms |
+| 4 | 5.44 req/s | 551 ms | 591 ms |
+| 8 | 8.60 req/s | 708 ms | 756 ms |
+| 16 | 11.06 req/s | 1,087 ms | 1,164 ms |
+
+**9.8x the throughput for 16x the concurrency, and latency degrades only
+2.3x.** A shared server scheduling work properly.
+
+Two caveats before quoting these:
+
+- **The column store was empty for this run.** It was deregistered during the
+  chaff experiment to break a DDL lock and never repopulated, so these are
+  row-store scans — which is why 1M lines reads 465 ms here against the 62 ms
+  recorded earlier. The SCALING is still valid, because the confound is
+  identical at every concurrency level, but the absolute latencies are not
+  comparable to anything else in this README.
+- **Throughput is understated at low concurrency.** Wall clock includes each
+  worker's bootstrap and one untimed warm-up query, amortised over only five
+  timed runs. The latency percentiles exclude both and are clean.
