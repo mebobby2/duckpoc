@@ -54,6 +54,8 @@ final class CashFlowActualsForecastSqlBuilderTest extends TestCase
         self::assertStringContainsString('SUM(tl.amount)', $scan);
         self::assertStringContainsString('CAST($period_from AS DATE)', $scan);
         self::assertStringNotContainsString('period p', $scan);
+        self::assertStringContainsString("tl.type = CASE WHEN tl.date <= CAST(\$horizon AS DATE) THEN 'actuals' ELSE 'forecast' END", $scan);
+        self::assertStringNotContainsString("AND tl.type = 'actuals')", $scan);
     }
 
     public function testEveryFiguredStageIsACte(): void

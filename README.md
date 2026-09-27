@@ -1371,6 +1371,28 @@ Every report is **byte-identical** before and after, all 52 tracker blocks
 included, and the oracle still passes its 687 cells. The earlier timings in
 this README predate the change.
 
+### The horizon as one comparison: 3.3 s to 2.3 s at 1B lines
+
+On `cfaf-dairy-farm-1b` (1,000,004,976 lines, 52 trackers) the whole-farm
+request took 3.29 s. Timing the scan's filters one at a time put the cost on
+the horizon split, `(date <= horizon AND type = 'actuals') OR (date > horizon
+AND type = 'forecast')`: grouping every line took 1.2 s, and that one filter
+added 1.1 s. Written as `type = CASE WHEN date <= horizon THEN 'actuals' ELSE
+'forecast' END` it selects the same lines in one comparison.
+
+| request | before | after (3 cold runs) |
+|---|---|---|
+| 1B farm, whole range | 3.29 s | 2.28 / 2.26 / 2.25 s |
+| 1B farm, FY2027 | — | 0.90 / 0.90 / 0.91 s |
+| 500M farm, whole range | 1.92 s | 1.33 s |
+
+Output is byte-identical and the oracle passes. What is left is the floor for
+this data layout: in the profile, the table scan and the grouping are the
+whole statement, CPU-bound on all 16 threads. Going further means changing
+what is stored rather than the query — a pre-summed rollup maintained on
+write, integer account and tracker keys, or files sorted so the string
+columns compress into runs.
+
 On the page the statement is ~1.75 s but the page is ~6.5 s: the four
 diagnostic queries it runs afterwards (virtual-journal and source-line
 listings, and the in-scope count) still read the raw lines, and the source
