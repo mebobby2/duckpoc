@@ -52,10 +52,15 @@ final class PipelineScaleSeeder
         return $n >= 1_000_000 ? ($n / 1_000_000).'m' : ($n >= 1_000 ? ($n / 1_000).'k' : (string) $n);
     }
 
-    /** @return int rows written */
-    public function seed(int $targetLines): int
+    /**
+     * @param int $extraAccounts additional expense accounts to spread the
+     *                           bulk lines across — the report's width, which
+     *                           every cells-stage pipe scales with
+     * @return int rows written
+     */
+    public function seed(int $targetLines, int $extraAccounts = 0): int
     {
-        $farmId = self::farmId($targetLines);
+        $farmId = self::farmId($targetLines).($extraAccounts > 0 ? '-'.$extraAccounts.'acc' : '');
         $months = (self::LAST_YEAR - self::FIRST_YEAR + 1) * 12;
         $perMonth = max(6, intdiv($targetLines, $months));
 
@@ -78,6 +83,28 @@ final class PipelineScaleSeeder
             'farm_id' => $farmId, 'rate' => 50000, 'overdraft_limit' => 100_000 * self::FIXED_POINT,
             'start_date' => self::PERIOD_FROM, 'payment_term' => 'interest_only_monthly',
         ]);
+
+        $w = PipelineOracleSeeder::WAGES;
+        $extraIds = [];
+        for ($k = 1; $k <= $extraAccounts; $k++) {
+            $extraIds[] = sprintf('ps-exp-%03d', $k);
+        }
+        if ($extraIds !== []) {
+            DB::table('accounts')->whereIn('account_id', $extraIds)->delete();
+            DB::table('accounts')->insert(array_map(static fn (string $id): array => [
+                'account_id' => $id, 'account_name' => 'Expense '.$id, 'account_class' => 'EXPENSE',
+                'account_category' => 'operating_expenses', 'account_type' => null, 'system_account' => null,
+                'mapped_to_account_id' => null, 'inverted_for_user' => false, 'report_group' => null,
+                'report_group_label' => null, 'report_group_order' => 0, 'line_order' => 0,
+                'is_gst_account' => false, 'is_default_bank_account' => false,
+            ], $extraIds));
+        }
+        // Bulk lines whose slot is an expense get an extra account by hash
+        // when there are extras, so width grows without changing the totals'
+        // shape.
+        $extraCase = $extraIds === []
+            ? "'{$w}'"
+            : "CASE WHEN CAST(hash('acc' || strftime(ms, '%Y%m') || i) % ".(count($extraIds) + 1)." AS INTEGER) = 0 THEN '{$w}' ELSE 'ps-exp-' || lpad(CAST(1 + CAST(hash('acc' || strftime(ms, '%Y%m') || i) % ".count($extraIds)." AS INTEGER) AS VARCHAR), 3, '0') END";
 
         $f = str_replace("'", "''", $farmId);
         $horizon = self::HORIZON;
@@ -107,7 +134,7 @@ final class PipelineScaleSeeder
                 'ps-' || strftime(ms, '%Y%m') || '-' || i,
                 CASE (i % 10)
                     WHEN 0 THEN '{$s}' WHEN 1 THEN '{$s}' WHEN 2 THEN '{$s}' WHEN 3 THEN '{$s}'
-                    WHEN 4 THEN '{$w}' WHEN 5 THEN '{$w}' WHEN 6 THEN '{$fe}' WHEN 7 THEN '{$fi}'
+                    WHEN 4 THEN {$extraCase} WHEN 5 THEN {$extraCase} WHEN 6 THEN '{$fe}' WHEN 7 THEN '{$fi}'
                     WHEN 8 THEN '{$d}' ELSE '{$lo}' END,
                 CASE WHEN ms <= DATE '{$horizon}' THEN 'actuals' ELSE 'forecast' END,
                 'cash',

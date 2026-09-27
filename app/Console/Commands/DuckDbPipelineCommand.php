@@ -45,6 +45,7 @@ class DuckDbPipelineCommand extends Command
         {--all : Turn on every logic pipe that has a gate}
         {--seed : Seed the pipeline oracle farm first}
         {--scale= : Seed pipeline-scale-<N> with about N lines and run against it}
+        {--accounts=0 : With --scale, spread expense lines across this many extra accounts}
         {--show= : Print this stage as a table (e.g. p24_format)}';
 
     protected $description = "Run Figured's DataPipeline as one statement and check every stage against the PHP transliteration";
@@ -67,8 +68,9 @@ class DuckDbPipelineCommand extends Command
             $target = (int) $this->option('scale');
             (new CashFlowSchema($db, $alias, $appAlias))->addTagColumn();
             $t = hrtime(true);
-            $n = (new PipelineScaleSeeder($db, $alias))->seed($target);
-            $farmId = PipelineScaleSeeder::farmId($target);
+            $extra = (int) $this->option('accounts');
+            $n = (new PipelineScaleSeeder($db, $alias))->seed($target, $extra);
+            $farmId = PipelineScaleSeeder::farmId($target).($extra > 0 ? '-'.$extra.'acc' : '');
             $this->line(sprintf('  seeded %s with %s lines in %.1f s', $farmId, number_format($n), (hrtime(true) - $t) / 1e9));
             $this->line('');
         }

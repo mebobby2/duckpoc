@@ -2451,6 +2451,75 @@ Every predicate the pipes apply falls on a month boundary in this PoC, so the
 bucket carries what a line would and pipe 7's `SUM` is the only thing that has
 happened to it; the transliteration stays a transliteration.
 
+#### Stress test 2 of 3 — concurrency, and the catalog it took to run it
+
+The lake profile could not be swept at all with its file catalog: the second
+worker fails to `ATTACH` with `Could not set lock on file catalog.s3.sqlite`,
+the finding the harness first made. So this is the first live run of the
+**Postgres DuckLake catalog** — `DUCKLAKE_CATALOG_DRIVER=postgres`, pointed at
+a `ducklake_catalog` database on the AlloyDB instance, env-overridden per
+invocation. It works: schema, a 1M-line seed in 1.4 s, 24/24 stages. It also
+costs — p24 is 120 ms on it against 79 ms on the file catalog, the catalog
+round-trips per statement.
+
+`bench:concurrency --engine=lake --report=pipeline` (every gate on) on the 1M
+farm, 25 runs per worker. A first pass at 5 runs per worker under-measured by
+half — it was mostly per-process warm-up and stragglers — and is not shown:
+
+| conc | throughput | p50 | p95 | max |
+|---|---|---|---|---|
+| 1 | 7.8 req/s | 106 ms | 113 ms | 113 ms |
+| 2 | 12.1 | 139 | 149 | 158 |
+| 4 | 16.1 | 200 | 218 | 234 |
+| 8 | **17.2** | 371 | 469 | 529 |
+| 16 | 16.4 | 716 | 1,176 | 1,843 |
+
+- **The pipeline saturates at ~17 req/s by eight workers** and is flat from
+  there; past that, latency grows with queue depth — p95 1.2 s at sixteen.
+- **It is not the CPU.** The container has 16 cores; `docker stats` during a
+  four-worker sweep showed `app-minio` at ~230% — two and a bit cores — and
+  MinIO at 3%. What each request waits on is the Postgres catalog: every
+  DuckLake scan opens a snapshot with several sequential round-trips, the
+  pipeline does three scans per statement where the Phase 3 statement does
+  one, and the round-trips are latency, not work. Three scans' worth of
+  catalog latency per request is the ceiling.
+- **The catalog host was busy.** The catalog lives on the AlloyDB instance,
+  which was repopulating its column store in the background at ~300% CPU for
+  the whole sweep (`g_columnar_columns` at 120 MB of 500 per column, climbing).
+  These numbers were taken under that load and are therefore pessimistic by an
+  unmeasured margin; a settled re-run is noted below if it moved them.
+- The per-process bootstrap — attach the Postgres catalog, attach MySQL — is
+  outside the timing, as for every engine here; PHP-FPM pays it once per
+  worker.
+
+What would move the line: derive the three nested reports from one scan
+instead of three (the volume finding above), and put the catalog on a
+Postgres that is not also doing something else. Neither is done.
+
+#### Stress test 3 of 3 — shape
+
+Volume was never the production risk; shape is. Three shapes, in order of
+how much they exercise:
+
+**84 months instead of 12** — `--from=2018-07-01 --to=2025-06-30` on the 1M
+farm, every gate on: **24/24**, p24 171 ms against 79 for twelve months —
+2.2× the time for 7× the period. The recursion is 84 deep and the YTD
+windows 84 wide and it is sub-linear, because the cells table is still
+accounts × months and the scans are the same scans.
+
+**214 accounts instead of 14** — `--scale=1000000 --accounts=200`, which
+spreads the expense lines across two hundred extra Xero accounts: **24/24**,
+p24 121 ms against 79 — 1.5× the time for 15× the width. The cells-stage
+pipes are the ones that grow (p16 YTD 119 ms, p15 RE 105), as they should:
+they are windows over accounts × months. The PHP transliteration, which loops
+over cells, went from 33 ms to 395.
+
+**Multi-entity** — the reporting-group "pickle": pipes 3, 11 and 20 are
+pass-throughs, and this is the shape most likely to break the "composes as
+SQL" claim, because a parent farm's report is the sum of its children's and
+each child's offsets are a nested `AccountBalances` run against *another*
+farm. Not a stress test; a build. It is the next tranche.
+
 ## Concurrency — the axis every other number here omits
 
 Every other measurement in this README is one query on an idle machine. That is

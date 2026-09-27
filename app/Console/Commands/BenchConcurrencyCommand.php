@@ -7,10 +7,13 @@ namespace App\Console\Commands;
 use App\Services\AlloyDb\GrossMarginV2PgQuery;
 use App\Services\AlloyDb\OverdraftPgQuery;
 use App\Services\CashFlow\GrossMarginV2Query;
+use App\Services\CashFlow\DataPipelineSqlBuilder;
 use App\Services\CashFlow\OverdraftQuery;
+use App\Services\CashFlow\PipelineOptions;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Saturio\DuckDB\DuckDB;
+use Saturio\DuckDB\Type\Type;
 use Throwable;
 
 /**
@@ -43,7 +46,7 @@ class BenchConcurrencyCommand extends Command
 {
     protected $signature = 'bench:concurrency
         {--engine=lake : lake | alloydb}
-        {--report=overdraft : overdraft | gross-margin}
+        {--report=overdraft : overdraft | gross-margin | pipeline}
         {--farm= : Farm to report on; defaults per engine}
         {--concurrency=1 : Worker processes running at once}
         {--runs=5 : Timed iterations per worker}
@@ -217,6 +220,24 @@ class BenchConcurrencyCommand extends Command
             $query = new GrossMarginV2Query($duck, $alias);
 
             return static fn () => $query->run($farm, 'dairy', 'gm-bulk', $from, $to, $horizon, 'cash');
+        }
+
+        if ($report === 'pipeline') {
+            // The whole DataPipeline with every gate on — the report the
+            // overdraft page renders — as one prepared statement per run.
+            $sql = (new DataPipelineSqlBuilder($alias, $appAlias, new PipelineOptions(
+                ytd: true, excludeEoyJournals: true, includeOpeningBudgetGst: true,
+                calculateCurrentYearEarnings: true, calculateRetained: true,
+                showExpectedSign: true, dynamicBankAccount: true,
+            )))->build();
+
+            return static function () use ($duck, $sql, $farm, $from, $to, $horizon): void {
+                $statement = $duck->preparedStatement($sql);
+                foreach (['farm_id' => $farm, 'period_from' => $from, 'period_to' => $to, 'horizon' => $horizon] as $p => $v) {
+                    $statement->bindParam($p, $v, Type::DUCKDB_TYPE_VARCHAR);
+                }
+                iterator_to_array($statement->execute()->rows(true));
+            };
         }
 
         $query = new OverdraftQuery($duck, $alias, $appAlias);
