@@ -2462,32 +2462,30 @@ invocation. It works: schema, a 1M-line seed in 1.4 s, 24/24 stages. It also
 costs — p24 is 120 ms on it against 79 ms on the file catalog, the catalog
 round-trips per statement.
 
-`bench:concurrency --engine=lake --report=pipeline` (every gate on) on the 1M
-farm, 25 runs per worker. A first pass at 5 runs per worker under-measured by
-half — it was mostly per-process warm-up and stragglers — and is not shown:
+`bench:concurrency --engine=lake --report=pipeline` (every gate on) against
+the Phase 3 one-pipe statement, same 1M farm, same Postgres catalog, 25 runs
+per worker, taken **after** the catalog host had settled (AlloyDB at ~1% CPU
+throughout — the first pass was taken while it repopulated its column store
+at ~300% and ran a third slower; a 5-run pass before that under-measured by
+half again. Neither is shown):
 
-| conc | throughput | p50 | p95 | max |
-|---|---|---|---|---|
-| 1 | 7.8 req/s | 106 ms | 113 ms | 113 ms |
-| 2 | 12.1 | 139 | 149 | 158 |
-| 4 | 16.1 | 200 | 218 | 234 |
-| 8 | **17.2** | 371 | 469 | 529 |
-| 16 | 16.4 | 716 | 1,176 | 1,843 |
+| conc | pipeline thru | p50 | p95 | · | one-pipe thru | p50 | p95 |
+|---|---|---|---|---|---|---|---|
+| 1 | 8.7 req/s | 90 ms | 95 ms | | 22.0 req/s | 24 ms | 28 ms |
+| 4 | 18.7 | 167 | 182 | | 53.4 | 39 | 45 |
+| 8 | **22.8** | 295 | 351 | | 77.6 | 52 | 70 |
+| 16 | 20.5 | 631 | 927 | | **82.0** | 99 | 197 |
 
-- **The pipeline saturates at ~17 req/s by eight workers** and is flat from
-  there; past that, latency grows with queue depth — p95 1.2 s at sixteen.
-- **It is not the CPU.** The container has 16 cores; `docker stats` during a
-  four-worker sweep showed `app-minio` at ~230% — two and a bit cores — and
-  MinIO at 3%. What each request waits on is the Postgres catalog: every
-  DuckLake scan opens a snapshot with several sequential round-trips, the
-  pipeline does three scans per statement where the Phase 3 statement does
-  one, and the round-trips are latency, not work. Three scans' worth of
-  catalog latency per request is the ceiling.
-- **The catalog host was busy.** The catalog lives on the AlloyDB instance,
-  which was repopulating its column store in the background at ~300% CPU for
-  the whole sweep (`g_columnar_columns` at 120 MB of 500 per column, climbing).
-  These numbers were taken under that load and are therefore pessimistic by an
-  unmeasured margin; a settled re-run is noted below if it moved them.
+- **The pipeline saturates at ~23 req/s by eight workers**; past that,
+  latency grows with queue depth — p95 0.9 s at sixteen. The one-pipe
+  statement is still climbing at sixteen, at ~82.
+- **The ratio is ~3.6× on throughput and ~3.7× on single-request latency**,
+  and it is not the CPU: sixteen cores, `app-minio` at ~230% during a
+  four-worker sweep, MinIO at 3%. Each DuckLake scan opens a snapshot with
+  several sequential round-trips to the Postgres catalog; the pipeline does
+  three scans per statement — the outer scan and the two nested sub-reports
+  — where the one-pipe statement does one. Three scans' worth of catalog
+  latency per request is the ceiling, and the ratio says so.
 - The per-process bootstrap — attach the Postgres catalog, attach MySQL — is
   outside the timing, as for every engine here; PHP-FPM pays it once per
   worker.
