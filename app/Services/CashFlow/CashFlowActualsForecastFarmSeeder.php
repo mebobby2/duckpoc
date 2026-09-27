@@ -120,6 +120,7 @@ final class CashFlowActualsForecastFarmSeeder
         private readonly string $appAlias,
         private readonly int $milkTrackerCount = 13,
         private readonly int $stockTrackerCount = 2,
+        private readonly string $farmId = self::FARM_ID,
     ) {
     }
 
@@ -143,7 +144,7 @@ final class CashFlowActualsForecastFarmSeeder
         $this->seedOneOffs();
 
         $n = 0;
-        foreach ($this->db->query("SELECT count(*) AS n FROM {$this->alias}.transaction_lines WHERE farm_id = '".self::FARM_ID."'")->rows(true) as $r) {
+        foreach ($this->db->query("SELECT count(*) AS n FROM {$this->alias}.transaction_lines WHERE farm_id = '".$this->farmId."'")->rows(true) as $r) {
             $n = (int) (string) $r['n'];
         }
 
@@ -152,24 +153,24 @@ final class CashFlowActualsForecastFarmSeeder
 
     private function clear(): void
     {
-        $this->db->query("DELETE FROM {$this->alias}.transaction_lines WHERE farm_id = '".self::FARM_ID."'");
+        $this->db->query("DELETE FROM {$this->alias}.transaction_lines WHERE farm_id = '".$this->farmId."'");
 
-        $trackerIds = DB::table('trackers')->where('farm_id', self::FARM_ID)->pluck('tracker_id')->all();
+        $trackerIds = DB::table('trackers')->where('farm_id', $this->farmId)->pluck('tracker_id')->all();
         DB::table('milk_payout_rates')->whereIn('tracker_id', $trackerIds)->delete();
         DB::table('tracker_milk_production')->whereIn('tracker_id', $trackerIds)->delete();
-        DB::table('trackers')->where('farm_id', self::FARM_ID)->delete();
+        DB::table('trackers')->where('farm_id', $this->farmId)->delete();
 
         foreach (['overdrafts', 'gst_settings'] as $table) {
-            DB::table($table)->where('farm_id', self::FARM_ID)->delete();
+            DB::table($table)->where('farm_id', $this->farmId)->delete();
         }
-        DB::table('accounts')->where('farm_id', self::FARM_ID)->delete();
-        DB::table('farms')->where('farm_id', self::FARM_ID)->delete();
+        DB::table('accounts')->where('farm_id', $this->farmId)->delete();
+        DB::table('farms')->where('farm_id', $this->farmId)->delete();
     }
 
     private function seedFarm(): void
     {
         DB::table('farms')->insert([
-            'farm_id' => self::FARM_ID,
+            'farm_id' => $this->farmId,
             'farm_type' => 'dairy',
             'region' => self::REGION,
             'opening_balance' => 0,
@@ -178,13 +179,13 @@ final class CashFlowActualsForecastFarmSeeder
         ]);
 
         DB::table('gst_settings')->insert([
-            'farm_id' => self::FARM_ID,
+            'farm_id' => $this->farmId,
             'sales_tax_period' => 'TWOMONTHS',
             'sales_tax_basis' => 'PAYMENTS',
         ]);
 
         DB::table('overdrafts')->insert([
-            'farm_id' => self::FARM_ID,
+            'farm_id' => $this->farmId,
             'rate' => 85000,
             'overdraft_limit' => 1_500_000 * self::FIXED_POINT,
             'start_date' => self::FIRST_MONTH,
@@ -195,9 +196,9 @@ final class CashFlowActualsForecastFarmSeeder
     private function seedAccounts(): void
     {
         DB::table('accounts')->insert(array_map(
-            static fn (array $a): array => [
-                'account_id' => $a[0],
-                'farm_id' => self::FARM_ID,
+            fn (array $a): array => [
+                'account_id' => $this->accountId($a[0]),
+                'farm_id' => $this->farmId,
                 'account_name' => $a[1],
                 'account_class' => $a[2],
                 'account_category' => $a[3],
@@ -224,11 +225,11 @@ final class CashFlowActualsForecastFarmSeeder
         foreach ($this->milkTrackers() as [$suffix, $name]) {
             $rows[] = [
                 'tracker_id' => $this->trackerId($suffix),
-                'farm_id' => self::FARM_ID,
+                'farm_id' => $this->farmId,
                 'tracker_name' => $name,
                 'tracker_type' => 'milk',
                 'stock_type' => 'Milk',
-                'income_account_id' => self::MILK_SALES,
+                'income_account_id' => $this->accountId(self::MILK_SALES),
                 'opening_stock' => 0,
                 'display_order' => $order++,
             ];
@@ -237,7 +238,7 @@ final class CashFlowActualsForecastFarmSeeder
         foreach ($this->stockTrackers() as [$suffix, $name, $stockType, $opening]) {
             $rows[] = [
                 'tracker_id' => $this->trackerId($suffix),
-                'farm_id' => self::FARM_ID,
+                'farm_id' => $this->farmId,
                 'tracker_name' => $name,
                 'tracker_type' => 'livestock',
                 'stock_type' => $stockType,
@@ -310,10 +311,10 @@ final class CashFlowActualsForecastFarmSeeder
      */
     private function seedMilkActualIncome(): void
     {
-        $f = self::FARM_ID;
+        $f = $this->farmId;
         $r = self::REGION;
         $h = self::HORIZON;
-        $acc = self::MILK_SALES;
+        $acc = $this->accountId(self::MILK_SALES);
 
         $this->db->query(<<<SQL
             INSERT INTO {$this->alias}.transaction_lines
@@ -380,7 +381,7 @@ final class CashFlowActualsForecastFarmSeeder
         foreach ($plan as [$account, $tracker, $monthly, $day]) {
             $values[] = sprintf(
                 "('%s', %s, %d, %d, %d)",
-                $account,
+                $this->accountId($account),
                 $tracker === null ? 'NULL' : "'{$tracker}'",
                 $classByAccount[$account] === 'REVENUE' ? -1 : 1,
                 $monthly,
@@ -389,7 +390,7 @@ final class CashFlowActualsForecastFarmSeeder
         }
         $planValues = implode(', ', $values);
 
-        $f = self::FARM_ID;
+        $f = $this->farmId;
         $r = self::REGION;
         $h = self::HORIZON;
         $fp = self::FIXED_POINT;
@@ -431,11 +432,11 @@ final class CashFlowActualsForecastFarmSeeder
      */
     private function seedGst(): void
     {
-        $f = self::FARM_ID;
+        $f = $this->farmId;
         $r = self::REGION;
         $h = self::HORIZON;
         $fp = self::FIXED_POINT;
-        $gst = self::GST;
+        $gst = $this->accountId(self::GST);
         $first = self::FIRST_MONTH;
         $last = self::LAST_MONTH;
         $tag = CashFlowActualsForecastSqlBuilder::TAG_GST_PAYMENT;
@@ -479,7 +480,7 @@ final class CashFlowActualsForecastFarmSeeder
      */
     private function seedOneOffs(): void
     {
-        $f = self::FARM_ID;
+        $f = $this->farmId;
         $r = self::REGION;
         $fp = self::FIXED_POINT;
         $eoy = CashFlowActualsForecastSqlBuilder::TAG_EOY_MANUAL;
@@ -495,7 +496,7 @@ final class CashFlowActualsForecastFarmSeeder
 
         $values = [];
         foreach ($rows as [$id, $account, $type, $date, $amount, $tag]) {
-            $values[] = "('{$f}', 'dairy', '{$r}', '{$id}', '{$account}', '{$type}', 'cash', DATE '{$date}', {$amount}, NULL, {$tag})";
+            $values[] = "('{$f}', 'dairy', '{$r}', '{$id}', '{$this->accountId($account)}', '{$type}', 'cash', DATE '{$date}', {$amount}, NULL, {$tag})";
         }
 
         $this->db->query(sprintf(
@@ -539,8 +540,22 @@ final class CashFlowActualsForecastFarmSeeder
         return $trackers;
     }
 
+    /**
+     * `accounts.account_id` is a global key, so a second farm from this
+     * seeder needs ids of its own. The default farm keeps the ids it has
+     * always had, which keeps its earlier measurements reproducible.
+     */
+    private function accountId(string $id): string
+    {
+        if ($this->farmId === self::FARM_ID) {
+            return $id;
+        }
+
+        return $this->farmId.'-'.substr($id, strlen('cfaf-'));
+    }
+
     private function trackerId(string $suffix): string
     {
-        return self::FARM_ID.'-'.$suffix;
+        return $this->farmId.'-'.$suffix;
     }
 }

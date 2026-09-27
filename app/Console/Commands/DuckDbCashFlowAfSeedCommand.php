@@ -22,6 +22,7 @@ class DuckDbCashFlowAfSeedCommand extends Command
         {--lines=200000 : Journal lines to seed the dairy farm with, across four seasons}
         {--milk-trackers=13 : Milk trackers on the dairy farm; past thirteen they are generated blocks}
         {--stock-trackers=2 : Livestock trackers on the dairy farm; past two they are generated herds}
+        {--farm=cfaf-dairy-nz : Farm id for the dairy farm; another id seeds a second farm beside it}
         {--oracle : Seed only the hand-computed oracle farm}
         {--skip-farm : Seed only the oracle farm (alias of --oracle)}';
 
@@ -53,10 +54,11 @@ class DuckDbCashFlowAfSeedCommand extends Command
                 $appAlias,
                 max(1, (int) $this->option('milk-trackers')),
                 max(1, (int) $this->option('stock-trackers')),
+                (string) $this->option('farm'),
             ))->seed((int) $this->option('lines'));
             $this->line(sprintf(
                 '  %-22s %s lines  %6.1f s  (%d trackers, %d lines per account-month)',
-                CashFlowActualsForecastFarmSeeder::FARM_ID,
+                (string) $this->option('farm'),
                 number_format($result['lines']),
                 (hrtime(true) - $t) / 1e9,
                 $result['trackers'],
