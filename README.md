@@ -2406,6 +2406,51 @@ oracle — seeding this same farm into figured-webapp and diffing its real
 cash flow and balance sheet — is the step that would convert "the SQL matches
 my reading of the pipes" into "the SQL matches Figured".
 
+#### Stress test 1 of 3 — volume, with the per-stage check still on
+
+`duckdb:pipeline --scale=N --all` seeds `pipeline-scale-<N>` — the oracle
+farm's shape over thirty years, generated in SQL from a hash of each row's
+coordinates so it reseeds identically, with the overdraft-triggering purchase
+sized from the data — and runs the full check against it. Four decades of
+volume, every gate on, the same twelve-month period each time:
+
+| lines | seed | p02 scan | p07 cells | p08 merge | p14 CYE | p15 RE | p24 final | stages |
+|---|---|---|---|---|---|---|---|---|
+| 10,346 | 0.2 s | 15 ms | 24 | 59 | 69 | 76 | **79 ms** | 24/24 |
+| 100,346 | 0.3 s | 15 | 23 | 59 | 65 | 76 | **82 ms** | 24/24 |
+| 1,000,346 | 0.7 s | 19 | 26 | 61 | 61 | 79 | **79 ms** | 24/24 |
+| 10,000,346 | 5.7 s | 34 | 49 | 77 | **100** | **160** | **188 ms** | 24/24 |
+
+(each stage's ms is a full run of the chain to that stage; p24 is the report)
+
+Two findings, and one near-miss:
+
+- **The pipeline is flat to a million lines and correct at ten.** The scan
+  collapses to cells at pipe 7 — accounts × months, a few hundred rows —
+  and every pipe after that is cells work. Line volume stops mattering the
+  moment it is aggregated, which is the property that makes an
+  ordering-dependent chain cheap to run as one statement.
+- **What bends at 10M is the nested reports, not the pipeline.** p14 and p15
+  each re-scan `transaction_lines` — `CurrentYearEarnings` from the FY start,
+  `RetainedEarnings` over the farm's whole history for every season's net
+  profit — and from 10M lines they are where the time goes (+40 ms and +60 ms
+  over p13). The base scan doubles too (p02: 19 → 34 ms). The three
+  sub-reports Figured nests are three reads of the same table in one
+  statement, and that is the cost that scales. The fix, if one is ever
+  wanted, is to scan once and derive the three from it — which Figured's
+  structure never allowed and this one does.
+- **A hollow pass.** The first sweep reported 24/24 at 10K and 1M on farms
+  that had **zero lines in the lake**: the seeder had failed on an unsigned
+  overflow (`hash()` returns UBIGINT), the output filter hid the error, and
+  both sides agreed on zeros. That is absence, not parity. `DataPipelineCheck`
+  and the command now fail the run outright when the scan is empty.
+
+To run the oracle at volume without a million-element PHP array,
+`DataPipelineOracle` reads lines pre-bucketed by (account, month, type, tag).
+Every predicate the pipes apply falls on a month boundary in this PoC, so the
+bucket carries what a line would and pipe 7's `SUM` is the only thing that has
+happened to it; the transliteration stays a transliteration.
+
 ## Concurrency — the axis every other number here omits
 
 Every other measurement in this README is one query on an idle machine. That is

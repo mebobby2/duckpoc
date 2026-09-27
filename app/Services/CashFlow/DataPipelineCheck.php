@@ -57,6 +57,14 @@ final class DataPipelineCheck
                 continue;
             }
 
+            // A farm with nothing in scope passes every stage trivially — both
+            // sides agree on zeros. That is not parity, it is absence, and it
+            // was mistaken for a result once. Refuse it at the scan.
+            if ($stage === 'p02_scan' && $actual === []) {
+                $stages[] = ['stage' => $stage, 'cells' => 0, 'ms' => $ms, 'ok' => false, 'detail' => 'scan is empty — no lines in scope for this farm and period; nothing to check'];
+                continue;
+            }
+
             $detail = $this->diff($actual, $expected[$stage] ?? [], $stage === 'p24_format');
             $ok = $detail === null;
             $passed += $ok ? 1 : 0;

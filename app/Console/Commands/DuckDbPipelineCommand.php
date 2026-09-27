@@ -9,6 +9,7 @@ use App\Services\CashFlow\DataPipelineOracle;
 use App\Services\CashFlow\DataPipelineSqlBuilder;
 use App\Services\CashFlow\PipelineOptions;
 use App\Services\CashFlow\PipelineOracleSeeder;
+use App\Services\CashFlow\PipelineScaleSeeder;
 use Illuminate\Console\Command;
 use Saturio\DuckDB\DuckDB;
 use Saturio\DuckDB\Type\Type;
@@ -43,6 +44,7 @@ class DuckDbPipelineCommand extends Command
         {--dynamic-bank : dynamicBankAccount}
         {--all : Turn on every logic pipe that has a gate}
         {--seed : Seed the pipeline oracle farm first}
+        {--scale= : Seed pipeline-scale-<N> with about N lines and run against it}
         {--show= : Print this stage as a table (e.g. p24_format)}';
 
     protected $description = "Run Figured's DataPipeline as one statement and check every stage against the PHP transliteration";
@@ -60,6 +62,16 @@ class DuckDbPipelineCommand extends Command
         }
 
         $farmId = (string) ($this->option('farm') ?: PipelineOracleSeeder::FARM_ID);
+
+        if ($this->option('scale')) {
+            $target = (int) $this->option('scale');
+            (new CashFlowSchema($db, $alias, $appAlias))->addTagColumn();
+            $t = hrtime(true);
+            $n = (new PipelineScaleSeeder($db, $alias))->seed($target);
+            $farmId = PipelineScaleSeeder::farmId($target);
+            $this->line(sprintf('  seeded %s with %s lines in %.1f s', $farmId, number_format($n), (hrtime(true) - $t) / 1e9));
+            $this->line('');
+        }
         $from = (string) ($this->option('from') ?: PipelineOracleSeeder::PERIOD_FROM);
         $to = (string) ($this->option('to') ?: PipelineOracleSeeder::PERIOD_TO);
         $horizon = (string) ($this->option('horizon') ?: PipelineOracleSeeder::HORIZON);
@@ -101,6 +113,12 @@ class DuckDbPipelineCommand extends Command
                 $sqlMs += $ms;
             } catch (Throwable $e) {
                 $this->error(sprintf('  %-20s %5s %8s  ERROR %s', $stage, '-', '-', substr($e->getMessage(), 0, 120)));
+                $failed++;
+                continue;
+            }
+
+            if ($stage === 'p02_scan' && $actual === []) {
+                $this->error(sprintf('  %-20s %5d %8.1f  FAIL scan is empty — no lines in scope; nothing to check', $stage, 0, $ms));
                 $failed++;
                 continue;
             }

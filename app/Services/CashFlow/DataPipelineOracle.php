@@ -113,9 +113,18 @@ final class DataPipelineOracle
             $this->accounts[(string) $a->account_id] = (array) $a;
         }
 
+        // Lines are read pre-bucketed by (account, month, type, tag). Every
+        // predicate the pipes apply — period, horizon, YTD start, the inner
+        // report's "before the period" — falls on a month boundary in this
+        // PoC, so the bucket carries everything a line would, and pipe 7's
+        // SUM is the only thing that has happened to it. A million lines
+        // become a few thousand rows and the transliteration stays a
+        // transliteration at volume.
         $this->lines = [];
         $sql = sprintf(
-            "SELECT account_id, CAST(date AS VARCHAR) AS date, amount, tag, type FROM %s.transaction_lines WHERE farm_id = '%s' ORDER BY date, line_id",
+            "SELECT account_id, CAST(date_trunc('month', date) AS VARCHAR) AS date, SUM(amount) AS amount, tag, type
+             FROM %s.transaction_lines WHERE farm_id = '%s'
+             GROUP BY 1, 2, 4, 5 ORDER BY 2, 1",
             $this->alias,
             str_replace("'", "''", $farmId),
         );
