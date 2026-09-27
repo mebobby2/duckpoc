@@ -7,7 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900">
-<div class="mx-auto max-w-6xl px-6 py-8">
+<div class="mx-auto max-w-7xl px-6 py-8">
 
     @php
         $money = static function (?float $v, int $dp = 2): string {
@@ -19,10 +19,7 @@
     <header class="mb-6">
         <h1 class="text-2xl font-semibold">Overdraft interest</h1>
         <p class="mt-1 text-sm text-slate-600">
-            Phase 3 — the first report here that a window function cannot express. Interest is
-            charged on a balance that <strong>excludes interest</strong>, so the running total of
-            what has already accrued has to be subtracted to find the true overdrawn position.
-            Month N's interest raises month N+1's charge base.
+            Interest charged on the overdrawn cash position, month by month, posted per the repayment term.
         </p>
         <p class="mt-2 text-sm">
             <a href="{{ route('reports') }}" class="text-blue-700 underline">← all reports</a>
@@ -30,6 +27,10 @@
     </header>
 
     <form method="GET" class="mb-4 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+        <input type="hidden" name="pipeline_type" value="{{ $options->type }}">
+        @foreach (['ytd' => $options->ytd, 'exclude_eoy' => $options->excludeEoyJournals, 'opening_gst' => $options->includeOpeningBudgetGst, 'cye' => $options->calculateCurrentYearEarnings, 'retained' => $options->calculateRetained, 'expected_sign' => $options->showExpectedSign, 'dynamic_bank' => $options->dynamicBankAccount] as $k => $v)
+            <input type="hidden" name="{{ $k }}" value="{{ $v ? 1 : 0 }}">
+        @endforeach
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
             <label class="block text-sm">
                 <span class="mb-1 block font-medium text-slate-700">Farm</span>
@@ -59,17 +60,12 @@
         </div>
     </form>
 
-    {{-- settings write to the overdrafts table, which is where the SQL reads them --}}
-    <form method="POST" action="{{ route('overdraft.save') }}" class="mb-6 rounded-lg border border-amber-200 bg-amber-50 p-5 shadow-sm">
+    <form method="POST" action="{{ route('overdraft.save') }}" class="mb-6 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
         @csrf
         <input type="hidden" name="farm_id" value="{{ $farmId }}">
         <input type="hidden" name="period_from" value="{{ $periodFrom }}">
         <input type="hidden" name="period_to" value="{{ $periodTo }}">
         <input type="hidden" name="horizon" value="{{ $horizon }}">
-        <p class="mb-3 text-xs text-slate-600">
-            The rate and term live in the <code class="rounded bg-white px-1">overdrafts</code> table —
-            the SQL reads them there rather than taking them as parameters, so changing them is a write.
-        </p>
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <label class="block text-sm">
                 <span class="mb-1 block font-medium text-slate-700">Annual rate %</span>
@@ -86,7 +82,7 @@
                 </select>
             </label>
             <div class="flex items-end">
-                <button type="submit" class="w-full rounded bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700">
+                <button type="submit" class="w-full rounded bg-slate-700 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800">
                     Save &amp; rerun
                 </button>
             </div>
@@ -99,196 +95,158 @@
         </div>
     @endif
 
-    @if ($elapsedMs !== null)
+    @if ($pipeline !== null)
         @php
-            $totalAccrued = 0.0; $totalPosted = 0.0;
-            foreach ($rows as $r) {
-                $totalAccrued += (float) (string) $r['interest_accrued'];
-                if ($r['interest_posted'] !== null) { $totalPosted += (float) (string) $r['interest_posted']; }
-            }
-            $conserved = abs($totalAccrued - $totalPosted) < 0.005;
+            $months = $pipeline['months'];
+            $final = $pipeline['final'];
+            $odKey = null;
+            foreach (array_keys($final) as $acc) { if (str_contains($acc, 'od-interest')) { $odKey = $acc; } }
+            $odRow = $odKey === null ? [] : $final[$odKey];
+            // Under YTD the interest row is already a running total; otherwise the period's total is the sum.
+            $odTotal = $odRow === [] ? 0.0 : ($options->ytd ? (float) end($odRow) : array_sum($odRow));
+            $allPass = $pipeline['passed'] === count($pipeline['stages']);
         @endphp
 
-        <div class="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div class="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Overdraft interest</p>
+                <p class="mt-1 text-2xl font-semibold tabular-nums">{{ $money($odTotal) }}</p>
+                <p class="mt-1 text-xs text-slate-500">{{ $periodFrom }} to {{ $periodTo }}</p>
+            </div>
             <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
                 <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Query time</p>
-                <p class="mt-1 text-2xl font-semibold tabular-nums">{{ number_format($elapsedMs, 0) }} ms</p>
-                <p class="mt-1 text-xs text-slate-500">1 statement, recursive CTE</p>
+                <p class="mt-1 text-2xl font-semibold tabular-nums">{{ number_format($pipeline['statement_ms'], 0) }} ms</p>
+                <p class="mt-1 text-xs text-slate-500">one statement</p>
             </div>
-            <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Interest accrued</p>
-                <p class="mt-1 text-2xl font-semibold tabular-nums">{{ $money($totalAccrued) }}</p>
-                <p class="mt-1 text-xs text-slate-500">every month, whatever the term</p>
-            </div>
-            <div class="rounded-lg border {{ $conserved ? 'border-slate-200 bg-white' : 'border-red-300 bg-red-50' }} p-4 shadow-sm">
-                <p class="text-xs font-medium uppercase tracking-wide {{ $conserved ? 'text-slate-500' : 'text-red-700' }}">Interest posted</p>
-                <p class="mt-1 text-2xl font-semibold tabular-nums">{{ $money($totalPosted) }}</p>
-                <p class="mt-1 text-xs {{ $conserved ? 'text-slate-500' : 'text-red-700' }}">
-                    {{ $conserved ? 'conserved — nothing dropped' : 'LOST ' . $money($totalAccrued - $totalPosted) }}
-                </p>
-            </div>
-            <div class="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-                <p class="text-xs font-medium uppercase tracking-wide text-slate-500">Page load</p>
-                <p class="mt-1 text-2xl font-semibold tabular-nums" data-page-ms>&mdash;</p>
-                <p class="mt-1 text-xs text-slate-500">
-                    @if ($serverMs !== null) server {{ number_format($serverMs, 0) }} ms @endif
+            <div class="rounded-lg border {{ $allPass ? 'border-slate-200 bg-white' : 'border-red-300 bg-red-50' }} p-4 shadow-sm">
+                <p class="text-xs font-medium uppercase tracking-wide {{ $allPass ? 'text-slate-500' : 'text-red-700' }}">Check</p>
+                <p class="mt-1 text-2xl font-semibold tabular-nums">{{ $pipeline['passed'] }}/{{ count($pipeline['stages']) }}</p>
+                <p class="mt-1 text-xs {{ $allPass ? 'text-slate-500' : 'text-red-700' }}">
+                    @if ($serverMs !== null) page {{ number_format($serverMs, 0) }} ms @endif
                 </p>
             </div>
         </div>
-    @endif
 
-    @if (!empty($rows))
-        @php
-            // Rows are line items and columns are months, the way the Planning
-            // Grid shows it. The report is read across a month, not down one.
-            $cell = static function (?float $v, bool $blankZero = false) use ($money): string {
-                if ($v === null || ($blankZero && abs($v) < 0.005)) { return '—'; }
-                return $money($v);
-            };
-        @endphp
-
-        <div class="mb-4 overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
+        {{-- the report: months as columns --}}
+        <div class="mb-6 overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
             <table class="min-w-full text-sm">
-                <thead>
-                <tr class="bg-slate-100">
-                    <th class="sticky left-0 z-10 bg-slate-100 px-3 py-2 text-left font-medium text-slate-600">Row</th>
-                    @foreach ($rows as $r)
-                        <th class="px-3 py-2 text-right font-medium text-slate-700 whitespace-nowrap">{{ $r['month'] }}</th>
-                    @endforeach
-                    <th class="px-3 py-2 text-right font-medium text-slate-700 border-l-2 border-slate-300">Total</th>
-                </tr>
+                <thead class="bg-slate-100 text-xs uppercase tracking-wide text-slate-600">
+                    <tr>
+                        <th class="sticky left-0 z-10 bg-slate-100 px-4 py-2 text-left"></th>
+                        @foreach ($months as $m)<th class="px-3 py-2 text-right whitespace-nowrap">{{ $m }}</th>@endforeach
+                    </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-100">
-
-                <tr>
-                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Opening Balance</td>
-                    @foreach ($rows as $r)
-                        @php $v = (float) (string) $r['opening_balance']; @endphp
-                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ $v < 0 ? 'text-red-700' : '' }}">{{ $cell($v) }}</td>
-                    @endforeach
-                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300 text-slate-400">—</td>
-                </tr>
-
-                <tr>
-                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Net Cash Movement</td>
-                    @php $sumMove = 0.0; @endphp
-                    @foreach ($rows as $r)
-                        @php $v = (float) (string) $r['net_cash_movement']; $sumMove += $v; @endphp
-                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ $v < 0 ? 'text-red-700' : '' }}">{{ $cell($v, true) }}</td>
-                    @endforeach
-                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300 {{ $sumMove < 0 ? 'text-red-700' : '' }}">{{ $cell($sumMove) }}</td>
-                </tr>
-
-                <tr class="bg-amber-50/60">
-                    <td class="sticky left-0 bg-amber-50/60 px-3 py-1.5 whitespace-nowrap font-medium">Interest &middot; Overdraft</td>
-                    @php $sumInt = 0.0; @endphp
-                    @foreach ($rows as $r)
-                        @php
-                            $v = $r['interest_posted'] === null ? null : (float) (string) $r['interest_posted'];
-                            $sumInt += $v ?? 0.0;
-                        @endphp
-                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap font-medium">{{ $cell($v) }}</td>
-                    @endforeach
-                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300 font-medium">{{ $cell($sumInt) }}</td>
-                </tr>
-
-                <tr class="text-slate-600">
-                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">
-                        Accrued, not yet charged
-                        <span class="ml-1 text-xs text-slate-400">liability</span>
-                    </td>
-                    @foreach ($rows as $r)
-                        @php $v = (float) (string) $r['accrued_not_charged']; @endphp
-                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ abs($v) < 0.005 ? 'text-slate-300' : 'text-amber-700' }}">{{ $cell($v) }}</td>
-                    @endforeach
-                    <td class="border-l-2 border-slate-300"></td>
-                </tr>
-
-                <tr class="border-t-2 border-slate-300 bg-slate-50 font-semibold">
-                    <td class="sticky left-0 bg-slate-50 px-3 py-1.5 whitespace-nowrap">Closing Balance</td>
-                    @foreach ($rows as $r)
-                        @php $v = (float) (string) $r['closing_balance']; @endphp
-                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ $v < 0 ? 'text-red-700' : '' }}">{{ $cell($v) }}</td>
-                    @endforeach
-                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300"></td>
-                </tr>
-
-                <tr><td colspan="{{ count($rows) + 2 }}" class="bg-slate-100 px-3 py-1 text-xs font-medium uppercase tracking-wide text-slate-500">How the charge is derived</td></tr>
-
-                <tr class="text-slate-600">
-                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Closing before interest</td>
-                    @foreach ($rows as $r)
-                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap">{{ $cell((float) (string) $r['closing_before_interest']) }}</td>
-                    @endforeach
-                    <td class="border-l-2 border-slate-300"></td>
-                </tr>
-
-                <tr class="text-slate-600">
-                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Principal charged</td>
-                    @foreach ($rows as $r)
-                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap">{{ $cell((float) (string) $r['principal']) }}</td>
-                    @endforeach
-                    <td class="border-l-2 border-slate-300"></td>
-                </tr>
-
-                <tr class="text-slate-600">
-                    <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Interest accrued</td>
-                    @php $sumAcc = 0.0; @endphp
-                    @foreach ($rows as $r)
-                        @php $v = (float) (string) $r['interest_accrued']; $sumAcc += $v; @endphp
-                        <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap">{{ $cell($v, true) }}</td>
-                    @endforeach
-                    <td class="px-3 py-1.5 text-right tabular-nums border-l-2 border-slate-300">{{ $cell($sumAcc) }}</td>
-                </tr>
-
-                @if ($isOracleFarm)
-                    <tr class="text-slate-500">
-                        <td class="sticky left-0 bg-white px-3 py-1.5 whitespace-nowrap">Figured oracle</td>
-                        @foreach ($rows as $i => $r)
-                            @php
-                                $exp = $oracle[$i] ?? null;
-                                $ok = $exp !== null && (int) round(((float) (string) $r['interest_accrued']) * 10000) === $exp;
-                            @endphp
-                            <td class="px-3 py-1.5 text-right tabular-nums whitespace-nowrap {{ $exp === null ? '' : ($ok ? 'text-emerald-700' : 'bg-red-100 text-red-800') }}">
-                                {{ $exp === null ? '—' : number_format($exp / 10000, 4) }}
-                            </td>
+                    <tr class="bg-amber-50 font-semibold">
+                        <td class="sticky left-0 z-10 bg-amber-50 px-4 py-2">Overdraft interest</td>
+                        @foreach ($months as $i => $m)
+                            <td class="px-3 py-2 text-right tabular-nums">{{ $money((float) ($odRow[$i + 1] ?? 0)) }}</td>
                         @endforeach
-                        <td class="border-l-2 border-slate-300"></td>
                     </tr>
-                @endif
-
+                    @foreach ($final as $acc => $cells)
+                        @if ($acc === $odKey) @continue @endif
+                        <tr>
+                            <td class="sticky left-0 z-10 bg-white px-4 py-1.5 font-mono text-xs text-slate-600">{{ $acc }}</td>
+                            @foreach ($months as $i => $m)
+                                @php $v = (float) ($cells[$i + 1] ?? 0); @endphp
+                                <td class="px-3 py-1.5 text-right tabular-nums {{ $v < 0 ? 'text-red-700' : '' }}">{{ $money($v) }}</td>
+                            @endforeach
+                        </tr>
+                    @endforeach
                 </tbody>
             </table>
         </div>
 
-        <div class="mb-6 rounded-lg border border-slate-200 bg-white p-4 text-sm text-slate-600 shadow-sm">
-            <span class="font-medium text-slate-900">Reading it:</span>
-            <strong>Closing Balance</strong> includes the interest, and each month's
-            <strong>Opening Balance</strong> is the previous month's closing — so the charge feeds
-            back into the position it was computed from, which is what Figured's virtual journals do.
-            <br><br>
-            The three rows under <em>How the charge is derived</em> are the working.
-            <strong>Closing before interest</strong> is the raw cash position and on the oracle farm
-            it never moves. <strong>Principal charged</strong> is that figure minus every dollar of
-            interest accrued so far, and it climbs. The interest is charged on the second, which is
-            why the charge grows when nothing in the data does — and why the query needs
-            <code class="rounded bg-slate-100 px-1">WITH RECURSIVE</code> rather than a window
-            function.
-            <br><br>
-            <strong>Interest accrued</strong> happens every month; <strong>Interest &middot;
-            Overdraft</strong> is what is actually posted, which depends on the repayment term.
-            Change the term above and the accrued row stays identical while the posted row moves.
-            <br><br>
-            <span class="font-medium text-slate-900">If the balance looks frozen, check the term.</span>
-            On anything but monthly, no cash moves between repayment months, so the closing balance
-            is flat by design — it is a <em>cash</em> position and nothing has been paid. The debt is
-            still growing, and <strong>Accrued, not yet charged</strong> is where it shows: it climbs
-            every month and resets to zero when the bucket is charged. On an annual term that is
-            eleven flat months and one step, which is also exactly what Figured does.
-        </div>
-    @endif
+        {{-- ---------- underneath ---------- --}}
+        <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm">
+            <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
+                Options
+                <span class="ml-2 font-normal text-slate-500">{{ $options->type }} · {{ collect(['ytd' => $options->ytd, 'excludeEoy' => $options->excludeEoyJournals, 'openingGst' => $options->includeOpeningBudgetGst, 'cye' => $options->calculateCurrentYearEarnings, 'retained' => $options->calculateRetained, 'expectedSign' => $options->showExpectedSign, 'dynamicBank' => $options->dynamicBankAccount])->filter()->keys()->implode(', ') ?: 'defaults' }}</span>
+            </summary>
+            <form method="GET" class="flex flex-wrap items-end gap-3 border-t border-slate-200 px-5 py-4 text-sm">
+                <input type="hidden" name="farm_id" value="{{ $farmId }}">
+                <input type="hidden" name="period_from" value="{{ $periodFrom }}">
+                <input type="hidden" name="period_to" value="{{ $periodTo }}">
+                <input type="hidden" name="horizon" value="{{ $horizon }}">
+                <label class="block">
+                    <span class="mb-1 block text-xs font-medium text-slate-600">type</span>
+                    <select name="pipeline_type" class="rounded border-slate-300 text-sm">
+                        <option value="actualsForecast" @selected($options->type === 'actualsForecast')>actualsForecast</option>
+                        <option value="budget" @selected($options->type === 'budget')>budget</option>
+                    </select>
+                </label>
+                @foreach ([
+                    'ytd' => ['ytd', $options->ytd], 'exclude_eoy' => ['excludeEoyJournals', $options->excludeEoyJournals],
+                    'opening_gst' => ['includeOpeningBudgetGst', $options->includeOpeningBudgetGst], 'cye' => ['calculateCurrentYearEarnings', $options->calculateCurrentYearEarnings],
+                    'retained' => ['calculateRetained', $options->calculateRetained], 'expected_sign' => ['showExpectedSign', $options->showExpectedSign],
+                    'dynamic_bank' => ['dynamicBankAccount', $options->dynamicBankAccount],
+                ] as $param => [$label, $on])
+                    <label class="flex items-center gap-1.5 rounded border border-slate-200 px-2 py-1.5">
+                        <input type="hidden" name="{{ $param }}" value="0">
+                        <input type="checkbox" name="{{ $param }}" value="1" @checked($on) class="rounded border-slate-300">
+                        <span class="font-mono text-xs">{{ $label }}</span>
+                    </label>
+                @endforeach
+                <label class="block">
+                    <span class="mb-1 block text-xs font-medium text-slate-600">ytd_type</span>
+                    <select name="ytd_type" class="rounded border-slate-300 text-sm">
+                        <option value="" @selected($options->ytdType === null)>—</option>
+                        <option value="season" @selected($options->ytdType === 'season')>season</option>
+                    </select>
+                </label>
+                <button type="submit" class="rounded bg-slate-700 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800">Apply</button>
+            </form>
+        </details>
 
-    @if ($elapsedMs !== null)
+        <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm">
+            <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
+                Pipeline stages
+                <span class="ml-2 font-normal text-slate-500">{{ $pipeline['passed'] }}/{{ count($pipeline['stages']) }} match the transliteration · {{ number_format($pipeline['oracle_ms'], 0) }} ms oracle</span>
+            </summary>
+            @php
+                $pipeLabels = [
+                    'p01_empty' => 'PrepareEmptyArray', 'p02_scan' => 'BuildAggregationPipeline', 'p03_mf_trackers' => 'UpdatePipelineForV3MultiFarmTrackers',
+                    'p04_mapped_in' => 'AddMappedAccountsToPipeline', 'p05_nesting' => 'CheckMaxNesting', 'p06_query' => 'QueryMongo',
+                    'p07_cells' => 'AddResultsToEmptyArray', 'p08_merge_vj' => 'MergeVirtualJournals', 'p09_opening_bank' => 'AddOpeningBudgetBankBalance',
+                    'p10_opening_gst' => 'AddOpeningBudgetGstBalance', 'p11_offsets' => 'ReportingGroupOffsetAccounts', 'p12_gst_payments' => 'AddGstPaymentsRefunds',
+                    'p13_merge_mapped' => 'MergeMappedResults', 'p14_cye' => 'CurrentYearEarnings', 'p15_retained' => 'RetainedEarnings',
+                    'p16_ytd' => 'FixYearToDateValues', 'p17_contra_gst' => 'ContraGstPaymentsRefunds', 'p18_expected_sign' => 'ShowExpectedSign',
+                    'p19_inverse' => 'InverseAmounts', 'p20_consolidate' => 'ReportingGroupConsolidateAccounts', 'p21_dynamic_bank' => 'DynamicBankBalance',
+                    'p22_hide_empty' => 'HideEmpty', 'p23_hide_accounts' => 'HideEmptyAccounts', 'p24_format' => 'FormatCells',
+                ];
+                $pipeNotes = [
+                    'p03_mf_trackers' => 'pass-through', 'p11_offsets' => 'pass-through', 'p20_consolidate' => 'pass-through',
+                    'p12_gst_payments' => 'disabled in Figured', 'p17_contra_gst' => 'disabled in Figured',
+                    'p22_hide_empty' => 'display only', 'p23_hide_accounts' => 'display only',
+                ];
+                $gateOf = [
+                    'p09_opening_bank' => $options->type === 'budget', 'p10_opening_gst' => $options->type === 'budget' && $options->ytd && $options->includeOpeningBudgetGst,
+                    'p14_cye' => $options->calculateCurrentYearEarnings, 'p15_retained' => $options->calculateRetained, 'p16_ytd' => $options->ytd,
+                    'p18_expected_sign' => $options->showExpectedSign, 'p19_inverse' => false, 'p21_dynamic_bank' => $options->dynamicBankAccount,
+                ];
+            @endphp
+            <div class="overflow-x-auto border-t border-slate-200">
+                <table class="min-w-full text-xs">
+                    <thead class="bg-slate-50 text-left text-slate-600">
+                        <tr><th class="px-3 py-2">#</th><th class="px-3 py-2">stage</th><th class="px-3 py-2">pipe</th><th class="px-3 py-2">gate</th><th class="px-3 py-2 text-right">cells</th><th class="px-3 py-2 text-right">ms</th><th class="px-3 py-2">result</th></tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100">
+                        @foreach ($pipeline['stages'] as $i => $st)
+                            <tr class="{{ $st['ok'] ? '' : 'bg-red-50' }}">
+                                <td class="px-3 py-1.5 tabular-nums text-slate-500">{{ $i + 1 }}</td>
+                                <td class="px-3 py-1.5 font-mono">{{ $st['stage'] }}</td>
+                                <td class="px-3 py-1.5">{{ $pipeLabels[$st['stage']] ?? '' }}@if (isset($pipeNotes[$st['stage']])) <span class="text-slate-400">— {{ $pipeNotes[$st['stage']] }}</span>@endif</td>
+                                <td class="px-3 py-1.5">@if (array_key_exists($st['stage'], $gateOf))<span class="rounded px-1.5 py-0.5 {{ $gateOf[$st['stage']] ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-600' }}">{{ $gateOf[$st['stage']] ? 'on' : 'off' }}</span>@else<span class="text-slate-400">always</span>@endif</td>
+                                <td class="px-3 py-1.5 text-right tabular-nums">{{ number_format($st['cells']) }}</td>
+                                <td class="px-3 py-1.5 text-right tabular-nums">{{ number_format($st['ms'], 1) }}</td>
+                                <td class="px-3 py-1.5 {{ $st['ok'] ? 'text-emerald-700' : 'font-medium text-red-700' }}">{{ $st['ok'] ? 'pass' : 'FAIL — ' . $st['detail'] }}</td>
+                            </tr>
+                        @endforeach
+                    </tbody>
+                </table>
+            </div>
+        </details>
+
         @php
             $bytes = static function (?int $b): string {
                 if (!$b) { return '0 B'; }
@@ -393,7 +351,7 @@
                     scope. {{ $outOfScope }} pruned before a byte was read — partition pruning is
                     resolved from the catalog, so a pruned file costs nothing at all.
                 </p>
-                @if (empty($inScope) && !empty($rows))
+                @if (empty($inScope) && $pipeline !== null)
                     <p class="mb-3 rounded border-l-4 border-sky-400 bg-sky-50 px-3 py-2 text-xs text-sky-900">
                         <strong>Nothing in scope, yet the report returned rows — this is expected
                         here.</strong> DuckLake keeps small writes inlined in the catalog rather than

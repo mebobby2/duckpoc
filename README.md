@@ -1347,8 +1347,9 @@ if either errors.
 
 ## Next steps
 
-Phased per the architecture conversation this PoC came out of. **Phase 0
-(scaffold) and Phase 1 (Cash Flow) are done**; the rest is not started:
+Phased per the architecture conversation this PoC came out of. **Phases 0
+(scaffold), 1 (Cash Flow), 1b (tracker sections) and 3 (overdraft interest)
+are done.** Phase 2 has been rescoped (below); Phases 4 and 5 are not started.
 
 1. ~~**Phase 1 — Cash Flow.**~~ **Done.** Schema + partitioning, the oracle
    captured from Figured's real engine, the report as one DuckDB query, and a
@@ -1361,31 +1362,222 @@ Phased per the architecture conversation this PoC came out of. **Phase 0
    now a fact-table column, per-tracker income/direct-cost sections resolve by
    grouping one scan, and the 1/10/50 curve is flat. See the tracker scaling
    section above, including what it deliberately does not show.
-3. **Phase 2 — Livestock valuation.** Research the actual virtual-journal
-   handler (methodology, data dependencies, existing tests) first, then port
-   it to DuckDB SQL against real synthetic tracker data. This is the
-   genuinely hard, multi-dimensional case (account × type × basis ×
-   tracking/mob × horizon, self-referential) — the step that actually tests
-   whether this architecture avoids repeating a past internal ClickHouse
-   evaluation's failure mode (swapping engines without solving the
-   underlying multi-dimensional derivation problem).
+3. **Phase 2 — Livestock valuation movement.** *Rescoped 2026-09-17 after
+   reading the real handler and measuring the real data. The original scope
+   is kept below under "What this used to say" because the correction is the
+   useful part.*
 
-   **Phase 1b sharpened what this phase has to prove.** The per-tracker
-   *quantity and valuation* chain — opening stock → movements → closing →
-   valuation, stateful and ordered within each tracker — is where
-   `getStockQuantities()` actually spends its time, and it is the half Phase
-   1b did not touch. The claim to test is that it becomes a window function
-   `PARTITION BY tracker_id`, computed for every tracker in one pass. That is
-   the thing Mongo cannot express, and therefore the real reason the current
-   engine loops in PHP at all — not an implementation slip.
-4. **Phase 3 — Overdraft interest**, built on top of the now-real Cash Flow
-   output instead of stubbed test values.
+   Port `NonCashMovementVirtualJournal` — the livestock valuation movement —
+   to DuckDB SQL, and show that Figured's per-interval PHP loop collapses
+   into **one windowed statement**:
+
+   ```sql
+   SUM(signed_qty) OVER (PARTITION BY tracker_id, stock_class_uuid ORDER BY interval)
+     * per_head_value                                                    -- closing valuation
+     - LAG(...) OVER (PARTITION BY tracker_id, stock_class_uuid ORDER BY interval)
+   ```
+
+   The claim is about **latency from PHP object churn**, not volume. Measure
+   it at realistic farm size, against the same oracle-parity bar as Phases 1
+   and 3.
+
+   **The measurement that forced the rescope.** `stock_transactions` in the
+   dev database (current rows only, `_valid_to IS NULL`, not soft-deleted):
+
+   | | |
+   |---|---|
+   | Total rows, whole database | **13,752** |
+   | Farms with any stock | 63 |
+   | **Largest single farm** | **5,039 rows** |
+   | Mean per farm | 218 |
+   | Largest single tracker | 865 |
+   | Stock classes per tracker | 6 mean, 35 max |
+   | Valuation templates | 557 |
+
+   The largest farm in the database is 5,039 rows — that is the *entire*
+   input to one valuation report, not per month. A scan that size is free on
+   every engine including the MySQL one it runs on today. Seeding a synthetic
+   500M-row livestock farm would have measured an axis that does not exist in
+   production — **the same trap Phase 1's volume test fell into**, one layer
+   down.
+
+   The real cost is above the query: `getValuationTotal()` runs a full
+   `allocateManagementValuationStock()` → `calculate()` cycle per interval per
+   template, and `StockQuantitiesCollection::getClosingTotal()` re-filters and
+   re-sums the whole collection in PHP once per interval. 557 templates × 84
+   intervals is ~47,000 PHP object calculations over 13,752 rows of input —
+   **O(intervals × templates), almost independent of row count.**
+
+   **What this used to say, and why it was wrong.** The original entry called
+   this "the genuinely hard, multi-dimensional case (account × type × basis ×
+   tracking/mob × horizon, self-referential)" and "the thing Mongo cannot
+   express, and therefore the real reason the current engine loops in PHP."
+   Reading the handler does not support any of that:
+
+   - **Not self-referential.** The generator emits a first difference —
+     `$movement = $intervalValue - $previousValue` — which is `LAG`. Nothing
+     feeds back into its own input. Phase 3's overdraft interest, already
+     built, is the genuinely recursive one.
+   - **Not Mongo.** `stock_transactions` is **MySQL**, and the interval
+     bucketing is already one `GROUP BY` with a generated `CASE` ladder
+     (`StockQuantity::getForPeriod()`). Mongo is not in this path at all.
+   - **Not multi-dimensional in the hard sense.** Most of the dimensions are
+     conditional routing, not simultaneous grouping — `shouldHandle()` skips
+     cash basis, scenarios, budgets and actuals outright. The one genuinely
+     awkward dimension is the **horizon split** (local actuals before the
+     horizon date, forecast after, in one scan), and `addSplitDateRangeToQuery`
+     handles it with an OR of two date+type predicates, which is a plain
+     `CASE` in DuckDB.
+   - **The valuation maths is `quantity × per-head value`.** No FIFO, no cost
+     layers. The scheme classes (`HerdScheme`, `NationalStandardCost`,
+     `AusTax`) only run for **EOY tax** valuations — a once-a-year
+     user-completed workflow, not a report-time calculation.
+
+   So this phase no longer claims to be the ClickHouse-failure-mode test.
+   **Nothing in the PoC currently is**, and that should be stated plainly
+   rather than assumed — see the honesty note below.
+
+   ### Built. The latency claim failed; the portability claim is the real one.
+
+   The report is one statement (`ValuationMovementSqlBuilder`), checked against
+   `ValuationMovementOracle` — a PHP transliteration of Figured's interval loop
+   — by `duckdb:valuation`. Parity holds at every shape tried, including the
+   30-year history and the first-month `LAG` NULL edge, and the movements
+   telescope to closing minus opening:
+
+   | farm | rows checked | parity | conservation |
+   |---|---|---|---|
+   | `gm-dairy-farm` (5 trackers, 12 mo) | 60 | pass | pass |
+   | `tracker-farm-50` (50 trackers, 12 mo) | 600 | pass | pass |
+   | `hero-tracker-farm-50` (50 trackers, 12 mo) | 600 | pass | pass |
+   | `hero-tracker-farm-50` (50 trackers, **354 mo**) | 17,700 | pass | pass |
+
+   #### It is not faster, and that is fine
+
+   Measured A/B inside one process, so the numbers are comparable to each other
+   (across-run comparisons on this box are not — AlloyDB's column store moves
+   the memory baseline by gigabytes):
+
+   | shape | PHP loop | statement, MySQL-attached | statement, DuckDB-native |
+   |---|---|---|---|
+   | 5 trackers, 12 mo | **2.6 ms** | 5.9 ms (0.4x) | 3.7 ms (0.7x) |
+   | 50 trackers, 12 mo | 53.8 ms | 80.8 ms (0.7x) | **14.2 ms (3.8x)** |
+   | 50 trackers, 354 mo | 115.3 ms | 184.2 ms (0.6x) | 95.7 ms (1.2x) |
+
+   Through the MySQL connector the statement loses at every shape. Over DuckDB's
+   own storage it wins 3.8x on a large farm. The window functions themselves
+   cost about 7 ms; everything else is moving rows between engines.
+
+   **A wrong diagnosis, corrected.** The first version of this section blamed a
+   "near-fixed ~23 ms connector overhead". It was mostly a **missing predicate
+   pushdown**: `farm_id` lives on `trackers`, and the DuckDB MySQL scanner
+   cannot push a predicate through a join, so every farm's rows crossed the wire
+   and were discarded locally. The tell was that the cost did not move between a
+   5-tracker and a 50-tracker farm. Resolving the tracker ids first and pasting
+   them in as a redundant `IN` on the scanned table fixes it — 37.6 ms to 5.9 ms,
+   **6.4x** — and it is why `ValuationMovementSqlBuilder::trackerPredicate()`
+   exists. The fix narrows the gap but does not flip it, so the conclusion holds;
+   the reasoning behind it was wrong for a while and the number was too.
+
+   Note the pushdown is a small *loss* on `hero-tracker-farm-50` (0.8x), which
+   holds ~18,000 of the table's 25,632 rows. Filtering to 70% of a table saves
+   nothing and a 50-id `IN` list costs something. It pays when one farm is a
+   small slice of a large table — which is the production shape.
+
+   #### What the phase is actually worth: one definition, several engines
+
+   Latency was never going to justify this — 2.6 ms of PHP on a typical farm is
+   not a problem anyone has. The reason to move the rule into SQL is that the
+   **same rule then runs wherever the data does**: the app, the warehouse, and
+   the data science team's notebooks, instead of three reimplementations of a
+   valuation that must agree and cannot be diffed.
+
+   That is a testable claim, and it was tested. `ValuationMovementPgSqlBuilder`
+   runs the same logic on AlloyDB, and all three agree exactly:
+
+   ```
+   rows: duckdb=60  alloydb=60  php-oracle=60
+   PASS: 60/60 rows identical across DuckDB, AlloyDB and the PHP loop
+   sum of movements: duckdb=308940.00 alloydb=308940.00  diff=0.000000
+   ```
+
+   Diffing the two statements with comments, catalog prefixes and parameter
+   style normalised away: **4 hunks differ out of 66 lines, and none of them
+   touch the window functions.**
+
+   | # | difference | what it is |
+   |---|---|---|
+   | 1 | `CAST(m AS DATE)` vs `m::DATE` | cast syntax |
+   | 2 | `INTERVAL 1 MONTH` / `AS g(m)` vs `INTERVAL '1 month'` | date spine |
+   | 3 | the pushdown subquery | DuckDB-only connector workaround, not logic |
+   | 4 | `strftime` vs `to_char` | display format |
+
+   The two clauses that *are* the valuation are byte-identical between the two
+   files:
+
+   ```sql
+   SUM(...) OVER (PARTITION BY tracker_id ORDER BY month
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+   LAG(closing_value) OVER (PARTITION BY tracker_id ORDER BY month_start)
+   ```
+
+   BigQuery needs the same three substitutions and no others:
+   `UNNEST(GENERATE_DATE_ARRAY(a, b, INTERVAL 1 MONTH))` for the spine,
+   `FORMAT_DATE('%Y-%m', d)` for the label, and a subquery alias instead of the
+   `AS g(m)` column list. Not yet run against BigQuery — that is an assertion
+   from the dialect, not a measurement, and should be marked as such until
+   someone runs it.
+
+   **The risk worth naming is drift, not expressibility.** Three hand-maintained
+   copies of a rule will diverge. `ValuationMovementPgSqlBuilder` being a
+   near-clone of its DuckDB counterpart is the evidence: if this becomes real,
+   the SQL wants generating from one source (a dbt model, or a builder with a
+   dialect shim), not copying. The cross-engine identity check above is the
+   minimum guard, and it should run in CI rather than by hand.
+
+   **Still outstanding:** the HTML report page with the diagnostics the other
+   reports carry, and an actual BigQuery run.
+
+4. **Phase 3 — Overdraft interest.** The recurrence is done and at parity;
+   the pipeline it sits in is not — see "Re-assessed against `DataPipeline`"
+   under the Phase 3 section. Built on the real Cash
+   Flow output rather than stubbed values. The genuinely self-referential
+   case — interest accrues on a balance that the previous month's interest
+   already moved — expressed as one `WITH RECURSIVE` statement on **both**
+   DuckDB and AlloyDB, at parity with Figured's oracle, with a conservation
+   check across every repayment term. Both engines have their own report page
+   and diagnostics. See the overdraft sections above.
 5. **Phase 4 — Scale/latency test**, only once 1–3 are correct at small
    scale, on the hardest real report shape (not Cash Flow, which real
    per-farm row counts already suggest isn't a meaningful performance risk).
 6. **Phase 5 — The additive derived-facts Parquet layer for BigQuery** /
    practice-wide benchmarking, built on report logic now proven correct on
    the hard case, not just the easy one.
+
+### What this PoC has not tested
+
+Stated plainly because the Phase 2 entry above used to claim otherwise, and
+because a PoC that only reports its wins is not worth much to the people
+deciding on it.
+
+**No report in this PoC is the ClickHouse-failure-mode test.** The original
+Phase 2 framing assumed livestock valuation was that test; reading the handler
+showed it is a `LAG` over `quantity × per-head value`. The four reports now
+built or scoped — Cash Flow, Gross Margin, overdraft interest, valuation
+movement — are all expressible in one statement, and three of them are proven
+so. That is a real result, but it is a result about *these* reports, not a
+general claim that every Figured derivation collapses into SQL.
+
+If there is a report that genuinely does not, it has not been found yet. Worth
+asking Richard directly which one he would nominate, rather than the PoC
+picking its own exam questions.
+
+**The data volumes are synthetic where it matters least.** The engines have
+been pushed to 1.75B rows on Gross Margin, a shape that real per-farm counts do
+not approach. The measured reality — 5,039 stock rows for the largest farm,
+and per-farm journal counts already noted above — says the production risk is
+latency and concurrency, not volume. The concurrency sweep is the number that
+speaks to the real risk; the billion-row numbers mostly establish headroom.
 
 ## The MongoDB baseline — what the current stack actually costs
 
@@ -1963,6 +2155,256 @@ at 1.80x for Gross Margin and 1.02x here.
 afterwards, because grouping on `date_trunc()` is a function call on the
 grouping key and moves the whole aggregate above the scan. That rule applies
 whatever the report.
+
+### Re-assessed against `DataPipeline` — 2026-09-27
+
+Richard's feedback on the result above, verbatim from Slack:
+
+> i think the thing more than pure speed is to look at
+> `/src/Figured/Packages/Core/Reporting/Pipes/DataPipeline` rather than any
+> specific implementation, it sort of nicely lays out all the business logic
+> … and the logic is ordering dependent … some of those steps are data steps
+> of course (like the merging / preparing arrays) but others are logic — ie
+> adding GST Payments / Refunds, contra accounts, current year earning
+> calculations, opening balances yadda yadda. and of course the consolidated
+> account handling between entities which is a pickle
+
+He is right, and the gap is larger than a missing feature or two. **What
+Phase 3 ported is pipe 8 of 25.** `DataPipelineService::$pipes` is an ordered
+list, and `MergeVirtualJournals` — the step that pulls the overdraft handler's
+output into the report — sits eighth. Seventeen pipes run after it, and every
+item Richard named lives in one of them. The PoC took the hard input as given:
+it computes the closing balance the interest compounds on as
+`SUM(-tl.amount)` over cash lines, validated against a farm holding **one
+transaction line**.
+
+The real structure also nests, which nothing here reproduces:
+
+```
+DataPipeline (outer report, 25 pipes)
+  └─ pipe 8  MergeVirtualJournals
+       └─ OverdraftVirtualJournals            priority 150, both bases
+            └─ OverdraftCalculationService
+                 └─ CashflowReport            a full sub-report, cash basis,
+                      └─ DataPipeline         tracking=CONSOLIDATED, tags dropped,
+                                              excludeEoyJournals=true — all 25 again
+```
+
+`OverdraftVirtualJournals` carries `private static bool $running` to stop
+that recursion. The interest is charged on the **closing** row of the inner
+report's `OpeningClosingBalance` dynamic section, and that inner report's net
+cash movement is `income - expense + gst` with GST its own inverted section and
+**bank accounts captured into a hidden section and excluded** — the PoC sums
+every line, bank included, and treats GST as an ordinary account (its own
+comment says so).
+
+#### The 25 pipes, in order, against what the PoC does
+
+Read from `DataPipelineService.php` and each pipe's `shouldHandle()`. "Gate"
+is the report option or state that turns the pipe on. *Data* pipes shape the
+Mongo query and result arrays; *logic* pipes change numbers.
+
+| # | pipe | kind | gate | what it does | PoC |
+|---|---|---|---|---|---|
+| 1 | `PrepareEmptyArray` | data | always | zero cell per account × interval | the month spine |
+| 2 | `BuildAggregationPipeline` | data | always | the Mongo `$match`/`$group`; ytd start, basis, tags, `excludeEoyJournals` (MYOB only: `$nin` tag) | `p02_scan` — horizon split, YTD widening, EOY tag `$nin` |
+| 3 | `UpdatePipelineForV3MultiFarmTrackers` | data | mf trackers | maps tracker ids onto multi-farm tracking options | n/a — one tracking dimension |
+| 4 | `AddMappedAccountsToPipeline` | data | always | adds internal Figured accounts mapped to Xero accounts to the query | `report_accounts` includes mapped targets |
+| 5 | `CheckMaxNesting` | data | always | guards Mongo query depth | n/a |
+| 6 | `QueryMongo` | data | always | runs it | the scan |
+| 7 | `AddResultsToEmptyArray` | data | always | fills the cells | the `GROUP BY` |
+| 8 | `MergeVirtualJournals` | data | VJs present | adds VJ amounts by account/interval/basis/tracking; **overdraft (150) and GST payments/refunds (145) arrive here** | `p08_merge_vj` — GST handler + overdraft recurrence, each over its nested report |
+| 9 | `AddOpeningBudgetBankBalance` | logic | budget, budget_id 0 | opening bank → default bank account, contra → retained earnings, first interval of each FY; value from `Balance::getReport()` | `p09_opening_bank` from `opening_balances` (budget) |
+| 10 | `AddOpeningBudgetGstBalance` | logic | budget, ytd, `includeOpeningBudgetGst`, GST/RE rows present | opening GST → GST account (inverse), contra → retained earnings | `p10_opening_gst` |
+| 11 | `ReportingGroupOffsetAccounts` | logic | reporting group, `mergedAccounts` | inter-entity transfers: adds the *from* entity's account balances (a nested `AccountBalances` run per source farm) onto the *to* account, zeroes the *from* — including its mapped alias | **pass-through — next tranche** |
+| 12 | `AddGstPaymentsRefunds` | logic | **hard-disabled** — `return false;` since `d43fc7ab0d2` / `3c1c742f797` (FIG-16282, Feb–Mar 2024) | predicted GST payments/refunds line; actual payments removed from net GST | dead in Figured; logic now lives in `GstPaymentsRefundsVirtualJournal` at pipe 8 |
+| 13 | `MergeMappedResults` | logic | always | folds each internal Figured account's cells into its Xero account and drops the internal row; includes adopted accounts | `p13_merge_mapped` (adopted accounts not modelled) |
+| 14 | `CurrentYearEarnings` | logic | `calculateCurrentYearEarnings` | runs a **nested YTD sub-report** (`allincome - allexpenses`) and copies the inverted total into the CYE equity account | `p14_cye` — nested YTD scan |
+| 15 | `RetainedEarnings` | logic | RE account present, `calculateRetained` | runs a **nested yearly sub-report** of net profit for every season since the farm's first transaction (a Mongo `findOne` sorted by `accrual_date`; 1990 for reporting groups), sums seasons before each interval's FY into a running RE line, resets at season start; plus opening-balance RE from MYOB | `p15_retained` — nested season scan (MYOB opening not modelled) |
+| 16 | `FixYearToDateValues` | logic | `ytd`, not offsets sub-run | running sum per account across intervals; resets at season start for `ytd_type=season`; skips RE and CYE | `p16_ytd` |
+| 17 | `ContraGstPaymentsRefunds` | logic | **hard-disabled**, same commits | contra the GST payments line against the bank | dead; see 12 |
+| 18 | `ShowExpectedSign` | logic | `showExpectedSign` | flips accounts the user views inverted | `p18_expected_sign` from `accounts.inverted_for_user` |
+| 19 | `InverseAmounts` | logic | `inverse` | multiplies every cell by −1 | `p19_inverse` |
+| 20 | `ReportingGroupConsolidateAccounts` | logic | reporting group, `consolidateAccounts` | moves each `old_account_id`'s cells onto `new_account_id`, summing when several map to one | **pass-through — next tranche** |
+| 21 | `DynamicBankBalance` | logic | `dynamicBankAccount`, liability account exists, not reporting group | a negative default-bank cell moves to the Figured liability account (US lines of credit) | `p21_dynamic_bank` |
+| 22 | `HideEmpty` | data | `hideEmpty` | flags all-zero rows | n/a |
+| 23 | `HideEmptyAccounts` | data | `hideEmptyAccounts` | flags all-zero internal/mapped/typed rows | n/a |
+| 24 | `FormatCells` | data | always, **last** | deflates ×10,000 | the `/ 10000.0` |
+
+(`DataPipe`, `BaseDataPipe`, `FlatTransactionsClass` are plumbing, not
+stages.)
+
+Two of Richard's five items — GST payments/refunds and contra accounts — are
+**no longer pipeline pipes at all**. Both `shouldHandle()` methods open with an
+unconditional `return false;`, dated to the FIG-16282 commits that moved the
+logic into `GstPaymentsRefundsVirtualJournal`. The business rule is alive; it
+just arrives at pipe 8 as journals rather than at pipes 12 and 17 as array
+edits. That matters for a port: GST payments/refunds must be produced *before*
+the merge, not after it, and `MergeVirtualJournals` filters by basis, date
+window and tracking, so the journals have to carry all three correctly to be
+counted.
+
+#### What "opening balance" actually is
+
+The PoC's is one integer on `farms`. Figured's, for a budget period
+(`Balance::getReport()`), is
+
+```
+opening_bank(FY)                    a per-FY user Variable; summed over every
+                                    tracking entity when the farm is consolidated
+  + bank account transactions       CurrentBalance over every BANK-type account,
+                                    season start → day before the period
+  + depreciation balance            cash basis only, DEPRECIATION-type accounts
+  + GST value                       GstCalculator over the same window
+  - opening GST(FY)                 another per-FY Variable, per entity
+```
+
+and for an actuals/forecast period it is a whole `AccountBalances` sub-report
+over every bank account, ending the day before the period, split around the
+horizon. Five terms and two nested reports where the PoC has a column.
+
+#### What the numbers say
+
+Only **one** farm has an overdraft configured — `overdraft-oracle-farm`, one
+transaction line — so the overdraft statement has never run against
+realistic data. Applying its movement expression to a realistic chaff farm
+(`gm-dairy-farm-500M-non-aggregated-sorted`, cash, 2024, 437M lines):
+
+| | |
+|---|---|
+| PoC net cash movement, all lines | **2,203,397.59** |
+| report-account legs only | **2,235,559.03** |
+| bank balancing legs | −29,861.09 |
+| GST legs | −2,300.35 |
+
+A 1.4% error in the base the recursion compounds on, every month, for the
+horizon. The `accounts` table already carries `is_gst_account` and
+`is_default_bank_account`; `OverdraftSqlBuilder` reads neither.
+
+#### The honest summary
+
+Phase 3 proved that a self-referential monthly recurrence fits one
+`WITH RECURSIVE` statement at parity with Figured's pinned series. That stands.
+It did not prove the thing Richard is asking about, which is whether an
+**ordering-dependent 25-stage pipeline** — with three nested sub-reports
+inside it — can be expressed as composable SQL at all. That is the
+ClickHouse-failure-mode test the "What this PoC has not tested" section
+admits nothing here currently is. It is now the work below.
+
+#### The port — `duckdb:pipeline`
+
+Scope, agreed 2026-09-27: exercise the whole pipeline on DuckDB/MinIO first,
+one CTE per pipe in `$pipes` order, gated the way Figured gates them, and
+check parity **after every stage** against a PHP transliteration of the same
+pipe, so an ordering mistake is caught at the stage that made it rather than
+in the final total. The seed farm has to carry every input the pipes read:
+a GST account and NZ two-monthly settings, a default bank and a second bank,
+a depreciation account, retained-earnings and current-year-earnings system
+accounts, an EOY-tagged journal, an internal account mapped to a Xero one,
+two entities in a reporting group with a merged (offset) account and a
+consolidated account, opening bank and GST balances per FY, and an overdraft.
+Progress is recorded in the pipe table above as stages land.
+
+#### First tranche — landed 2026-09-27
+
+`php artisan duckdb:pipeline --seed --all` seeds `pipeline-oracle-farm` (97
+lines: NZ, FY ending June, GST two-monthly on a payments basis, an actuals /
+forecast horizon at 31 December, and an input for every pipe) and checks
+`DataPipelineSqlBuilder` against `DataPipelineOracle` — a PHP transliteration
+of the same pipes — **after each of the 24 stages**, in three configurations:
+
+| run | gates on | stages passing |
+|---|---|---|
+| `duckdb:pipeline` | none | **24 / 24** |
+| `duckdb:pipeline --all` | ytd, excludeEoy, openingGst, cye, retained, expectedSign, dynamicBank | **24 / 24** |
+| `duckdb:pipeline --type=budget --all --ytd-type=season` | as above, budget path (pipes 9 and 10 live) | **24 / 24** |
+
+Per-stage checking is the point: an ordering-dependent pipeline can be wrong
+at stage 9 and right again by stage 24 if two mistakes cancel, and the
+transliteration keeps a snapshot after every pipe so the diff lands on the
+pipe that made it. Pipes 2–6 are the scan and are diffed as cells the way
+pipe 7 will bucket them.
+
+What the final table shows on the `--all` run, each visibly the work of one
+pipe:
+
+- the internal fertiliser account is gone and the Xero fertiliser line carries
+  3,000 + 400 a month — pipe 13;
+- June wages are 144,000, not 153,000: the $9,000 EOY adjustment is excluded
+  — pipe 2's tag predicate;
+- each actual IRD settlement is off the net GST line and on the payments line,
+  and the predicted payments net off the settlements already made in their
+  window — the GST handler at pipe 8;
+- **overdraft interest posts January to June — $524.63 falling to $223.07 as
+  the balance climbs back out** — the recurrence at pipe 8, over an inner
+  cash flow with bank excluded and GST inverted, which the outer report then
+  carries forward. This is the row Phase 3 could never populate on a
+  one-line farm;
+- the term loan shows sign-flipped — pipe 18;
+- a negative default-bank cell moves to the liability account — pipe 21;
+- current-year earnings and retained earnings rows are populated from their
+  nested sub-reports — pipes 14 and 15.
+
+The statement is ~65 ms for the whole chain on this farm (median of 7, one
+pass); the transliteration is ~15 ms. Not a speed result and not meant as one
+— the data is 97 lines, and the ~1.1 s the command reports is 24 full runs,
+one per stage checked.
+
+**So: yes, the ordering-dependent pipeline composes as SQL**, on this
+tranche, including the three nested reports and the recursion, with the
+ordering itself under test. It is one `WITH RECURSIVE` statement of ~16 KB.
+
+#### What this tranche does not yet do — stated so it is not mistaken for done
+
+- **Pipes 3, 11 and 20** (`UpdatePipelineForV3MultiFarmTrackers`,
+  `ReportingGroupOffsetAccounts`, `ReportingGroupConsolidateAccounts`) are
+  pass-throughs. They need a multi-entity scan — a parent farm whose report
+  sums child entities — and the seed farm is single-entity. The dimension
+  tables for them exist (`reporting_group_farms`, `merged_accounts`,
+  `consolidated_accounts`); the stages do not. This is the "pickle" Richard
+  named, and it is the next tranche.
+- **The GST payment schedule** is NZ two-monthly with the exception-month
+  *dates* applied (December → 15 January, April → 7 May) but the
+  exception-month *windows* unverified against `PaymentsDates::getSchedule()`,
+  which was not read. The transliteration implements the same rule, so parity
+  proves the SQL matches the rule, not that the rule matches Figured. A farm
+  whose FY end makes April or December a payment month would exercise it;
+  this one does not.
+- **Pre-financial-year balances under YTD.** The YTD scan starts at the FY
+  start, as `BuildAggregationPipeline` does, so a balance-sheet account's
+  balance from before the FY is not in it. How Figured's balance sheet carries
+  that forward (a report-type-specific start, or the opening pipes only) was
+  not verified, so pipe 21 here fires on a bank *movement* rather than a
+  balance. The overdraft's inner cash flow is unaffected — it reads the bank
+  accounts' own lines before the period, as `Balance::getReport()` does.
+- **Sign convention of the equity rows.** `CurrentYearEarnings` and
+  `RetainedEarnings` are transliterated literally — `inverse(allincome -
+  allexpenses)` on stored signs — and come out positive for a profitable
+  farm. Whether a rendered Figured balance sheet flips them again for display
+  was not checked. The transliteration and the statement agree; a rendered
+  page is the missing oracle.
+- **Both bases.** The handlers emit journals for cash and accrual; this
+  lake holds one basis per line and the runs are cash. Accrual is a
+  `--basis=accrual` away but unexercised.
+- **Only the monthly repayment term.** Phase 3's `--all-terms` distribution is
+  not yet inside the pipeline.
+- **No AlloyDB port.** DuckDB/MinIO first, as agreed. The AlloyDB overdraft
+  page still runs the Phase 3 statement, not the pipeline.
+
+The overdraft page (`/overdraft`) now renders the pipeline's output as the
+report — one table, months as columns, the interest row on top — with the
+per-stage check, the options, the statement and the usual diagnostics in
+collapsed sections underneath. The Phase 3 statement is no longer shown there;
+`OverdraftSqlBuilder` remains for `duckdb:overdraft`'s check against Figured's
+pinned series and for the page's source-line listing, whose predicate is the
+pipeline scan's. On `overdraft-oracle-farm` the two agree to the cent
+($51.16), which is the evidence the re-work enclosed Phase 3 rather than
+replacing it.
+
+The oracle here is a transliteration, not Figured's output. The stronger
+oracle — seeding this same farm into figured-webapp and diffing its real
+cash flow and balance sheet — is the step that would convert "the SQL matches
+my reading of the pipes" into "the SQL matches Figured".
 
 ## Concurrency — the axis every other number here omits
 

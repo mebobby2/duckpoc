@@ -146,14 +146,8 @@
                 </span>
             </div>
             <p class="mt-2 text-sm text-slate-600">
-                Phase 3. The first report here a window function cannot express: interest is charged
-                on a balance that excludes interest, so month N's charge raises month N+1's base.
-                One statement, <code class="rounded bg-slate-100 px-1">WITH RECURSIVE</code>, no PHP
-                arithmetic &mdash; matching Figured's own test oracle cell for cell.
-            </p>
-            <p class="mt-2 text-xs text-slate-500">
-                Exercises: a genuine recurrence in SQL &middot; compounding on a flat balance &middot;
-                repayment-term distribution that must conserve the accrual
+                Interest charged on the overdrawn cash position, month by month, posted per the
+                repayment term. Configurable rate and term per farm.
             </p>
         </a>
 
@@ -175,15 +169,40 @@
                 report with no selective predicate to prune with
             </p>
         </a>
+
+        <a href="{{ route('valuation') }}"
+           class="block rounded-lg border border-slate-200 bg-white p-5 shadow-sm hover:border-slate-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Livestock valuation movement</h2>
+                <span class="rounded bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800">
+                    parity with Figured
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                Figured builds a valuation object per tracker per interval and subtracts the previous
+                one. Here: a running <code class="rounded bg-slate-100 px-1">SUM(...) OVER</code> for
+                head count &times; per-head value, then
+                <code class="rounded bg-slate-100 px-1">LAG</code> for the movement.
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: one rule running unchanged on DuckDB and AlloyDB &middot; the report shape
+                where the lake is not involved at all &middot; the actuals/forecast horizon split
+            </p>
+        </a>
     </div>
 
     <section class="mt-10 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
         <h2 class="text-sm font-semibold">Not built yet</h2>
         <ul class="mt-2 space-y-1 text-sm text-slate-600">
             <li>
-                <span class="font-medium text-slate-900">Livestock valuation</span> — stock is now
-                tracked in <em>head</em>; valuing it in dollars (national standard cost, market value)
-                is the remaining half.
+                <span class="font-medium text-slate-900">EOY tax valuation</span> — the statutory
+                year-end schemes (national standard cost, herd scheme, AusTax). Deliberately out of
+                scope: they are a once-a-year user-completed workflow, not a report-time calculation.
+                The management valuation that <em>is</em> report-time is built, above.
+            </li>
+            <li>
+                <span class="font-medium text-slate-900">BigQuery</span> — the portability claim is
+                tested across DuckDB and AlloyDB but only asserted for BigQuery, from the dialect.
             </li>
         </ul>
     </section>

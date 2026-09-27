@@ -188,6 +188,23 @@ final class CashFlowSchema
     }
 
     /**
+     * Adds `tag` to an existing table without dropping it.
+     *
+     * Figured's `BuildAggregationPipeline` excludes journals by tag — the
+     * end-of-year adjustment tags, and budget/season tags — with a `$nin` on
+     * the Mongo document's `tags` array. The pipeline port needs the same
+     * predicate, so lines gain a single nullable tag. One rather than an
+     * array because the only tags the pipes read are mutually exclusive.
+     */
+    public function addTagColumn(): void
+    {
+        $this->db->query(<<<SQL
+            ALTER TABLE {$this->alias}.transaction_lines
+            ADD COLUMN IF NOT EXISTS tag VARCHAR
+            SQL);
+    }
+
+    /**
      * The same facts as `transaction_lines`, shaped the way Figured stores them.
      *
      * Figured's Mongo collection holds one document per TRANSACTION with a
