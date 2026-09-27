@@ -227,6 +227,8 @@ enough volume for multiple row groups, i.e. the 800K scale test.
 | `duckdb:tracker:curve` | Measures report time against tracker count, volume held constant |
 | `duckdb:hero:seed` | Seeds the hero stress-test farm — 50 trackers over 30 years, `--rows=` (default 10M) |
 | `duckdb:hero:bench` | Report time on the hero farm across widening period windows |
+| `duckdb:cashflow-af:seed` | Seeds the actuals-plus-forecast oracle farm and the 13-milk-tracker dairy farm, `--lines=` (default 200K) |
+| `duckdb:cashflow-af:run` | Runs the actuals-plus-forecast Cash Flow as one statement; on the oracle farm checks 687 cells across three passes |
 
 The root URL (`/`) is an index of the reports below.
 
@@ -236,6 +238,7 @@ Two report viewers:
 |---|---|
 | `/cashflow` | Plain Cash Flow — the parity-checked report (84/84 against Figured) |
 | `/tracker-cashflow` | Cash Flow with per-tracker income sections, and the tracker-count timings |
+| `/cashflow-actuals-plus-forecast` | The whole Figured request — a from/to period, horizon, tracker blocks, EOY exclusion, Total column, and the milk/GST/overdraft virtual journals — as one statement. See [the section below](#cash-flow--actuals-plus-forecast-the-whole-request) |
 
 The two are deliberately separate controllers and views. `/cashflow` is the
 artefact parity is asserted against, so nothing in the tracker work can
@@ -1223,6 +1226,181 @@ maintain this. Not solved here; a known gap for Phase 5+.
 enough to force multiple row groups, but not yet at the real Phase 1 target
 (one ~800K-row "hero" farm alongside several smaller farms across multiple
 cohorts) — that's the actual stress test this design still needs.
+
+## Cash Flow — actuals plus forecast, the whole request
+
+Figured's Cash Flow was benchmarked on a real farm with the diagnostics URL
+
+```
+/reports/data/cash_flow?type=actualsForecast&period=2027&actuals_horizon=2026-06-30
+  &display=monthly&group_by=tracker&exclude_eoy_journals=1&with_total=1&with_overdraft=0 …
+```
+
+and came back at **16.4 s**, of which 61% was the three virtual-journal
+handlers a cash flow fires (milk tracker income 4.7 s, GST payments/refunds
+4.1 s, overdraft 0.9 s), 24% was the data fetch, and only ~3.3 s was spent in
+MySQL and Mongo at all. The earlier `/cashflow` viewer reproduces the journal-
+driven part of that request and none of the virtual journals — so it could not
+be held against that number.
+
+`/cashflow-actuals-plus-forecast` reproduces the request. Every option in the
+URL has a form input under its Figured name, and every piece of report-time
+work Figured does for it is a CTE in **one DuckDB statement**
+(`CashFlowActualsForecastSqlBuilder`, driven by
+`CashFlowActualsForecastReportDefinition`, which mirrors
+`CashFlowStructureBuilder` section for section):
+
+| Figured does | The statement does |
+|---|---|
+| resolves `period=2027` from the farm's balance date | `from` / `to` bound as dates; `ReportPeriod::financialYear()` makes the default FY2027 range in PHP |
+| types each column actuals / forecast / `actualsForecast` | `months` CTE, from the horizon |
+| `BuildAggregationPipeline` `$match`, EOY tags `$nin` | `scan` CTE, materialised once |
+| `Balance::getReport()` for the opening bank balance | `opening` CTE — the bank accounts' lines before the period |
+| `MilkTrackerVirtualJournalService`, per tracker | `milk_vj` — production x payout per tracker, paid the 20th of the next month, virtual only after the horizon |
+| `GstPaymentsRefundsVirtualJournal` | `gst_*` CTEs — the NZ two-monthly calendar with the January and May exceptions, predictions after the horizon, actual settlements moved to the payments line |
+| `OverdraftCalculationService` over its own sub-report | `inner_cashflow` + `od_accrual` — Phase 3's `WITH RECURSIVE` recurrence, over scan + the other handlers' journals, as Figured nests it |
+| per-tracker income/costs sections, then `implode(' + ', $trackerGrossProfitIds)` | `tracker_agg` grouped by tracker, `tracker_rollup` as one `SUM` |
+| the eight farm sections and four calculation rows | `farm_agg`, then one chained CTE per formula |
+| `OpeningClosingBalance` | two named windows |
+| `with_total=1` | a `UNION ALL` row summing flows, `arg_min`/`arg_max` for the balances |
+| `with_overdraft=1` limit and headroom rows | `with_limits` CTE |
+| `group_by=tracker` blocks | `tracker_rows`, unioned into the same result |
+
+The result is long — `(scope, column)` rows, `scope` being `farm` or a tracker
+id — and PHP binds four parameters and pivots. Option gates are compiled into
+the SQL text, so an option that is off leaves nothing in the plan.
+
+### Checked, not assumed
+
+`duckdb:cashflow-af:run` seeds a farm small enough to work out on paper
+(`CashFlowActualsForecastOracleSeeder` — one line per mechanism, including a
+May production row whose June payment falls *before* the horizon and must not
+be synthesised) and checks **687 cells across three passes**: the default
+request, `exclude_eoy_journals=0`, and with an overdraft configured. The
+overdraft pass computes its expectation with Figured's recurrence in PHP over
+the hand-derived closing balances, so the SQL is checked against an
+independent evaluation rather than against itself.
+
+What it is *not* checked against is Figured itself, unlike `/cashflow`. The
+milk payout calendar, the GST due-date rule and the monthly-only overdraft
+term are this PoC's reading of the handlers, not captures from the real
+services.
+
+### Measured, `cfaf-dairy-nz`
+
+A farm shaped like the benchmarked one: NZ dairy, May balance date, thirteen
+milk trackers and two livestock trackers, two-monthly GST, an overdraft the
+winter milk trough pushes it into, EOY adjustments, four seasons of history.
+`--lines=` fans each account-month out while holding the monthly totals, so
+the report reads the same at any volume. MinIO, fresh process per cold run:
+
+| lines seeded | lines in FY2027 | cold | warm (5 runs, median) | page |
+|---|---|---|---|---|
+| 201,141 | ~50K | 106 ms | 53 ms | 0.36 s |
+| 2,000,565 | 500,043 | 116–123 ms | 60 ms | 0.36 s |
+
+**At 500M lines and 52 trackers.** `--milk-trackers=40 --stock-trackers=12`
+adds generated milk blocks and herds past the named ones, each with its own
+curve. 500,006,256 lines seeded in 172 s (3.3 GB of Parquet, 65 files), about
+125M of them inside FY2027. MinIO, web container stopped, fresh process per
+cold run, 3 cold runs per variant:
+
+| request | cold | warm (6 runs, one process) |
+|---|---|---|
+| default (tracker blocks, EOY excluded, Total) | 4.07 / 5.35 / 4.45 s | median 5.27 s, min 3.62 s |
+| `--with-overdraft` | 3.99 / 4.23 / 4.27 s | median 5.33 s, min 3.91 s |
+| `--consolidated` | 3.72 / 3.83 / 3.58 s | median 5.32 s, min 4.46 s |
+| `--include-eoy` | 3.89 / 3.75 / 4.11 s | — |
+
+Warm is not faster than cold here: nothing caches the Parquet reads between
+runs, so every run re-reads ~125M rows from MinIO. Tracker rows match the 2M
+seed to within 0.2% (the per-line noise averages out), and milk income matches
+exactly, since it is production x payout rather than a function of volume.
+
+```bash
+docker compose exec app-minio php artisan duckdb:cashflow-af:seed --lines=500000000 --milk-trackers=40 --stock-trackers=12
+```
+
+The single-writer catalog lock bites here: once the web server has served a
+lake page it holds the catalog, and every CLI run fails to attach until
+`app-minio` is restarted. Stop it for the benchmark and run each timing with
+`docker compose --profile minio run --rm --no-deps app-minio …`.
+
+### From and to instead of a financial year
+
+The report takes `from` and `to` dates (inclusive) in place of Figured's
+`period=` year, on the page and as `--from` / `--to` on
+`duckdb:cashflow-af:run`. Leaving both out gives the farm's FY2027, so the
+default request and the oracle's three passes are unchanged. There is one
+column per calendar month the range touches, and a range starting or ending
+mid-month gets a short first or last column: the scan stops at the exact
+dates, and the column's end date and type are clamped to them.
+
+The whole 500M-line farm in one request, June 2023 to May 2027, is 48
+columns and 52 tracker blocks.
+
+### Summing at the scan: 72 s to 1.9 s
+
+The first cut of the whole-farm request took 72.3 s. `EXPLAIN ANALYZE` put
+the largest single cost on the `scan` CTE: `AS MATERIALIZED` over the raw
+lines held all 500M of them (18.6 s), under a nested-loop join against the
+`period` CTE (3.5 s) and a second pass over the type filter (3.0 s).
+
+Two changes, both in `CashFlowActualsForecastSqlBuilder`:
+
+1. **`scan` is summed to one row per (date, account, tracker, tag).** Every
+   reader of it — the sections, the GST handler, the overdraft's inner cash
+   flow — only sums amounts within those keys, so nothing is lost. On this
+   farm the materialised result drops from 500M rows to a few thousand.
+2. **The period and horizon are bound straight into the predicate**
+   (`CAST($period_from AS DATE)` and friends) instead of joined from the
+   `period` CTE, so the filter reaches the table scan rather than running as
+   a join over every line. The opening-balance read got the same change.
+
+Measured cold, one fresh process each, web container stopped:
+
+| range | before | after |
+|---|---|---|
+| whole farm, 2023-06-01 → 2027-05-31 | 72.3 s | 1.92 s |
+| whole farm, with overdraft | 71.8 s | 1.80 s |
+| FY2027 (default) | 4.97 s | 0.69 s |
+| FY2027, with overdraft | 4.53 s | 1.02 s |
+| 2026-06-15 → 2026-09-10 | 1.29 s | 0.44 s |
+
+Every report is **byte-identical** before and after, all 52 tracker blocks
+included, and the oracle still passes its 687 cells. The earlier timings in
+this README predate the change.
+
+On the page the statement is ~1.75 s but the page is ~6.5 s: the four
+diagnostic queries it runs afterwards (virtual-journal and source-line
+listings, and the in-scope count) still read the raw lines, and the source
+listing sorts all 500M by date to show the first 300.
+
+```bash
+php artisan duckdb:cashflow-af:run --farm=cfaf-dairy-nz --from=2023-06-01 --to=2027-05-31
+```
+
+Against the 16.4 s the same request cost Figured on its real farm — with the
+caveat that this farm is synthetic and the handlers are ports, not the real
+services — the statement does all three virtual journals, the two scans and
+the sections in roughly a tenth of a second. The page's own time is mostly
+the four diagnostic queries it runs after the report (virtual-journal and
+source-line listings) plus the render.
+
+```bash
+docker compose exec app-minio php artisan migrate
+docker compose exec app-minio php artisan duckdb:cashflow-af:seed --lines=2000000
+docker compose exec app-minio php artisan duckdb:cashflow-af:run             # oracle, 687 cells
+docker compose exec app-minio php artisan duckdb:cashflow-af:run --farm=cfaf-dairy-nz --repeats=5 --with-overdraft
+open http://localhost:8081/cashflow-actuals-plus-forecast
+```
+
+Two schema changes came with it, both additive: `milk_payout_rates` and
+`trackers.income_account_id` (the price and account halves of the milk
+handler), and `accounts.farm_id`, so a farm's GST, GST-payments and overdraft
+system accounts resolve to *its* accounts. The `DataPipelineSqlBuilder` and
+`DataPipelineOracle` lookups were scoped to `farm_id IS NULL OR farm_id =
+$farm_id` at the same time; the pipeline check still passes all 24 stages.
 
 ## The Cash Flow parity oracle (Phase 1, Step 2)
 

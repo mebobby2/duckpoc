@@ -19,6 +19,27 @@
 
     <div class="space-y-4">
 
+        <a href="{{ route('cashflow-actuals-plus-forecast') }}"
+           class="block rounded-lg border border-emerald-300 bg-white p-5 shadow-sm ring-1 ring-emerald-200 hover:border-emerald-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Cash Flow — actuals + forecast, the whole request</h2>
+                <span class="rounded bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800">
+                    one statement, oracle-checked
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                Figured's <code class="rounded bg-slate-100 px-1">/reports/data/cash_flow?type=actualsForecast</code>
+                as it was benchmarked: a financial-year period, actuals to a horizon and forecast after, per-tracker
+                income blocks, EOY journals excluded, a Total column &mdash; and the three virtual-journal handlers
+                (milk income, GST settlements, overdraft interest) that were 61% of the benchmarked 16 s, all as CTEs
+                inside the same statement.
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: a 13-milk-tracker NZ dairy farm with a May balance date &middot; <code class="rounded bg-slate-100 px-1">WITH RECURSIVE</code>
+                for the interest recurrence &middot; every Figured option compiled into the SQL text &middot; MinIO
+            </p>
+        </a>
+
         <a href="{{ route('cashflow') }}"
            class="block rounded-lg border border-slate-200 bg-white p-5 shadow-sm hover:border-slate-400">
             <div class="flex items-baseline justify-between gap-4">

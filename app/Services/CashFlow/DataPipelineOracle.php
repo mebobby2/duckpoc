@@ -109,7 +109,7 @@ final class DataPipelineOracle
         $this->fyEndMonth = (int) ($farm->financial_year_end_month ?? 6);
 
         $this->accounts = [];
-        foreach (DB::table('accounts')->get() as $a) {
+        foreach (DB::table('accounts')->where(fn ($q) => $q->whereNull('farm_id')->orWhere('farm_id', $farmId))->get() as $a) {
             $this->accounts[(string) $a->account_id] = (array) $a;
         }
 

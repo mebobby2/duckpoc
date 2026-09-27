@@ -187,7 +187,7 @@ final class DataPipelineSqlBuilder
                 WHERE a.mapped_to_account_id IS NOT NULL
                   AND a.account_id IN (SELECT account_id FROM {$this->alias}.transaction_lines WHERE farm_id = \$farm_id)
                 UNION ALL
-                SELECT a.account_id FROM {$this->appAlias}.accounts a WHERE a.system_account IS NOT NULL
+                SELECT a.account_id FROM {$this->appAlias}.accounts a WHERE a.system_account IS NOT NULL AND (a.farm_id IS NULL OR a.farm_id = \$farm_id)
             ) x
             SQL;
     }
@@ -290,8 +290,8 @@ final class DataPipelineSqlBuilder
         return <<<SQL
             WITH gst_accounts AS (
                 SELECT
-                    (SELECT account_id FROM {$this->appAlias}.accounts WHERE system_account = 'GST' LIMIT 1) AS gst_id,
-                    (SELECT account_id FROM {$this->appAlias}.accounts WHERE system_account = 'GSTPAYMENTS' LIMIT 1) AS payments_id
+                    (SELECT account_id FROM {$this->appAlias}.accounts WHERE system_account = 'GST' AND (farm_id IS NULL OR farm_id = \$farm_id) LIMIT 1) AS gst_id,
+                    (SELECT account_id FROM {$this->appAlias}.accounts WHERE system_account = 'GSTPAYMENTS' AND (farm_id IS NULL OR farm_id = \$farm_id) LIMIT 1) AS payments_id
             ),
             -- Net GST per calendar month, tax components only, across the
             -- whole scan (the window for a July payment reaches back to May).
@@ -482,7 +482,7 @@ final class DataPipelineSqlBuilder
     {
         return <<<SQL
             SELECT
-                (SELECT account_id FROM {$this->appAlias}.accounts WHERE system_account = 'OVERDRAFT' LIMIT 1) AS account_id,
+                (SELECT account_id FROM {$this->appAlias}.accounts WHERE system_account = 'OVERDRAFT' AND (farm_id IS NULL OR farm_id = \$farm_id) LIMIT 1) AS account_id,
                 month_end AS date,
                 CAST(floor(interest) AS BIGINT) AS amount
             FROM od_accrual

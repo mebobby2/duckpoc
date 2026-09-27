@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\CashFlowActualsForecastReportController;
 use App\Http\Controllers\CashFlowReportController;
 use App\Http\Controllers\GrossMarginReportController;
 use App\Http\Controllers\AlloyDbGrossMarginController;
@@ -13,6 +14,7 @@ use Illuminate\Support\Facades\Route;
 
 Route::view('/', 'reports')->name('reports');
 Route::get('/cashflow', CashFlowReportController::class)->name('cashflow');
+Route::get('/cashflow-actuals-plus-forecast', CashFlowActualsForecastReportController::class)->name('cashflow-actuals-plus-forecast');
 Route::get('/tracker-cashflow', TrackerCashFlowReportController::class)->name('tracker-cashflow');
 Route::get('/gross-margin', GrossMarginReportController::class)->name('gross-margin');
 Route::get('/gross-margin-v2', GrossMarginV2ReportController::class)->name('gross-margin-v2');
