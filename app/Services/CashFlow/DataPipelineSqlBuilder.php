@@ -69,6 +69,7 @@ final class DataPipelineSqlBuilder
         private readonly string $alias,
         private readonly string $appAlias,
         private readonly PipelineOptions $options,
+        private readonly ?int $entitiesPerBranch = null,
     ) {
     }
 
@@ -83,6 +84,7 @@ final class DataPipelineSqlBuilder
         $ctes['farm'] = $this->farmCte();
         $ctes['entities'] = $this->entitiesCte();
         $ctes['months'] = $this->monthSpineCte();
+        $ctes['days'] = $this->daySpineCte();
         $ctes['lines_by_day'] = $this->linesByDayCte();
         $ctes['sys_accounts'] = $this->systemAccountsCte();
         $ctes['posted_accounts'] = $this->postedAccountsCte();
@@ -147,7 +149,7 @@ final class DataPipelineSqlBuilder
         // intervals the way pipe 7 will, so every stage diffs the same shape.
         if (in_array($stage, self::SCAN_STAGES, true)) {
             $select = "SELECT l.farm_id, l.account_id, COALESCE(m.interval_index, 1) AS interval_index, SUM(l.amount) AS amount\n"
-                ."FROM ({$this->byDay($stage)}) l LEFT JOIN months m ON l.date BETWEEN m.month_start AND m.month_end\n"
+                ."FROM ({$this->byDay($stage)}) l LEFT JOIN days m ON m.date = l.date\n"
                 .'GROUP BY 1, 2, 3 ORDER BY 1, 2, 3';
         } elseif ($stage === 'p25_combine') {
             $select = 'SELECT account_id, interval_index, amount FROM p25_combine ORDER BY account_id, interval_index';
@@ -243,6 +245,30 @@ final class DataPipelineSqlBuilder
     }
 
     /**
+     * Every day of the period with the interval it falls in — at most ~11k
+     * rows over thirty years. Lines and journals meet the month spine through
+     * this, on an equality, rather than by `date BETWEEN month_start AND
+     * month_end` directly: DuckDB runs a LEFT range join as a nested loop, so
+     * each of the three that bucket lines compared every (entity, account,
+     * day) row with every month — 2.9M rows × 360 months at 50 × 10M, about
+     * 5 s of CPU of the statement's 41. The range join now runs once, on the
+     * day spine. Lines before the first interval (a YTD scan) find no day and
+     * fall into interval 1, as they did.
+     */
+    private function daySpineCte(): string
+    {
+        return <<<SQL
+            SELECT CAST(d AS DATE) AS date, m.interval_index
+            FROM generate_series(
+                CAST(\$period_from AS DATE),
+                (SELECT MAX(month_end) FROM months),
+                INTERVAL 1 DAY
+            ) AS g(d)
+            JOIN months m ON CAST(d AS DATE) BETWEEN m.month_start AND m.month_end
+            SQL;
+    }
+
+    /**
      * The entities' lines, read once and collapsed to one row per entity,
      * account, day, basis, type and tag. Every scan below — the report's, the
      * overdraft sub-report's, the CYE and retained-earnings sub-reports' and
@@ -273,17 +299,17 @@ final class DataPipelineSqlBuilder
         $basisGroup = count($bases) === 1 ? '' : ', basis';
         $basisIn = "'".implode("', '", $bases)."'";
 
-        $branch = fn (string $farm, string $farmLiteral): string => <<<SQL
-            SELECT {$farmLiteral} AS farm_id, account_id, date, {$basis}, type, tag, SUM(amount) AS amount
+        $branch = fn (?array $ids): string => <<<SQL
+            SELECT {$this->branchFarm('farm_id', $ids)} AS farm_id, account_id, date, {$basis}, type, tag, SUM(amount) AS amount
             FROM {$this->alias}.transaction_lines
-            WHERE farm_id = {$farm}
+            WHERE {$this->branchPredicate('farm_id', $ids)}
               AND basis IN ({$basisIn})
               {$bound}
-            GROUP BY account_id, date, type, tag{$basisGroup}
+            GROUP BY {$this->branchKey('farm_id', $ids)}account_id, date, type, tag{$basisGroup}
             SQL;
 
         return "SELECT * FROM (\n"
-            .implode("\nUNION ALL\n", $this->perEntity($branch))
+            .implode("\nUNION ALL\n", array_map($branch, $this->branches()))
             ."\n) l\nLIMIT 9223372036854775807";
     }
 
@@ -345,35 +371,68 @@ final class DataPipelineSqlBuilder
      */
     private function postedAccountsCte(): string
     {
-        $branch = fn (string $farm, string $farmLiteral): string => <<<SQL
-            SELECT {$farmLiteral} AS farm_id, account_id FROM (
-                SELECT DISTINCT tl.account_id
+        $branch = fn (?array $ids): string => <<<SQL
+            SELECT {$this->branchFarm('farm_id', $ids)} AS farm_id, account_id FROM (
+                SELECT DISTINCT {$this->branchKey('tl.farm_id', $ids)}tl.account_id
                 FROM {$this->farmHistory()} tl
-                WHERE tl.farm_id = {$farm}
+                WHERE {$this->branchPredicate('tl.farm_id', $ids)}
             ) x
             SQL;
 
-        return implode("\nUNION ALL\n", $this->perEntity($branch));
+        return implode("\nUNION ALL\n", array_map($branch, $this->branches()));
     }
 
     /**
-     * One SQL fragment per entity, from `$branch(farm predicate value, farm
-     * literal)`: the bound parameter for a single farm, each child's quoted id
-     * for a reporting group.
+     * The entities each branch of the pass covers: null for a single farm,
+     * which binds the parameter; otherwise the reporting group split in two.
      *
-     * @param callable(string, string): string $branch
-     * @return list<string>
+     * A branch of one entity filters and tags with a literal `farm_id` and
+     * never hashes it; a branch of several groups by it. Measured over 1 to
+     * 50 branches on three groups — 50 × 10M, 10 × 1M, and a 1B beside a 500M
+     * child — two was fastest every time, and every branch past two slower
+     * (50 × 10M, twelve months: 1,500 ms as one grouped scan, 1,338 ms as two
+     * branches, 1,461 as three, 1,984 as fifty). Why two and not more is not
+     * established; the count is the measurement, not a model of DuckDB's
+     * scheduler. `$entitiesPerBranch` overrides it, for measuring again.
+     *
+     * @return list<list<string>|null>
      */
-    private function perEntity(callable $branch): array
+    private function branches(): array
     {
         if (!$this->options->isReportingGroup()) {
-            return [$branch('$farm_id', 'CAST($farm_id AS VARCHAR)')];
+            return [null];
         }
 
-        return array_map(
-            fn (string $id): string => $branch($this->quote($id), "CAST({$this->quote($id)} AS VARCHAR)"),
-            $this->options->reportingGroupEntities,
-        );
+        $entities = $this->options->reportingGroupEntities;
+        $size = $this->entitiesPerBranch ?? (int) ceil(count($entities) / 2);
+
+        return array_chunk($entities, max(1, $size));
+    }
+
+    /** @param list<string>|null $ids */
+    private function branchPredicate(string $column, ?array $ids): string
+    {
+        return match (true) {
+            $ids === null => "{$column} = \$farm_id",
+            count($ids) === 1 => "{$column} = {$this->quote($ids[0])}",
+            default => "{$column} IN (".implode(', ', array_map($this->quote(...), $ids)).')',
+        };
+    }
+
+    /** @param list<string>|null $ids */
+    private function branchFarm(string $column, ?array $ids): string
+    {
+        return match (true) {
+            $ids === null => 'CAST($farm_id AS VARCHAR)',
+            count($ids) === 1 => "CAST({$this->quote($ids[0])} AS VARCHAR)",
+            default => $column,
+        };
+    }
+
+    /** The grouping key a branch needs for `farm_id`: none when it holds one entity. */
+    private function branchKey(string $column, ?array $ids): string
+    {
+        return $ids !== null && count($ids) > 1 ? "{$column}, " : '';
     }
 
     /**
@@ -501,7 +560,7 @@ final class DataPipelineSqlBuilder
                     COALESCE(m.interval_index, 1) AS interval_index,
                     SUM(l.amount) AS amount
                 FROM ({$this->byDay($scan)}) l
-                LEFT JOIN months m ON l.date BETWEEN m.month_start AND m.month_end
+                LEFT JOIN days m ON m.date = l.date
                 GROUP BY 1, 2, 3
             ) s ON s.farm_id = e.farm_id AND s.account_id = e.account_id AND s.interval_index = e.interval_index
             SQL;
@@ -596,7 +655,7 @@ final class DataPipelineSqlBuilder
             LEFT JOIN (
                 SELECT j.farm_id, j.account_id, m.interval_index, SUM(j.amount) AS amount
                 FROM {$journals} j
-                JOIN months m ON j.date BETWEEN m.month_start AND m.month_end
+                JOIN days m ON m.date = j.date
                 GROUP BY 1, 2, 3
             ) j ON j.farm_id = c.farm_id AND j.account_id = c.account_id AND j.interval_index = c.interval_index
             SQL;
@@ -768,7 +827,7 @@ final class DataPipelineSqlBuilder
                     UNION ALL
                     SELECT farm_id, account_id, date, amount FROM overdraft_vj
                 ) j
-                JOIN months m ON j.date BETWEEN m.month_start AND m.month_end
+                JOIN days m ON m.date = j.date
                 GROUP BY 1, 2, 3
             ) j ON j.farm_id = c.farm_id AND j.account_id = c.account_id AND j.interval_index = c.interval_index
             SQL;
@@ -936,7 +995,7 @@ final class DataPipelineSqlBuilder
                     SUM(CASE WHEN a.account_class = 'EXPENSE' THEN l.amount ELSE 0 END) AS expenses
                 FROM ({$this->byDay('cye_scan')}) l
                 JOIN {$this->appAlias}.accounts a ON a.account_id = l.account_id
-                LEFT JOIN months m ON l.date BETWEEN m.month_start AND m.month_end
+                LEFT JOIN days m ON m.date = l.date
                 GROUP BY 1, 2
             ),
             cye AS (

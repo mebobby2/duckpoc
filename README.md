@@ -2912,6 +2912,8 @@ The first version collapsed every child's lines in one grouped scan with
 every line. One `UNION ALL` branch per child, each filtering and tagging with
 its own literal `farm_id`, removes that: 38% faster, the same totals to the
 cent. The account list reads the table the same way.
+(Two children are also two branches; at fifty children one branch each lost —
+see *Revised at fifty farms* below.)
 
 The third column is Figured's fan-out with the HTTP, the nested
 `AccountBalances` re-runs and the PHP combine taken away — the best that
@@ -2922,6 +2924,47 @@ statement is the work it does not do — no nested re-run per transfer source,
 no round trips, no merge — and that pipe 11 is a join, not a report. Its
 totals differ from the group's by design: pipe 21 runs for a single farm and is
 off for a reporting group.
+
+**Revised at fifty farms: two branches, not one per entity.** On `rg-50x10m` —
+fifty children of 10M lines, 500,021,800 in all, 25/25 stages — one branch per
+entity was 34% *slower* than the single grouped scan it had beaten on two
+children: fifty small aggregations cost more than the string hashing they
+avoid. So branches now hold several entities each (`farm_id IN (…)`, grouped
+by it), and the count was measured rather than chosen. Median of 3, twelve
+months unless noted, ms:
+
+| group | 1 branch | **2** | 3 | 4 | 5 | 1 per entity |
+|---|---|---|---|---|---|---|
+| 50 × 10M | 1,468 | **1,327** | 1,461 | 1,519 | 1,520 | 1,984 |
+| 50 × 10M, 360 months | 4,640 | **4,480** | — | — | 4,738 | 5,060 |
+| 10 × 1M | 207 | **171** | 183 | 197 | 239 (10) | 239 |
+| 1B + 500M | 2,913 | **1,792** | | | | 1,792 |
+
+Two was fastest in every group — over branches of 5M, 250M and 1B lines, so it
+is the count and not the size that matters here. Why two, and not more, is not
+established; `DataPipelineSqlBuilder::branches()` splits a group in halves and
+says the number is a measurement, not a model of DuckDB's scheduler. A single
+farm keeps its one branch with the bound parameter.
+
+Thirty years over fifty farms was ~4.5 s against ~1.3 s for twelve months.
+The profile named it: the three LEFT range joins that bucket lines into months
+(`date BETWEEN month_start AND month_end`) run as nested loops, and after the
+pass there are 2.9M (entity, account, day) rows — each compared with all 360
+months, three times, ~5 s of CPU. A day spine (`days`: every day of the
+period with its interval, ≤ 11k rows) takes the range join instead, and lines
+and journals meet it on `date =`:
+
+| 500M lines, every gate, median of 5 | before | after |
+|---|---|---|
+| `rg-50x10m`, 12 months | 1,327 ms | 1,349 ms |
+| `rg-50x10m`, 360 months | 5,171 ms | **2,776 ms** |
+| `pipeline-scale-1000m`, 360 months | 1,476 ms | 1,424 ms |
+
+Identical totals, 25/25 on both periods. What remains is the pass itself: of
+32.7 s of CPU, 29 s is scanning 500M lines (14.9), collapsing them to days
+(9.1) and the `farm_id IN (…)` check (3.3, which DuckDB runs as a per-row mark
+join — an `OR` chain and per-farm sub-scans both measured slower). The whole
+25-stage pipeline after it is ~3.5 s of CPU, the recursion 0.4 of that.
 
 **A realistic group — ten farms, a million lines each.**
 `duckdb:pipeline --seed-scale-group=1000000 --group-farms=10` seeds `rg-10x1m`
