@@ -87,22 +87,29 @@ final class OverdraftSqlBuilder
     {
         $fp = self::FIXED_POINT;
 
+        // Collapsed to account × day before the accounts join, which otherwise
+        // probes once per line (1.3 s at 483M lines, against ~0.5 s this way).
+        // The LIMIT is an optimiser fence, as in DataPipelineSqlBuilder::linesByDayCte().
         return <<<SQL
+            WITH by_day AS (
+                SELECT tl.account_id, tl.date, tl.type, count(*) AS n, SUM(tl.amount) AS amount
+                FROM {$this->alias}.transaction_lines tl
+                WHERE tl.farm_id = \$farm_id
+                  AND tl.basis = 'cash'
+                  AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
+                GROUP BY ALL
+                LIMIT 9223372036854775807
+            )
             SELECT
-                count(*) AS n,
-                count(DISTINCT tl.account_id) AS n_accounts,
-                min(tl.date) AS first_date,
-                max(tl.date) AS last_date,
-                SUM(-tl.amount) / {$fp}.0 AS net_cash
-            FROM {$this->alias}.transaction_lines tl
-            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
-            WHERE tl.farm_id = \$farm_id
-              AND tl.basis = 'cash'
-              AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
-              AND (
-                    (tl.date <= CAST(\$horizon AS DATE) AND tl.type = 'actuals')
-                 OR (tl.date >  CAST(\$horizon AS DATE) AND tl.type = 'forecast')
-              )
+                CAST(SUM(d.n) AS BIGINT) AS n,
+                count(DISTINCT d.account_id) AS n_accounts,
+                min(d.date) AS first_date,
+                max(d.date) AS last_date,
+                SUM(-d.amount) / {$fp}.0 AS net_cash
+            FROM by_day d
+            JOIN {$this->appAlias}.accounts a ON a.account_id = d.account_id
+            WHERE (d.date <= CAST(\$horizon AS DATE) AND d.type = 'actuals')
+               OR (d.date >  CAST(\$horizon AS DATE) AND d.type = 'forecast')
             SQL;
     }
 

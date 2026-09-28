@@ -47,6 +47,11 @@ class OverdraftReportController extends Controller
 
     public function __invoke(Request $request, DuckDB $db): View
     {
+        // max_execution_time counts CPU across every thread on Linux, and DuckDB
+        // runs on all sixteen cores: the 600 s limit is ~37 s of wall clock, and
+        // its hard kill takes the whole single-process `artisan serve` down.
+        set_time_limit(0);
+
         $alias = config('duckdb.attached_alias');
         $appAlias = config('duckdb.app_database.alias');
 
@@ -60,6 +65,9 @@ class OverdraftReportController extends Controller
         // gates are query parameters so the pipes can be switched from the
         // options panel. Defaults are a cash flow's.
         $all = $request->boolean('pipeline_all');
+        // check=0 runs the report statement once, without the transliteration
+        // and the 24 per-stage reruns — which at 500M lines are ~25x the report.
+        $check = $request->boolean('check', true);
         $options = new PipelineOptions(
             type: (string) $request->query('pipeline_type', 'actualsForecast'),
             basis: 'cash',
@@ -100,7 +108,7 @@ class OverdraftReportController extends Controller
                 $tracer?->start();
 
                 $pipeline = (new DataPipelineCheck($db, $alias, $appAlias))
-                    ->run($farmId, $periodFrom, $periodTo, $horizon, $options);
+                    ->run($farmId, $periodFrom, $periodTo, $horizon, $options, $check);
 
                 $reportRequests = $requests->connectionEvents();
                 $trace = $tracer?->collect();
@@ -141,6 +149,7 @@ class OverdraftReportController extends Controller
             'pipeline' => $pipeline,
             'options' => $options,
             'pipelineAll' => $all,
+            'check' => $check,
             'error' => $error,
             'serverMs' => $serverMs,
             'sql' => $pipeline['sql'] ?? null,

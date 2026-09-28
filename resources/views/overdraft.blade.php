@@ -28,6 +28,7 @@
 
     <form method="GET" class="mb-4 rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
         <input type="hidden" name="pipeline_type" value="{{ $options->type }}">
+        <input type="hidden" name="check" value="{{ $check ? 1 : 0 }}">
         @foreach (['ytd' => $options->ytd, 'exclude_eoy' => $options->excludeEoyJournals, 'opening_gst' => $options->includeOpeningBudgetGst, 'cye' => $options->calculateCurrentYearEarnings, 'retained' => $options->calculateRetained, 'expected_sign' => $options->showExpectedSign, 'dynamic_bank' => $options->dynamicBankAccount] as $k => $v)
             <input type="hidden" name="{{ $k }}" value="{{ $v ? 1 : 0 }}">
         @endforeach
@@ -104,7 +105,7 @@
             $odRow = $odKey === null ? [] : $final[$odKey];
             // Under YTD the interest row is already a running total; otherwise the period's total is the sum.
             $odTotal = $odRow === [] ? 0.0 : ($options->ytd ? (float) end($odRow) : array_sum($odRow));
-            $allPass = $pipeline['passed'] === count($pipeline['stages']);
+            $allPass = !$pipeline['checked'] || $pipeline['passed'] === count($pipeline['stages']);
         @endphp
 
         <div class="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
@@ -120,9 +121,14 @@
             </div>
             <div class="rounded-lg border {{ $allPass ? 'border-slate-200 bg-white' : 'border-red-300 bg-red-50' }} p-4 shadow-sm">
                 <p class="text-xs font-medium uppercase tracking-wide {{ $allPass ? 'text-slate-500' : 'text-red-700' }}">Check</p>
-                <p class="mt-1 text-2xl font-semibold tabular-nums">{{ $pipeline['passed'] }}/{{ count($pipeline['stages']) }}</p>
+                @if ($pipeline['checked'])
+                    <p class="mt-1 text-2xl font-semibold tabular-nums">{{ $pipeline['passed'] }}/{{ count($pipeline['stages']) }}</p>
+                @else
+                    <p class="mt-1 text-2xl font-semibold text-slate-400">off</p>
+                @endif
                 <p class="mt-1 text-xs {{ $allPass ? 'text-slate-500' : 'text-red-700' }}">
-                    @if ($serverMs !== null) page {{ number_format($serverMs, 0) }} ms @endif
+                    @if ($serverMs !== null) page {{ number_format($serverMs, 0) }} ms · @endif
+                    <a href="{{ request()->fullUrlWithQuery(['check' => $pipeline['checked'] ? 0 : 1]) }}" class="text-blue-700 underline">{{ $pipeline['checked'] ? 'turn check off' : 'turn check on' }}</a>
                 </p>
             </div>
         </div>
@@ -168,6 +174,7 @@
                 <input type="hidden" name="period_from" value="{{ $periodFrom }}">
                 <input type="hidden" name="period_to" value="{{ $periodTo }}">
                 <input type="hidden" name="horizon" value="{{ $horizon }}">
+                <input type="hidden" name="check" value="{{ $check ? 1 : 0 }}">
                 <label class="block">
                     <span class="mb-1 block text-xs font-medium text-slate-600">type</span>
                     <select name="pipeline_type" class="rounded border-slate-300 text-sm">
@@ -201,7 +208,11 @@
         <details class="mb-4 rounded-lg border border-slate-200 bg-white shadow-sm">
             <summary class="cursor-pointer px-5 py-3 text-sm font-medium text-slate-700">
                 Pipeline stages
-                <span class="ml-2 font-normal text-slate-500">{{ $pipeline['passed'] }}/{{ count($pipeline['stages']) }} match the transliteration · {{ number_format($pipeline['oracle_ms'], 0) }} ms oracle</span>
+                @if ($pipeline['checked'])
+                    <span class="ml-2 font-normal text-slate-500">{{ $pipeline['passed'] }}/{{ count($pipeline['stages']) }} match the transliteration · {{ number_format($pipeline['oracle_ms'], 0) }} ms oracle</span>
+                @else
+                    <span class="ml-2 font-normal text-slate-500">not checked — <code>check=0</code></span>
+                @endif
             </summary>
             @php
                 $pipeLabels = [

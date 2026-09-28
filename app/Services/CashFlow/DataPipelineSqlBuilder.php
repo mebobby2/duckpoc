@@ -74,6 +74,7 @@ final class DataPipelineSqlBuilder
 
         $ctes['farm'] = $this->farmCte();
         $ctes['months'] = $this->monthSpineCte();
+        $ctes['lines_by_day'] = $this->linesByDayCte();
         $ctes['report_accounts'] = $this->reportAccountsCte();
 
         $ctes['p01_empty'] = $this->p01Empty();
@@ -86,7 +87,11 @@ final class DataPipelineSqlBuilder
 
         // Pipe 8's inputs: the two virtual journal handlers that fire for a
         // cash flow, each over its own nested report.
-        $ctes['inner_scan'] = $this->scanCte($this->options->forOverdraftSubReport());
+        // Read three times below, so DuckDB materialises it: collapsed to days
+        // it is thousands of rows rather than every line in the period.
+        $ctes['inner_scan'] = "SELECT account_id, date, tag, SUM(amount) AS amount\n"
+            ."FROM (\n{$this->scanCte($this->options->forOverdraftSubReport())}\n) l\n"
+            .'GROUP BY account_id, date, tag';
         $ctes['inner_cells'] = $this->cellsCte('p01_empty', 'inner_scan', $this->options->forOverdraftSubReport());
         $ctes['gst_vj'] = $this->gstPaymentsRefundsVjCte();
         $ctes['inner_with_gst'] = $this->addJournalsCte('inner_cells', 'gst_vj');
@@ -115,18 +120,31 @@ final class DataPipelineSqlBuilder
 
         $parts = [];
         foreach ($ctes as $name => $body) {
-            $parts[] = "{$name} AS (\n{$body}\n)";
+            $materialized = $name === 'lines_by_day' ? ' MATERIALIZED' : '';
+            $parts[] = "{$name} AS{$materialized} (\n{$body}\n)";
         }
 
         // Pipes 2–6 are the scan — lines, not cells. Project them onto
         // intervals the way pipe 7 will, so every stage diffs the same shape.
         $select = in_array($stage, ['p02_scan', 'p03_mf_trackers', 'p04_mapped_in', 'p05_nesting', 'p06_query'], true)
             ? "SELECT l.account_id, COALESCE(m.interval_index, 1) AS interval_index, SUM(l.amount) AS amount\n"
-              ."FROM {$stage} l LEFT JOIN months m ON l.date BETWEEN m.month_start AND m.month_end\n"
+              ."FROM ({$this->byDay($stage)}) l LEFT JOIN months m ON l.date BETWEEN m.month_start AND m.month_end\n"
               ."GROUP BY 1, 2 ORDER BY 1, 2"
             : "SELECT account_id, interval_index, amount FROM {$stage} ORDER BY account_id, interval_index";
 
         return "WITH RECURSIVE\n".implode(",\n\n", $parts)."\n\n".$select;
+    }
+
+    /**
+     * Lines collapsed to one row per account and day before they meet the
+     * month spine. A LEFT range join cannot use DuckDB's IEJoin, so bucketing
+     * raw lines compares every line against every month — 500M lines over
+     * 348 months is ~174 billion comparisons. Days are bounded (~11k over 30
+     * years), so the range join then runs on thousands of rows at any volume.
+     */
+    private function byDay(string $lines): string
+    {
+        return "SELECT account_id, date, SUM(amount) AS amount FROM {$lines} GROUP BY account_id, date";
     }
 
     private function passThrough(string $previous): string
@@ -167,6 +185,65 @@ final class DataPipelineSqlBuilder
     }
 
     /**
+     * The farm's lines, read once and collapsed to one row per account, day,
+     * basis, type and tag. Every scan below — the report's, the overdraft
+     * sub-report's, the CYE and retained-earnings sub-reports' and the account
+     * list — used to read transaction_lines itself, six passes over the same
+     * files; 500M lines collapse to ~59k rows here, so the rest read those.
+     * Bounded to the period's financial year unless retained earnings needs
+     * the whole history — see readsWholeHistory().
+     *
+     * The LIMIT is an optimiser fence. Without it DuckDB pushes the OR of
+     * every consumer's predicate into the CTE and evaluates it per line —
+     * 21 s of CPU over 500M lines that all pass, since the consumers between
+     * them want everything. Each consumer filters the ~59k day rows instead.
+     */
+    private function linesByDayCte(): string
+    {
+        $bound = $this->readsWholeHistory()
+            ? ''
+            : "AND date >= {$this->financialYearStartOfPeriod()} AND date <= CAST(\$period_to AS DATE)";
+
+        return <<<SQL
+            SELECT farm_id, account_id, date, basis, type, tag, SUM(amount) AS amount
+            FROM {$this->alias}.transaction_lines
+            WHERE farm_id = \$farm_id
+              {$bound}
+            GROUP BY ALL
+            LIMIT 9223372036854775807
+            SQL;
+    }
+
+    /**
+     * Only retained earnings needs every season the farm has; without it no
+     * scan reads before the period's financial year, so the one pass stops
+     * at its start.
+     */
+    private function readsWholeHistory(): bool
+    {
+        return $this->options->calculateRetained;
+    }
+
+    /**
+     * The account list and the bank opening balance reach past the period on
+     * both sides. They read lines_by_day when it holds the whole history, and
+     * otherwise the table itself, as they did before it existed: each reads
+     * one or two columns, which is cheaper than widening the one pass.
+     */
+    private function farmHistory(): string
+    {
+        return $this->readsWholeHistory() ? 'lines_by_day' : "{$this->alias}.transaction_lines";
+    }
+
+    private function financialYearStartOfPeriod(): string
+    {
+        return "(SELECT MIN(CASE WHEN month(CAST(\$period_from AS DATE)) > financial_year_end_month
+                                THEN make_date(year(CAST(\$period_from AS DATE)), financial_year_end_month + 1, 1)
+                                ELSE make_date(year(CAST(\$period_from AS DATE)) - 1, financial_year_end_month + 1, 1) END)
+               FROM farm)";
+    }
+
+    /**
      * The report's account list: PrepareEmptyArray zeroes a cell for each.
      *
      * Figured is handed the list by the structure builder. Here it is every
@@ -179,13 +256,13 @@ final class DataPipelineSqlBuilder
         return <<<SQL
             SELECT DISTINCT account_id FROM (
                 SELECT tl.account_id
-                FROM {$this->alias}.transaction_lines tl
+                FROM {$this->farmHistory()} tl
                 WHERE tl.farm_id = \$farm_id
                 UNION ALL
                 SELECT a.mapped_to_account_id
                 FROM {$this->appAlias}.accounts a
                 WHERE a.mapped_to_account_id IS NOT NULL
-                  AND a.account_id IN (SELECT account_id FROM {$this->alias}.transaction_lines WHERE farm_id = \$farm_id)
+                  AND a.account_id IN (SELECT account_id FROM {$this->farmHistory()} WHERE farm_id = \$farm_id)
                 UNION ALL
                 SELECT a.account_id FROM {$this->appAlias}.accounts a WHERE a.system_account IS NOT NULL AND (a.farm_id IS NULL OR a.farm_id = \$farm_id)
             ) x
@@ -211,12 +288,7 @@ final class DataPipelineSqlBuilder
      */
     private function scanCte(PipelineOptions $o): string
     {
-        $from = $o->ytd
-            ? "(SELECT MIN(CASE WHEN month(CAST(\$period_from AS DATE)) > financial_year_end_month
-                                THEN make_date(year(CAST(\$period_from AS DATE)), financial_year_end_month + 1, 1)
-                                ELSE make_date(year(CAST(\$period_from AS DATE)) - 1, financial_year_end_month + 1, 1) END)
-               FROM farm)"
-            : 'CAST($period_from AS DATE)';
+        $from = $o->ytd ? $this->financialYearStartOfPeriod() : 'CAST($period_from AS DATE)';
 
         $eoy = $o->excludeEoyJournals
             ? "AND (tl.tag IS NULL OR tl.tag <> '".self::TAG_EOY."')"
@@ -229,7 +301,7 @@ final class DataPipelineSqlBuilder
                 tl.amount,
                 tl.tag,
                 tl.type
-            FROM {$this->alias}.transaction_lines tl
+            FROM lines_by_day tl
             WHERE tl.farm_id = \$farm_id
               AND tl.basis = '{$o->basis}'
               AND tl.date >= {$from}
@@ -259,7 +331,7 @@ final class DataPipelineSqlBuilder
                     l.account_id,
                     COALESCE(m.interval_index, 1) AS interval_index,
                     SUM(l.amount) AS amount
-                FROM {$scan} l
+                FROM ({$this->byDay($scan)}) l
                 LEFT JOIN months m ON l.date BETWEEN m.month_start AND m.month_end
                 GROUP BY 1, 2
             ) s ON s.account_id = e.account_id AND s.interval_index = e.interval_index
@@ -398,7 +470,7 @@ final class DataPipelineSqlBuilder
             ),
             opening AS (
                 SELECT COALESCE(SUM(tl.amount), 0) AS opening_balance
-                FROM {$this->alias}.transaction_lines tl
+                FROM {$this->farmHistory()} tl
                 JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
                 WHERE tl.farm_id = \$farm_id
                   AND tl.basis = 'cash'
@@ -611,7 +683,7 @@ final class DataPipelineSqlBuilder
                     COALESCE(m.interval_index, 1) AS interval_index,
                     SUM(CASE WHEN a.account_class = 'REVENUE' THEN l.amount ELSE 0 END) AS income,
                     SUM(CASE WHEN a.account_class = 'EXPENSE' THEN l.amount ELSE 0 END) AS expenses
-                FROM cye_scan l
+                FROM ({$this->byDay('cye_scan')}) l
                 JOIN {$this->appAlias}.accounts a ON a.account_id = l.account_id
                 LEFT JOIN months m ON l.date BETWEEN m.month_start AND m.month_end
                 GROUP BY 1
@@ -657,7 +729,7 @@ final class DataPipelineSqlBuilder
                     year(tl.date) + CASE WHEN month(tl.date) > f.financial_year_end_month THEN 1 ELSE 0 END AS season,
                     SUM(CASE WHEN a.account_class = 'REVENUE' THEN tl.amount ELSE 0 END)
                       - SUM(CASE WHEN a.account_class = 'EXPENSE' THEN tl.amount ELSE 0 END) AS net_profit
-                FROM {$this->alias}.transaction_lines tl
+                FROM lines_by_day tl
                 JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
                 CROSS JOIN farm f
                 WHERE tl.farm_id = \$farm_id

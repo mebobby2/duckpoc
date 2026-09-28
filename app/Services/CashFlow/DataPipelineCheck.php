@@ -28,15 +28,35 @@ final class DataPipelineCheck
      *     final: array<string, array<int, float>>,
      *     merged: array<string, array<int, int>>,
      *     months: list<string>,
+     *     checked: bool,
      *     passed: int,
-     *     oracle_ms: float,
+     *     oracle_ms: ?float,
      *     statement_ms: float,
      *     sql: string
      * }
      */
-    public function run(string $farmId, string $from, string $to, string $horizon, PipelineOptions $options): array
+    public function run(string $farmId, string $from, string $to, string $horizon, PipelineOptions $options, bool $check = true): array
     {
         $builder = new DataPipelineSqlBuilder($this->alias, $this->appAlias, $options);
+
+        if (!$check) {
+            $t = hrtime(true);
+            $final = $this->stage($builder, 'p24_format', $farmId, $from, $to, $horizon);
+            $statementMs = (hrtime(true) - $t) / 1e6;
+            ksort($final);
+
+            return [
+                'stages' => [],
+                'final' => $final,
+                'merged' => [],
+                'months' => $this->months($from, $to),
+                'checked' => false,
+                'passed' => 0,
+                'oracle_ms' => null,
+                'statement_ms' => $statementMs,
+                'sql' => $builder->build(),
+            ];
+        }
 
         $t = hrtime(true);
         $expected = (new DataPipelineOracle($this->db, $this->alias))->run($farmId, $from, $to, $horizon, $options);
@@ -82,6 +102,25 @@ final class DataPipelineCheck
         $this->stage($builder, 'p24_format', $farmId, $from, $to, $horizon);
         $statementMs = (hrtime(true) - $t) / 1e6;
 
+        ksort($final);
+        ksort($merged);
+
+        return [
+            'stages' => $stages,
+            'final' => $final,
+            'merged' => $merged,
+            'months' => $this->months($from, $to),
+            'checked' => true,
+            'passed' => $passed,
+            'oracle_ms' => $oracleMs,
+            'statement_ms' => $statementMs,
+            'sql' => $builder->build(),
+        ];
+    }
+
+    /** @return list<string> */
+    private function months(string $from, string $to): array
+    {
         $months = [];
         $cursor = strtotime(substr($from, 0, 7).'-01');
         $end = strtotime(substr($to, 0, 7).'-01');
@@ -90,19 +129,7 @@ final class DataPipelineCheck
             $cursor = strtotime(date('Y-m-d', $cursor).' +1 month');
         }
 
-        ksort($final);
-        ksort($merged);
-
-        return [
-            'stages' => $stages,
-            'final' => $final,
-            'merged' => $merged,
-            'months' => $months,
-            'passed' => $passed,
-            'oracle_ms' => $oracleMs,
-            'statement_ms' => $statementMs,
-            'sql' => $builder->build(),
-        ];
+        return $months;
     }
 
     /** @return array<string, array<int, int|float>> */

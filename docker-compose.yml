@@ -53,6 +53,7 @@ services:
   # round of wrong conclusions; verify a backend switch by stopping the backend.
   app-minio:
     profiles: [minio]
+    restart: unless-stopped
     build:
       context: .
       dockerfile: docker/php/Dockerfile
