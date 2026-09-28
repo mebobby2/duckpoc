@@ -37,7 +37,7 @@
         <h1 class="text-2xl font-semibold">Cash Flow — actuals + forecast</h1>
         <p class="mt-1 text-sm text-slate-600">
             Figured's <code class="rounded bg-slate-100 px-1">/reports/data/cash_flow?type=actualsForecast</code>
-            as one DuckDB statement over DuckLake on MinIO: the from/to period, the actuals/forecast horizon,
+            as {{ $engineLabel }}: the from/to period, the actuals/forecast horizon,
             the milk, GST and overdraft virtual journals, per-tracker sections, the section chain, the running balance
             and the Total column are all inside the SQL. PHP binds five parameters and pivots the result.
         </p>

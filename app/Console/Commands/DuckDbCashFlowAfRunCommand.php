@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Services\AlloyDb\CashFlowActualsForecastPgQuery;
 use App\Services\CashFlow\CashFlowActualsForecastFarmSeeder;
 use App\Services\CashFlow\CashFlowActualsForecastOptions;
 use App\Services\CashFlow\CashFlowActualsForecastOracleSeeder;
 use App\Services\CashFlow\CashFlowActualsForecastQuery;
+use App\Services\CashFlow\CashFlowActualsForecastReport;
 use App\Services\CashFlow\ReportPeriod;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -38,9 +40,10 @@ class DuckDbCashFlowAfRunCommand extends Command
         {--no-total : Drop the Total column}
         {--consolidated : No per-tracker blocks}
         {--repeats=1 : Timed runs}
-        {--sql : Print the statement}';
+        {--sql : Print the statement}
+        {--engine=duckdb : duckdb (DuckLake, from app-minio) or alloydb (from app-alloydb)}';
 
-    protected $description = 'Run the actuals-plus-forecast Cash Flow as one DuckDB statement, checking the oracle farm cell by cell';
+    protected $description = 'Run the actuals-plus-forecast Cash Flow as one statement on DuckLake or AlloyDB, checking the oracle farm cell by cell';
 
     private const int FIXED_POINT = 10000;
 
@@ -77,10 +80,21 @@ class DuckDbCashFlowAfRunCommand extends Command
         ],
     ];
 
-    public function handle(DuckDB $db): int
+    public function handle(): int
     {
-        $alias = config('duckdb.attached_alias');
-        $appAlias = config('duckdb.app_database.alias');
+        if (!in_array($this->option('engine'), ['duckdb', 'alloydb'], true)) {
+            $this->error('--engine must be duckdb or alloydb.');
+
+            return self::FAILURE;
+        }
+
+        // The oracle's overdraft pass writes its configuration through the
+        // default connection, which is AlloyDB only inside app-alloydb.
+        if ($this->option('engine') === 'alloydb' && config('database.default') !== 'alloydb') {
+            $this->error('Run --engine=alloydb from the app-alloydb container.');
+
+            return self::FAILURE;
+        }
 
         $farmId = (string) ($this->option('farm') ?: CashFlowActualsForecastOracleSeeder::FARM_ID);
         try {
@@ -99,7 +113,7 @@ class DuckDbCashFlowAfRunCommand extends Command
             withOverdraft: (bool) $this->option('with-overdraft'),
         );
 
-        $query = new CashFlowActualsForecastQuery($db, $alias, $appAlias, $options);
+        $query = $this->report($options);
 
         if ($this->option('sql')) {
             $this->line($query->sql());
@@ -137,13 +151,13 @@ class DuckDbCashFlowAfRunCommand extends Command
             return self::SUCCESS;
         }
 
-        return $this->checkOracle($db, $alias, $appAlias);
+        return $this->checkOracle();
     }
 
     /**
      * @param list<array<string, mixed>> $rows
      */
-    private function printReport(array $rows, CashFlowActualsForecastQuery $query): void
+    private function printReport(array $rows, CashFlowActualsForecastReport $query): void
     {
         $farm = array_values(array_filter($rows, static fn (array $r): bool => $r['scope'] === 'farm'));
         $this->line('');
@@ -200,25 +214,44 @@ class DuckDbCashFlowAfRunCommand extends Command
         return (int) (DB::table('farms')->where('farm_id', $farmId)->value('financial_year_end_month') ?? 12);
     }
 
-    private function checkOracle(DuckDB $db, string $alias, string $appAlias): int
+    private function report(CashFlowActualsForecastOptions $options): CashFlowActualsForecastReport
+    {
+        if ($this->option('engine') === 'alloydb') {
+            return new CashFlowActualsForecastPgQuery(DB::connection('alloydb'), $options);
+        }
+
+        return new CashFlowActualsForecastQuery(
+            app(DuckDB::class),
+            config('duckdb.attached_alias'),
+            config('duckdb.app_database.alias'),
+            $options,
+        );
+    }
+
+    private function checkOracle(): int
     {
         $farmId = CashFlowActualsForecastOracleSeeder::FARM_ID;
         $period = ReportPeriod::financialYear(CashFlowActualsForecastOracleSeeder::PERIOD_YEAR, $this->financialYearEndMonth($farmId));
         $horizon = CashFlowActualsForecastOracleSeeder::HORIZON;
-        $seeder = new CashFlowActualsForecastOracleSeeder($db, $alias);
+        // Only its overdraft toggles are used, and they write through the
+        // default connection; the lake handle is never touched on AlloyDB.
+        $seeder = new CashFlowActualsForecastOracleSeeder(
+            $this->option('engine') === 'alloydb' ? DuckDB::create() : app(DuckDB::class),
+            (string) config('duckdb.attached_alias'),
+        );
         $seeder->removeOverdraft();
 
         $failures = [];
 
         // Pass 1: the default request — EOY excluded, Total column, tracker blocks.
-        $rows = (new CashFlowActualsForecastQuery($db, $alias, $appAlias, new CashFlowActualsForecastOptions()))->run($farmId, $period, $horizon);
+        $rows = $this->report(new CashFlowActualsForecastOptions())->run($farmId, $period, $horizon);
         $expected = self::ORACLE;
         $failures = array_merge($failures, $this->diffFarm('eoy excluded', $rows, $expected, true));
         $failures = array_merge($failures, $this->diffTrackers('eoy excluded', $rows));
         $failures = array_merge($failures, $this->diffColumnTypes($rows));
 
         // Pass 2: EOY journals included — May's $900 wages adjustment appears.
-        $rows = (new CashFlowActualsForecastQuery($db, $alias, $appAlias, new CashFlowActualsForecastOptions(excludeEoyJournals: false)))->run($farmId, $period, $horizon);
+        $rows = $this->report(new CashFlowActualsForecastOptions(excludeEoyJournals: false))->run($farmId, $period, $horizon);
         $expected = self::ORACLE;
         foreach (['operating_expenses' => 900, 'operating_surplus' => -900, 'total_surplus' => -900, 'net_cash_movement' => -900, 'closing' => -900] as $field => $delta) {
             $expected[$field][11] += $delta;
@@ -227,7 +260,7 @@ class DuckDbCashFlowAfRunCommand extends Command
 
         // Pass 3: overdraft configured — interest accrues from November.
         $seeder->configureOverdraft();
-        $rows = (new CashFlowActualsForecastQuery($db, $alias, $appAlias, new CashFlowActualsForecastOptions(withOverdraft: true)))->run($farmId, $period, $horizon);
+        $rows = $this->report(new CashFlowActualsForecastOptions(withOverdraft: true))->run($farmId, $period, $horizon);
         $seeder->removeOverdraft();
         $failures = array_merge($failures, $this->diffFarm('overdraft', $rows, $this->withOverdraftInterest(self::ORACLE), true));
         $failures = array_merge($failures, $this->diffOverdraftRows($rows));

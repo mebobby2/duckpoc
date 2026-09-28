@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
+use App\Services\AlloyDb\CashFlowActualsForecastPgQuery;
 use App\Services\CashFlow\CashFlowActualsForecastFarmSeeder;
 use App\Services\CashFlow\CashFlowActualsForecastOptions;
 use App\Services\CashFlow\CashFlowActualsForecastQuery;
@@ -32,8 +33,18 @@ class CashFlowActualsForecastReportController extends Controller
 {
     private const int ROW_LIMIT = 300;
 
-    public function __invoke(Request $request, DuckDB $db): View
+    public const string ENGINE_DUCKDB = 'duckdb';
+    public const string ENGINE_ALLOYDB = 'alloydb';
+
+    /**
+     * One page for both engines, told apart by the route. The lake's
+     * connection is resolved only on the lake's route: resolving it attaches
+     * DuckLake, which cannot happen inside the AlloyDB stack.
+     */
+    public function __invoke(Request $request, string $engine = self::ENGINE_DUCKDB): View
     {
+        $onLake = $engine !== self::ENGINE_ALLOYDB;
+        $db = $onLake ? app(DuckDB::class) : null;
         $alias = config('duckdb.attached_alias');
         $appAlias = config('duckdb.app_database.alias');
 
@@ -57,7 +68,9 @@ class CashFlowActualsForecastReportController extends Controller
             withOverdraft: $request->boolean('with_overdraft', false),
         );
 
-        $query = new CashFlowActualsForecastQuery($db, $alias, $appAlias, $options);
+        $query = $onLake
+            ? new CashFlowActualsForecastQuery($db, $alias, $appAlias, $options)
+            : new CashFlowActualsForecastPgQuery(DB::connection('alloydb'), $options);
 
         $rows = [];
         $error = null;
@@ -83,25 +96,25 @@ class CashFlowActualsForecastReportController extends Controller
             $error = 'No farm seeded. Run: php artisan duckdb:cashflow-af:seed';
         } elseif ($period !== null) {
             try {
-                $requests = new StorageRequestProfile($db);
-                $requests->startLogging();
+                $requests = $onLake ? new StorageRequestProfile($db) : null;
+                $requests?->startLogging();
 
                 $startedAt = hrtime(true);
                 $rows = $query->run($farmId, $period, $horizon);
                 $elapsedMs = (hrtime(true) - $startedAt) / 1e6;
-                $reportRequests = $requests->connectionEvents();
+                $reportRequests = $requests?->connectionEvents();
 
                 $virtualJournalSummary = $query->virtualJournalSummary($farmId, $period, $horizon);
                 $virtualJournals = $query->virtualJournals($farmId, $period, $horizon, self::ROW_LIMIT);
                 $sourceSummary = $query->sourceRowSummary($farmId, $period, $horizon);
                 $sourceRows = $query->sourceRows($farmId, $period, $horizon, self::ROW_LIMIT);
 
-                if ($sourceSummary['period_from'] !== '') {
+                if ($onLake && $sourceSummary['period_from'] !== '') {
                     $files = (new ParquetFileLister($db, $alias))->forQuery($farm, $sourceSummary['period_from'], $sourceSummary['period_to']);
                     $storage = $requests->summarise($files);
                 }
 
-                if ($request->boolean('explain')) {
+                if ($onLake && $request->boolean('explain')) {
                     $profile = (new QueryProfiler($db))->profile($query->sql(), [
                         'farm_id' => $farmId,
                         'period_from' => $period->from,
@@ -118,6 +131,7 @@ class CashFlowActualsForecastReportController extends Controller
         [$farmRows, $trackerBlocks] = $this->split($rows);
 
         return view('cashflow-actuals-forecast', [
+            'engineLabel' => $onLake ? 'one DuckDB statement over DuckLake on MinIO' : 'one PostgreSQL statement on AlloyDB Omni, facts and dimensions in one database',
             'farms' => $farms,
             'farm' => $farm,
             'farmId' => $farmId,

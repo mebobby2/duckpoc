@@ -33,6 +33,13 @@ final class AlloyDbSchema
      */
     public const array COLUMNAR_COLUMNS = ['farm_id', 'basis', 'date', 'type', 'account_id', 'amount'];
 
+    /**
+     * The actuals-plus-forecast Cash Flow's scan groups on `tracker_id` and
+     * `tag` as well, and the engine can only aggregate inside the scan when
+     * every grouping key is in the store.
+     */
+    public const array CASH_FLOW_COLUMNAR_COLUMNS = [...self::COLUMNAR_COLUMNS, 'tracker_id', 'tag'];
+
     public function __construct(
         private readonly ConnectionInterface $db,
     ) {
@@ -145,6 +152,78 @@ final class AlloyDbSchema
                 tracker_id TEXT
             )
             SQL);
+
+        $this->ensureCashFlowActualsForecast();
+    }
+
+    /**
+     * What the actuals-plus-forecast Cash Flow needs on top of the Gross
+     * Margin and overdraft schema, mirroring the lake's MySQL migrations:
+     * the farm's balance date, account types and system accounts scoped per
+     * farm, milk payout rates and each milk tracker's income account, GST
+     * settings, and the journal line tag that marks EOY adjustments and GST
+     * settlements.
+     *
+     * Additive and idempotent, so it runs against a database already holding
+     * the Gross Margin farms without reloading them. A nullable column with
+     * no default is a catalog change in PostgreSQL, not a rewrite, even on a
+     * table of half a billion rows. It still needs an exclusive lock, and the
+     * columnar engine's background rebuild can hold that for minutes, so a
+     * lock timeout makes it fail fast instead of looking like a hang.
+     */
+    public function ensureCashFlowActualsForecast(): void
+    {
+        $this->db->statement("SET lock_timeout = '30s'");
+
+        $this->db->statement(<<<'SQL'
+            ALTER TABLE farms
+                ADD COLUMN IF NOT EXISTS financial_year_end_month SMALLINT NOT NULL DEFAULT 6,
+                ADD COLUMN IF NOT EXISTS country_code TEXT NOT NULL DEFAULT 'NZ'
+            SQL);
+
+        $this->db->statement(<<<'SQL'
+            ALTER TABLE accounts
+                ADD COLUMN IF NOT EXISTS farm_id TEXT,
+                ADD COLUMN IF NOT EXISTS account_type TEXT,
+                ADD COLUMN IF NOT EXISTS system_account TEXT,
+                ADD COLUMN IF NOT EXISTS mapped_to_account_id TEXT,
+                ADD COLUMN IF NOT EXISTS inverted_for_user BOOLEAN NOT NULL DEFAULT false,
+                ADD COLUMN IF NOT EXISTS is_gst_account BOOLEAN NOT NULL DEFAULT false,
+                ADD COLUMN IF NOT EXISTS is_default_bank_account BOOLEAN NOT NULL DEFAULT false
+            SQL);
+        $this->db->statement('CREATE INDEX IF NOT EXISTS accounts_farm_system_idx ON accounts (farm_id, system_account)');
+
+        $this->db->statement('ALTER TABLE trackers ADD COLUMN IF NOT EXISTS income_account_id TEXT');
+        $this->db->statement('ALTER TABLE transaction_lines ADD COLUMN IF NOT EXISTS tag TEXT');
+
+        $this->db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS gst_settings (
+                farm_id          TEXT PRIMARY KEY,
+                sales_tax_period TEXT NOT NULL DEFAULT 'TWOMONTHS',
+                sales_tax_basis  TEXT NOT NULL DEFAULT 'PAYMENTS'
+            )
+            SQL);
+
+        $this->db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS milk_payout_rates (
+                id            BIGSERIAL PRIMARY KEY,
+                tracker_id    TEXT NOT NULL,
+                month         DATE NOT NULL,
+                advance_rate  BIGINT NOT NULL,
+                deferred_rate BIGINT NOT NULL,
+                UNIQUE (tracker_id, month)
+            )
+            SQL);
+
+        // The scan's grouping keys are far from independent: 1B lines hold a
+        // few thousand (date, account, tracker) combinations, but multiplying
+        // per-column estimates told the planner 3.35M groups for a 413-group
+        // range. It then gathered 30M raw rows into one aggregate instead of
+        // letting each worker's column store sum its share: 4.2 s against
+        // 0.27 s. Filled in by the ANALYZE that index() runs.
+        $this->db->statement('CREATE STATISTICS IF NOT EXISTS transaction_lines_scan_groups (ndistinct) ON date, account_id, tracker_id FROM transaction_lines');
+
+        $this->db->statement('RESET lock_timeout');
     }
 
     public function dropIndex(): void
@@ -201,11 +280,12 @@ final class AlloyDbSchema
      * where this approach stops scaling, and it is the number the ceiling test
      * is really hunting.
      *
+     * @param list<string> $columns
      * @return list<array<string, mixed>>
      */
-    public function columnarize(bool $forceRefresh = false): array
+    public function columnarize(bool $forceRefresh = false, array $columns = self::COLUMNAR_COLUMNS): array
     {
-        foreach (self::COLUMNAR_COLUMNS as $column) {
+        foreach ($columns as $column) {
             $this->db->statement(
                 "SELECT google_columnar_engine_add('transaction_lines', ?)",
                 [$column]

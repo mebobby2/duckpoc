@@ -12,7 +12,7 @@ use Saturio\DuckDB\Type\Type;
  * Runs the actuals-plus-forecast Cash Flow. Prepares, binds, executes;
  * the report's meaning is in the definition and its SQL in the builder.
  */
-final class CashFlowActualsForecastQuery
+final class CashFlowActualsForecastQuery implements CashFlowActualsForecastReport
 {
     private readonly CashFlowActualsForecastReportDefinition $definition;
 

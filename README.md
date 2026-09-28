@@ -228,7 +228,8 @@ enough volume for multiple row groups, i.e. the 800K scale test.
 | `duckdb:hero:seed` | Seeds the hero stress-test farm — 50 trackers over 30 years, `--rows=` (default 10M) |
 | `duckdb:hero:bench` | Report time on the hero farm across widening period windows |
 | `duckdb:cashflow-af:seed` | Seeds the actuals-plus-forecast oracle farm and the 13-milk-tracker dairy farm, `--lines=` (default 200K) |
-| `duckdb:cashflow-af:run` | Runs the actuals-plus-forecast Cash Flow as one statement; on the oracle farm checks 687 cells across three passes |
+| `duckdb:cashflow-af:run` | Runs the actuals-plus-forecast Cash Flow as one statement (`--engine=duckdb\|alloydb`); on the oracle farm checks 687 cells across three passes |
+| `alloydb:cashflow-af:seed` | Seeds the same Cash Flow farms into AlloyDB with the lake's seeders, through DuckDB's postgres extension |
 
 The root URL (`/`) is an index of the reports below.
 
@@ -1423,6 +1424,91 @@ handler), and `accounts.farm_id`, so a farm's GST, GST-payments and overdraft
 system accounts resolve to *its* accounts. The `DataPipelineSqlBuilder` and
 `DataPipelineOracle` lookups were scoped to `farm_id IS NULL OR farm_id =
 $farm_id` at the same time; the pipeline check still passes all 24 stages.
+
+## Cash Flow actuals + forecast on AlloyDB
+
+The same report on AlloyDB Omni: `/alloydb/cashflow-actuals-plus-forecast` on
+`:8082`, and `duckdb:cashflow-af:run --engine=alloydb` from `app-alloydb`.
+
+**One statement, translated, not copied.** `CashFlowActualsForecastPgSqlBuilder`
+takes the lake builder's output and applies a short list of dialect rules
+(`$param` to `:param`, `INTERVAL 1 MONTH`, `strftime`, `month()`/`year()`,
+`arg_min`/`arg_max`, `DOUBLE`), and refuses any DuckDB-only construct it has
+no rule for. A change to the lake's statement reaches AlloyDB automatically.
+The one deliberate difference is the scan's shape, a builder parameter
+(`CashFlowActualsForecastScanShape`), below. The lake's statements are
+unchanged by it, checked text-for-text against the committed builder.
+
+**Identical data, not a second generator.** `alloydb:cashflow-af:seed` runs the
+lake's own seeders with DuckDB's postgres extension attached as the schema
+alias, so the generated lines are the same rows the lake holds. Dimensions go
+through the default connection, which is AlloyDB in `app-alloydb`. That makes
+the comparison exact: every AlloyDB report below is **byte-identical** to the
+lake's, 52 tracker blocks included, and the 687-cell oracle passes.
+
+```bash
+docker compose --profile alloydb up -d
+docker compose exec app-alloydb php artisan alloydb:cashflow-af:seed \
+    --farm=cfaf-dairy-nz --lines=500000000 --milk-trackers=40 --stock-trackers=12 --columnar
+docker compose exec app-alloydb php artisan duckdb:cashflow-af:run --engine=alloydb   # oracle
+docker compose exec app-alloydb php artisan duckdb:cashflow-af:run --engine=alloydb --farm=cfaf-dairy-nz
+```
+
+The load, beside the ~522M Gross Margin rows already in the table: 500M lines
+in 567 s (~880K rows/s over binary `COPY`), the index rebuilt over all ~1.02B
+rows in 589 s, and the column store filled with the report's eight columns in
+29 min. Those eight columns for 1.02B rows use 8.7 GB of the 9 GB budget, so
+**a 1B-line farm would not fit** beside what is there.
+
+### What the column store needed
+
+The first run took 248 s (no column store) and then 110 s (six of the eight
+columns in the store: a query only uses it when every column it touches is
+held). With all eight, 32 s — the store filtered but did not aggregate, and
+streamed 125M rows up to PostgreSQL. Four changes, each found in a plan:
+
+| change | FY2027 statement |
+|---|---|
+| all eight columns in the store | 110 s → 32 s |
+| scan split: GST settlements apart, everything else untagged, grouped by (date, account, tracker); horizon as the `OR` | 32 s → 2.0 s |
+| opening balance: bank account ids as `= ANY (ARRAY(...))` instead of a join | 2.0 s → 1.07 s |
+| `CREATE STATISTICS (ndistinct)` on (date, account, tracker) | partial range 3.9 s → 0.33 s |
+| `max_parallel_workers` 16 for the report's session (DuckDB uses 16 threads) | 1.07 s → 0.33 s |
+
+- **`tag` as a grouping key stops aggregation inside the scan**, and so does the
+  horizon written as a `CASE` — the opposite of DuckDB, where the `CASE` was the
+  fast form. The statement only ever asks whether a line is a GST settlement,
+  so summing settlements apart and everything else untagged changes no figure.
+- **A join above the scan** makes the store hand every row up. The opening
+  balance read ~375M earlier lines to find one bank line (1.03 s against 44 ms).
+- **The planner's group estimate** for a partial range was 3.35M against 413
+  real groups, so it skipped the per-worker aggregate. Extended statistics
+  put it at ~22K and the plan comes back.
+- **Two parallel workers by default.** Raised per session, not server-wide, so
+  the Gross Margin measurements above keep their settings.
+
+### Results, 500M lines, 52 trackers
+
+Statement time, three runs each. AlloyDB's column store is memory-resident,
+so every AlloyDB run is served from memory; the lake figures are cold, a fresh
+process reading MinIO each time.
+
+| request | AlloyDB | DuckDB lake |
+|---|---|---|
+| FY2027 | 0.44 / 0.34 / 0.33 s | 0.69 s (before the `CASE` change) |
+| FY2027, overdraft | 0.32 / 0.31 / 0.31 s | 0.59 s |
+| whole farm, 2023-06-01 → 2027-05-31 | 1.47 / 1.46 / 1.45 s | 1.33 s |
+| 2026-06-15 → 2026-09-10 | 0.12 / 0.12 / 0.12 s | 0.44 s (before the `CASE` change) |
+
+The page's diagnostics are slow on AlloyDB (11.5 s for FY2027, 44 s for the
+whole farm, against a 0.40 s and 1.56 s statement): the source-line listing
+reads `line_id`, which is not in the column store, from the heap.
+
+**Do not drop a relation from the column store while it is populating.** The
+drop warned `Relation is pinned`, and afterwards `_add` reported columns as
+present that `g_columnar_columns` did not list, and `_refresh` said the
+relation did not exist. A restart restored a consistent state; a drop after
+population finished, then one `_add` of every column, filled all eight.
 
 ## The Cash Flow parity oracle (Phase 1, Step 2)
 

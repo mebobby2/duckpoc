@@ -58,6 +58,7 @@ final class CashFlowActualsForecastSqlBuilder
         private readonly string $alias,
         private readonly string $appAlias,
         private readonly CashFlowActualsForecastOptions $options,
+        private readonly CashFlowActualsForecastScanShape $scanShape = CashFlowActualsForecastScanShape::DuckDb,
     ) {
     }
 
@@ -303,12 +304,19 @@ final class CashFlowActualsForecastSqlBuilder
      * tags dropped with a `$nin`.
      */
     /**
-     * The horizon split is written as one comparison against a `CASE`
-     * rather than Figured's `(actuals AND on-or-before) OR (forecast AND
-     * after)`. The two select the same lines, but DuckDB evaluates the `OR`
-     * as two passes over every row: on the 1B-line farm the grouped scan
-     * took 3.2 s with it and 1.8 s without.
+     * Actuals on or before the horizon, forecast after it. The two spellings
+     * select the same lines; which one is fast depends on the engine, see
+     * CashFlowActualsForecastScanShape. On DuckDB the `OR` took the 1B-line
+     * grouped scan from 1.8 s to 3.2 s.
      */
+    private function horizonPredicate(): string
+    {
+        return match ($this->scanShape) {
+            CashFlowActualsForecastScanShape::DuckDb => "tl.type = CASE WHEN tl.date <= CAST(\$horizon AS DATE) THEN 'actuals' ELSE 'forecast' END",
+            CashFlowActualsForecastScanShape::AlloyDbColumnar => "((tl.date <= CAST(\$horizon AS DATE) AND tl.type = 'actuals') OR (tl.date > CAST(\$horizon AS DATE) AND tl.type = 'forecast'))",
+        };
+    }
+
     private function scanPredicate(): string
     {
         $eoy = $this->options->excludeEoyJournals
@@ -319,7 +327,7 @@ final class CashFlowActualsForecastSqlBuilder
             WHERE tl.farm_id = \$farm_id
               AND tl.basis = \$basis
               AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
-              AND tl.type = CASE WHEN tl.date <= CAST(\$horizon AS DATE) THEN 'actuals' ELSE 'forecast' END
+              AND {$this->horizonPredicate()}
             {$eoy}
             SQL;
     }
@@ -335,6 +343,24 @@ final class CashFlowActualsForecastSqlBuilder
      */
     private function scanCte(): string
     {
+        if ($this->scanShape === CashFlowActualsForecastScanShape::AlloyDbColumnar) {
+            $pay = self::TAG_GST_PAYMENT;
+
+            return <<<SQL
+                SELECT tl.date, tl.account_id, tl.tracker_id, CAST(NULL AS VARCHAR) AS tag, CAST(SUM(tl.amount) AS BIGINT) AS amount
+                FROM {$this->alias}.transaction_lines tl
+                {$this->scanPredicate()}
+                  AND (tl.tag IS NULL OR tl.tag <> '{$pay}')
+                GROUP BY tl.date, tl.account_id, tl.tracker_id
+                UNION ALL
+                SELECT tl.date, tl.account_id, tl.tracker_id, '{$pay}' AS tag, CAST(SUM(tl.amount) AS BIGINT) AS amount
+                FROM {$this->alias}.transaction_lines tl
+                {$this->scanPredicate()}
+                  AND tl.tag = '{$pay}'
+                GROUP BY tl.date, tl.account_id, tl.tracker_id
+                SQL;
+        }
+
         return <<<SQL
             SELECT tl.date, tl.account_id, tl.tracker_id, tl.tag, CAST(SUM(tl.amount) AS BIGINT) AS amount
             FROM {$this->alias}.transaction_lines tl
@@ -351,15 +377,27 @@ final class CashFlowActualsForecastSqlBuilder
      */
     private function openingCte(): string
     {
+        // On AlloyDB the join to accounts sits above the scan, so the column
+        // store can only filter the farm's earlier lines (~375M on the 500M
+        // farm) and hand every one of them up to be joined: 1.03 s to find
+        // one bank line. The bank account ids as an array are evaluated once
+        // and filter inside the scan instead: 44 ms, same balance.
+        $bank = $this->scanShape === CashFlowActualsForecastScanShape::AlloyDbColumnar
+            ? "tl.account_id = ANY (ARRAY(SELECT account_id FROM {$this->appAlias}.accounts WHERE account_type = 'BANK'))"
+            : null;
+
+        $join = $bank === null ? "JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id" : '';
+        $bankFilter = $bank ?? "a.account_type = 'BANK'";
+
         return <<<SQL
             SELECT COALESCE(SUM(tl.amount), 0) AS opening_balance
             FROM {$this->alias}.transaction_lines tl
-            JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
+            {$join}
             WHERE tl.farm_id = \$farm_id
               AND tl.basis = \$basis
-              AND a.account_type = 'BANK'
+              AND {$bankFilter}
               AND tl.date < CAST(\$period_from AS DATE)
-              AND tl.type = CASE WHEN tl.date <= CAST(\$horizon AS DATE) THEN 'actuals' ELSE 'forecast' END
+              AND {$this->horizonPredicate()}
             SQL;
     }
 

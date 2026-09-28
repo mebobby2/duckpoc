@@ -15,6 +15,9 @@ use Illuminate\Support\Facades\Route;
 Route::view('/', 'reports')->name('reports');
 Route::get('/cashflow', CashFlowReportController::class)->name('cashflow');
 Route::get('/cashflow-actuals-plus-forecast', CashFlowActualsForecastReportController::class)->name('cashflow-actuals-plus-forecast');
+Route::get('/alloydb/cashflow-actuals-plus-forecast', CashFlowActualsForecastReportController::class)
+    ->defaults('engine', CashFlowActualsForecastReportController::ENGINE_ALLOYDB)
+    ->name('alloydb-cashflow-actuals-plus-forecast');
 Route::get('/tracker-cashflow', TrackerCashFlowReportController::class)->name('tracker-cashflow');
 Route::get('/gross-margin', GrossMarginReportController::class)->name('gross-margin');
 Route::get('/gross-margin-v2', GrossMarginV2ReportController::class)->name('gross-margin-v2');
