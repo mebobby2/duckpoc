@@ -56,9 +56,11 @@ final class OverdraftSqlBuilder
      * "why is this expense reducing the balance" is the first question anyone
      * asks of this table.
      */
-    public function buildSourceRowsSql(): string
+    /** @param list<string> $farmIds a reporting group's child entities; empty for the bound farm */
+    public function buildSourceRowsSql(array $farmIds = []): string
     {
         $fp = self::FIXED_POINT;
+        $farms = $this->farmPredicate($farmIds);
 
         return <<<SQL
             SELECT
@@ -71,7 +73,7 @@ final class OverdraftSqlBuilder
                 -tl.amount / {$fp}.0 AS cash_effect
             FROM {$this->alias}.transaction_lines tl
             JOIN {$this->appAlias}.accounts a ON a.account_id = tl.account_id
-            WHERE tl.farm_id = \$farm_id
+            WHERE {$farms}
               AND tl.basis = 'cash'
               AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
               AND (
@@ -83,9 +85,11 @@ final class OverdraftSqlBuilder
             SQL;
     }
 
-    public function buildSourceSummarySql(): string
+    /** @param list<string> $farmIds a reporting group's child entities; empty for the bound farm */
+    public function buildSourceSummarySql(array $farmIds = []): string
     {
         $fp = self::FIXED_POINT;
+        $farms = $this->farmPredicate($farmIds);
 
         // Collapsed to account × day before the accounts join, which otherwise
         // probes once per line (1.3 s at 483M lines, against ~0.5 s this way).
@@ -94,7 +98,7 @@ final class OverdraftSqlBuilder
             WITH by_day AS (
                 SELECT tl.account_id, tl.date, tl.type, count(*) AS n, SUM(tl.amount) AS amount
                 FROM {$this->alias}.transaction_lines tl
-                WHERE tl.farm_id = \$farm_id
+                WHERE {$farms}
                   AND tl.basis = 'cash'
                   AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
                 GROUP BY ALL
@@ -111,6 +115,16 @@ final class OverdraftSqlBuilder
             WHERE (d.date <= CAST(\$horizon AS DATE) AND d.type = 'actuals')
                OR (d.date >  CAST(\$horizon AS DATE) AND d.type = 'forecast')
             SQL;
+    }
+
+    /** @param list<string> $farmIds */
+    private function farmPredicate(array $farmIds): string
+    {
+        if ($farmIds === []) {
+            return 'tl.farm_id = $farm_id';
+        }
+
+        return 'tl.farm_id IN ('.implode(', ', array_map(static fn (string $id): string => "'".str_replace("'", "''", $id)."'", $farmIds)).')';
     }
 
     public function build(): string

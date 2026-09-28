@@ -100,9 +100,13 @@
         @php
             $months = $pipeline['months'];
             $final = $pipeline['final'];
-            $odKey = null;
-            foreach (array_keys($final) as $acc) { if (str_contains($acc, 'od-interest')) { $odKey = $acc; } }
-            $odRow = $odKey === null ? [] : $final[$odKey];
+            // Every entity's interest row: a reporting group has one per child.
+            $odRow = [];
+            foreach ($final as $acc => $byIdx) {
+                if (str_contains($acc, 'od-interest')) {
+                    foreach ($byIdx as $idx => $v) { $odRow[$idx] = ($odRow[$idx] ?? 0.0) + $v; }
+                }
+            }
             // Under YTD the interest row is already a running total; otherwise the period's total is the sum.
             $odTotal = $odRow === [] ? 0.0 : ($options->ytd ? (float) end($odRow) : array_sum($odRow));
             $allPass = !$pipeline['checked'] || $pipeline['passed'] === count($pipeline['stages']);
@@ -150,7 +154,7 @@
                         @endforeach
                     </tr>
                     @foreach ($final as $acc => $cells)
-                        @if ($acc === $odKey) @continue @endif
+                        @if (str_contains($acc, 'od-interest')) @continue @endif
                         <tr>
                             <td class="sticky left-0 z-10 bg-white px-4 py-1.5 font-mono text-xs text-slate-600">{{ $acc }}</td>
                             @foreach ($months as $i => $m)
@@ -224,16 +228,19 @@
                     'p16_ytd' => 'FixYearToDateValues', 'p17_contra_gst' => 'ContraGstPaymentsRefunds', 'p18_expected_sign' => 'ShowExpectedSign',
                     'p19_inverse' => 'InverseAmounts', 'p20_consolidate' => 'ReportingGroupConsolidateAccounts', 'p21_dynamic_bank' => 'DynamicBankBalance',
                     'p22_hide_empty' => 'HideEmpty', 'p23_hide_accounts' => 'HideEmptyAccounts', 'p24_format' => 'FormatCells',
+                    'p25_combine' => 'CombineReports',
                 ];
                 $pipeNotes = [
-                    'p03_mf_trackers' => 'pass-through', 'p11_offsets' => 'pass-through', 'p20_consolidate' => 'pass-through',
+                    'p03_mf_trackers' => 'no tracking filter to widen', 'p11_offsets' => 'reporting groups', 'p20_consolidate' => 'reporting groups',
+                    'p25_combine' => 'after DataPipeline',
                     'p12_gst_payments' => 'disabled in Figured', 'p17_contra_gst' => 'disabled in Figured',
                     'p22_hide_empty' => 'display only', 'p23_hide_accounts' => 'display only',
                 ];
                 $gateOf = [
                     'p09_opening_bank' => $options->type === 'budget', 'p10_opening_gst' => $options->type === 'budget' && $options->ytd && $options->includeOpeningBudgetGst,
                     'p14_cye' => $options->calculateCurrentYearEarnings, 'p15_retained' => $options->calculateRetained, 'p16_ytd' => $options->ytd,
-                    'p18_expected_sign' => $options->showExpectedSign, 'p19_inverse' => false, 'p21_dynamic_bank' => $options->dynamicBankAccount,
+                    'p18_expected_sign' => $options->showExpectedSign, 'p19_inverse' => false, 'p21_dynamic_bank' => $options->dynamicBankAccount && !$options->isReportingGroup(),
+                    'p11_offsets' => $options->isReportingGroup() && $options->mergedAccounts, 'p20_consolidate' => $options->isReportingGroup() && $options->consolidateAccounts,
                 ];
             @endphp
             <div class="overflow-x-auto border-t border-slate-200">

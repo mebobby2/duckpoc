@@ -36,10 +36,11 @@ final class OverdraftQuery
     /**
      * @return list<array<string, mixed>>
      */
-    public function sourceRows(string $farmId, string $periodFrom, string $periodTo, string $horizon, int $limit): array
+    /** @param list<string> $farmIds a reporting group's child entities; empty for `$farmId` alone */
+    public function sourceRows(string $farmId, string $periodFrom, string $periodTo, string $horizon, int $limit, array $farmIds = []): array
     {
-        $statement = $this->db->preparedStatement($this->builder()->buildSourceRowsSql());
-        $this->bindScope($statement, $farmId, $periodFrom, $periodTo, $horizon);
+        $statement = $this->db->preparedStatement($this->builder()->buildSourceRowsSql($farmIds));
+        $this->bindScope($statement, $farmId, $periodFrom, $periodTo, $horizon, bindFarm: $farmIds === []);
         $statement->bindParam('row_limit', $limit, Type::DUCKDB_TYPE_BIGINT);
 
         return iterator_to_array($statement->execute()->rows(true));
@@ -48,10 +49,11 @@ final class OverdraftQuery
     /**
      * @return array<string, mixed>
      */
-    public function sourceSummary(string $farmId, string $periodFrom, string $periodTo, string $horizon): array
+    /** @param list<string> $farmIds a reporting group's child entities; empty for `$farmId` alone */
+    public function sourceSummary(string $farmId, string $periodFrom, string $periodTo, string $horizon, array $farmIds = []): array
     {
-        $statement = $this->db->preparedStatement($this->builder()->buildSourceSummarySql());
-        $this->bindScope($statement, $farmId, $periodFrom, $periodTo, $horizon);
+        $statement = $this->db->preparedStatement($this->builder()->buildSourceSummarySql($farmIds));
+        $this->bindScope($statement, $farmId, $periodFrom, $periodTo, $horizon, bindFarm: $farmIds === []);
 
         foreach ($statement->execute()->rows(true) as $row) {
             return (array) $row;
@@ -70,14 +72,18 @@ final class OverdraftQuery
         return new OverdraftSqlBuilder($this->alias, $this->appAlias);
     }
 
-    private function bindScope(object $statement, string $farmId, string $periodFrom, string $periodTo, string $horizon): void
+    /**
+     * `$bindFarm` is false when the statement names a reporting group's
+     * entities inline: DuckDB refuses to bind a parameter the SQL lacks.
+     */
+    private function bindScope(object $statement, string $farmId, string $periodFrom, string $periodTo, string $horizon, bool $bindFarm = true): void
     {
-        foreach ([
-            'farm_id' => $farmId,
-            'period_from' => $periodFrom,
-            'period_to' => $periodTo,
-            'horizon' => $horizon,
-        ] as $parameter => $value) {
+        $params = ['period_from' => $periodFrom, 'period_to' => $periodTo, 'horizon' => $horizon];
+        if ($bindFarm) {
+            $params = ['farm_id' => $farmId] + $params;
+        }
+
+        foreach ($params as $parameter => $value) {
             $statement->bindParam($parameter, $value, Type::DUCKDB_TYPE_VARCHAR);
         }
     }

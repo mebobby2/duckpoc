@@ -101,7 +101,8 @@ final class ParquetFileLister
 
             $year = (int) substr($m[3], strlen('year='));
 
-            $inScope = $m[1] === 'farm_id='.$farm['farm_id']
+            // A reporting group reads every child entity's partitions.
+            $inScope = in_array(substr($m[1], strlen('farm_id=')), $farm['farm_ids'] ?? [$farm['farm_id']], true)
                 && $year >= $fromYear
                 && $year <= $toYear;
         }

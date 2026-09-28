@@ -41,7 +41,7 @@ final class DataPipelineCheck
 
         if (!$check) {
             $t = hrtime(true);
-            $final = $this->stage($builder, 'p24_format', $farmId, $from, $to, $horizon);
+            $final = $this->stage($builder, 'p25_combine', $farmId, $from, $to, $horizon);
             $statementMs = (hrtime(true) - $t) / 1e6;
             ksort($final);
 
@@ -70,7 +70,7 @@ final class DataPipelineCheck
         foreach (DataPipelineSqlBuilder::STAGES as $stage) {
             try {
                 $t = hrtime(true);
-                $actual = $this->stage($builder, $stage, $farmId, $from, $to, $horizon);
+                $actual = $this->stage($builder, $stage, $farmId, $from, $to, $horizon, $options->isReportingGroup());
                 $ms = (hrtime(true) - $t) / 1e6;
             } catch (Throwable $e) {
                 $stages[] = ['stage' => $stage, 'cells' => 0, 'ms' => 0.0, 'ok' => false, 'detail' => substr($e->getMessage(), 0, 160)];
@@ -85,12 +85,12 @@ final class DataPipelineCheck
                 continue;
             }
 
-            $detail = $this->diff($actual, $expected[$stage] ?? [], $stage === 'p24_format');
+            $detail = $this->diff($actual, $expected[$stage] ?? [], self::isDeflated($stage));
             $ok = $detail === null;
             $passed += $ok ? 1 : 0;
             $stages[] = ['stage' => $stage, 'cells' => count($actual, COUNT_RECURSIVE) - count($actual), 'ms' => $ms, 'ok' => $ok, 'detail' => $detail];
 
-            if ($stage === 'p24_format') {
+            if ($stage === 'p25_combine') {
                 $final = $actual;
             }
             if ($stage === 'p08_merge_vj') {
@@ -99,7 +99,7 @@ final class DataPipelineCheck
         }
 
         $t = hrtime(true);
-        $this->stage($builder, 'p24_format', $farmId, $from, $to, $horizon);
+        $this->stage($builder, 'p25_combine', $farmId, $from, $to, $horizon);
         $statementMs = (hrtime(true) - $t) / 1e6;
 
         ksort($final);
@@ -132,17 +132,31 @@ final class DataPipelineCheck
         return $months;
     }
 
-    /** @return array<string, array<int, int|float>> */
-    private function stage(DataPipelineSqlBuilder $builder, string $stage, string $farmId, string $from, string $to, string $horizon): array
+    /** Pipe 24 onwards carry dollars, compared with a tolerance; earlier stages are exact integers. */
+    public static function isDeflated(string $stage): bool
+    {
+        return in_array($stage, ['p24_format', 'p25_combine'], true);
+    }
+
+    /**
+     * One stage's rows as `[key][interval_index] => amount`. The key is the
+     * account, or `entity|account` for a reporting group's per-entity stages
+     * — the transliteration's snapshots are keyed the same way.
+     *
+     * @return array<string, array<int, int|float>>
+     */
+    public function stage(DataPipelineSqlBuilder $builder, string $stage, string $farmId, string $from, string $to, string $horizon, bool $reportingGroup = false): array
     {
         $statement = $this->db->preparedStatement($builder->build($stage));
         foreach (['farm_id' => $farmId, 'period_from' => $from, 'period_to' => $to, 'horizon' => $horizon] as $p => $v) {
             $statement->bindParam($p, $v, Type::DUCKDB_TYPE_VARCHAR);
         }
 
+        $perEntity = $reportingGroup && $stage !== 'p25_combine';
         $out = [];
         foreach ($statement->execute()->rows(true) as $row) {
-            $out[(string) $row['account_id']][(int) (string) $row['interval_index']] = $stage === 'p24_format'
+            $key = $perEntity ? $row['farm_id'].'|'.$row['account_id'] : (string) $row['account_id'];
+            $out[$key][(int) (string) $row['interval_index']] = self::isDeflated($stage)
                 ? (float) (string) $row['amount']
                 : (int) (string) $row['amount'];
         }
@@ -150,7 +164,7 @@ final class DataPipelineCheck
         return $out;
     }
 
-    private function diff(array $actual, array $expected, bool $float): ?string
+    public function diff(array $actual, array $expected, bool $float): ?string
     {
         foreach ($expected as $id => $byIdx) {
             foreach ($byIdx as $idx => $want) {

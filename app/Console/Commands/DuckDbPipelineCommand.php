@@ -5,14 +5,17 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Services\CashFlow\CashFlowSchema;
+use App\Services\CashFlow\DataPipelineCheck;
 use App\Services\CashFlow\DataPipelineOracle;
 use App\Services\CashFlow\DataPipelineSqlBuilder;
 use App\Services\CashFlow\PipelineOptions;
 use App\Services\CashFlow\PipelineOracleSeeder;
 use App\Services\CashFlow\PipelineScaleSeeder;
+use App\Services\CashFlow\ReportingGroupEntities;
+use App\Services\CashFlow\ReportingGroupScaleSeeder;
+use App\Services\CashFlow\ReportingGroupSeeder;
 use Illuminate\Console\Command;
 use Saturio\DuckDB\DuckDB;
-use Saturio\DuckDB\Type\Type;
 use Throwable;
 
 /**
@@ -46,7 +49,12 @@ class DuckDbPipelineCommand extends Command
         {--seed : Seed the pipeline oracle farm first}
         {--scale= : Seed pipeline-scale-<N> with about N lines and run against it}
         {--accounts=0 : With --scale, spread expense lines across this many extra accounts}
-        {--show= : Print this stage as a table (e.g. p24_format)}';
+        {--show= : Print this stage as a table (e.g. p25_combine)}
+        {--seed-group : Seed the reporting-group oracle (a parent and two child entities) and run against its parent}
+        {--seed-scale-group= : Seed a reporting group of --group-farms children, about this many lines each, and run against its parent}
+        {--group-farms=10 : With --seed-scale-group, how many child entities}
+        {--no-offsets : mergedAccounts off — pipe 11 passes through}
+        {--no-consolidate : consolidateAccounts off — pipe 20 passes through}';
 
     protected $description = "Run Figured's DataPipeline as one statement and check every stage against the PHP transliteration";
 
@@ -63,6 +71,25 @@ class DuckDbPipelineCommand extends Command
         }
 
         $farmId = (string) ($this->option('farm') ?: PipelineOracleSeeder::FARM_ID);
+
+        if ($this->option('seed-group')) {
+            (new CashFlowSchema($db, $alias, $appAlias))->addTagColumn();
+            $n = (new ReportingGroupSeeder($db, $alias))->seed();
+            $farmId = ReportingGroupSeeder::PARENT;
+            $this->line("  seeded {$farmId} (".implode(', ', ReportingGroupSeeder::CHILDREN).") with {$n} lines");
+            $this->line('');
+        }
+
+        if ($this->option('seed-scale-group')) {
+            (new CashFlowSchema($db, $alias, $appAlias))->addTagColumn();
+            $farms = (int) $this->option('group-farms');
+            $perFarm = (int) $this->option('seed-scale-group');
+            $t = hrtime(true);
+            $n = (new ReportingGroupScaleSeeder($db, $alias))->seed($farms, $perFarm);
+            $farmId = ReportingGroupScaleSeeder::parentId($farms, $perFarm);
+            $this->line(sprintf('  seeded %s: %d children, %s lines in %.1f s', $farmId, $farms, number_format($n), (hrtime(true) - $t) / 1e9));
+            $this->line('');
+        }
 
         if ($this->option('scale')) {
             $target = (int) $this->option('scale');
@@ -91,11 +118,23 @@ class DuckDbPipelineCommand extends Command
             showExpectedSign: $all || (bool) $this->option('expected-sign'),
             inverse: (bool) $this->option('inverse'),
             dynamicBankAccount: $all || (bool) $this->option('dynamic-bank'),
+            mergedAccounts: !$this->option('no-offsets'),
+            consolidateAccounts: !$this->option('no-consolidate'),
         );
+        $entities = ReportingGroupEntities::for($farmId);
+        if ($entities !== []) {
+            $options = $options->forReportingGroup($entities);
+        }
 
         $this->info(sprintf('DataPipeline — %s, %s to %s (horizon %s), %s, %s', $farmId, $from, $to, $horizon, $options->type, $options->basis));
         $this->line('  gates: '.$this->gates($options));
+        if ($entities !== []) {
+            $this->line('  reporting group: '.implode(', ', $entities));
+        }
         $this->line('');
+
+        $check = new DataPipelineCheck($db, $alias, $appAlias);
+        $group = $options->isReportingGroup();
 
         $builder = new DataPipelineSqlBuilder($alias, $appAlias, $options);
 
@@ -110,7 +149,7 @@ class DuckDbPipelineCommand extends Command
         foreach (DataPipelineSqlBuilder::STAGES as $stage) {
             try {
                 $t = hrtime(true);
-                $actual = $this->runStage($db, $builder, $stage, $farmId, $from, $to, $horizon);
+                $actual = $check->stage($builder, $stage, $farmId, $from, $to, $horizon, $group);
                 $ms = (hrtime(true) - $t) / 1e6;
                 $sqlMs += $ms;
             } catch (Throwable $e) {
@@ -125,7 +164,7 @@ class DuckDbPipelineCommand extends Command
                 continue;
             }
 
-            $diff = $this->diff($actual, $expected[$stage] ?? [], $stage === 'p24_format');
+            $diff = $check->diff($actual, $expected[$stage] ?? [], DataPipelineCheck::isDeflated($stage));
             if ($diff === null) {
                 $this->line(sprintf('  %-20s %5d %8.1f  pass', $stage, count($actual), $ms));
             } else {
@@ -135,58 +174,15 @@ class DuckDbPipelineCommand extends Command
         }
 
         $this->line('');
-        $this->line(sprintf('  statement, all 24 stages   %8.1f ms (sum of per-stage runs)', $sqlMs));
+        $this->line(sprintf('  statement, all %d stages   %8.1f ms (sum of per-stage runs)', count(DataPipelineSqlBuilder::STAGES), $sqlMs));
         $this->line(sprintf('  PHP transliteration        %8.1f ms', $oracleMs));
 
         if ($this->option('show')) {
             $this->line('');
-            $this->show($this->runStage($db, $builder, (string) $this->option('show'), $farmId, $from, $to, $horizon));
+            $this->show($check->stage($builder, (string) $this->option('show'), $farmId, $from, $to, $horizon, $group));
         }
 
         return $failed === 0 ? self::SUCCESS : self::FAILURE;
-    }
-
-    /** @return array<string, array<int, int|float>> */
-    private function runStage(DuckDB $db, DataPipelineSqlBuilder $builder, string $stage, string $farmId, string $from, string $to, string $horizon): array
-    {
-        $statement = $db->preparedStatement($builder->build($stage));
-        foreach (['farm_id' => $farmId, 'period_from' => $from, 'period_to' => $to, 'horizon' => $horizon] as $p => $v) {
-            $statement->bindParam($p, $v, Type::DUCKDB_TYPE_VARCHAR);
-        }
-
-        $out = [];
-        foreach ($statement->execute()->rows(true) as $row) {
-            $out[(string) $row['account_id']][(int) (string) $row['interval_index']] = $stage === 'p24_format'
-                ? (float) (string) $row['amount']
-                : (int) (string) $row['amount'];
-        }
-
-        return $out;
-    }
-
-    private function diff(array $actual, array $expected, bool $float): ?string
-    {
-        foreach ($expected as $id => $byIdx) {
-            foreach ($byIdx as $idx => $want) {
-                $got = $actual[$id][$idx] ?? null;
-                if ($got === null) {
-                    return "missing {$id}[{$idx}] (want {$want})";
-                }
-                $same = $float ? abs($got - $want) < 1e-6 : $got === $want;
-                if (!$same) {
-                    return "{$id}[{$idx}] got {$got} want {$want}";
-                }
-            }
-        }
-        foreach ($actual as $id => $byIdx) {
-            foreach ($byIdx as $idx => $got) {
-                if (!isset($expected[$id][$idx]) && $got != 0) {
-                    return "unexpected {$id}[{$idx}] = {$got}";
-                }
-            }
-        }
-
-        return null;
     }
 
     private function gates(PipelineOptions $o): string

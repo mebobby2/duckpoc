@@ -22,6 +22,12 @@ use Saturio\DuckDB\DuckDB;
  * then does everything else in PHP. Checking SQL against SQL would only prove
  * the statement is self-consistent; the point is that this loop and that
  * statement agree.
+ *
+ * A reporting-group report runs the pipes once per child entity on the
+ * parent's financial year, as Figured's per-child requests do, except that
+ * pipe 11 needs every entity's pipe 10 first — so the entities go through
+ * pipes 1–10 together, then 11, then 12–24, then `CombineReports`. A stage's
+ * snapshot is then keyed `entity|account`.
  */
 final class DataPipelineOracle
 {
@@ -38,6 +44,14 @@ final class DataPipelineOracle
 
     private int $fyEndMonth = 6;
 
+    /** The entity whose state the pipes below are reading. */
+    private string $entity = '';
+
+    /**
+     * @var array<string, array{lines: list<array<string, mixed>>, accounts: array<string, array<string, mixed>>}>
+     */
+    private array $state = [];
+
     public function __construct(
         private readonly DuckDB $db,
         private readonly string $alias,
@@ -49,68 +63,232 @@ final class DataPipelineOracle
      */
     public function run(string $farmId, string $from, string $to, string $horizon, PipelineOptions $o): array
     {
-        $this->load($farmId, $from, $to);
-
-        $snap = [];
-        $data = $this->p01Empty();
-        $snap['p01_empty'] = $data;
-
-        $scan = $this->scan($from, $to, $horizon, $o);
-        foreach (['p02_scan', 'p03_mf_trackers', 'p04_mapped_in', 'p05_nesting', 'p06_query'] as $s) {
-            $snap[$s] = $this->scanAsCells($scan, $from);
+        $entities = $o->isReportingGroup() ? $o->reportingGroupEntities : [$farmId];
+        $this->fyEndMonth = (int) (DB::table('farms')->where('farm_id', $farmId)->value('financial_year_end_month') ?? 6);
+        $this->buildMonths($from, $to);
+        foreach ($entities as $entity) {
+            $this->load($entity);
         }
 
-        $data = $this->cells($data, $scan, $from);
-        $snap['p07_cells'] = $data;
-
+        /** @var array<string, array<string, array<string, array<int, int|float>>>> $byEntity stage => entity => data */
+        $byEntity = [];
+        $data = [];
         $inner = $o->forOverdraftSubReport();
-        $innerScan = $this->scan($from, $to, $horizon, $inner);
-        $innerCells = $this->cells($this->p01Empty(), $innerScan, $from);
-        $gstVj = $this->gstPaymentsRefundsVj($innerScan);
-        $innerWithGst = $this->addJournals($innerCells, $gstVj);
-        $innerCashflow = $this->innerCashFlow($innerWithGst, $farmId, $from, $horizon);
-        $odVj = $this->overdraftVj($innerCashflow, $farmId, $to);
+        $innerWithGst = [];
+        $gstVjs = [];
 
-        $data = $this->addJournals($this->addJournals($data, $gstVj), $odVj);
-        $snap['p08_merge_vj'] = $data;
+        foreach ($entities as $e) {
+            $this->use($e);
+            $data[$e] = $this->p01Empty();
+            $byEntity['p01_empty'][$e] = $data[$e];
 
-        $data = $this->openingBank($data, $farmId, $o);
-        $snap['p09_opening_bank'] = $data;
-        $data = $this->openingGst($data, $farmId, $o);
-        $snap['p10_opening_gst'] = $data;
-        $snap['p11_offsets'] = $data;
-        $snap['p12_gst_payments'] = $data;
-        $data = $this->mergeMapped($data);
-        $snap['p13_merge_mapped'] = $data;
-        $data = $this->currentYearEarnings($data, $from, $to, $horizon, $o);
-        $snap['p14_cye'] = $data;
-        $data = $this->retainedEarnings($data, $to, $horizon, $o);
-        $snap['p15_retained'] = $data;
-        $data = $this->ytd($data, $o);
-        $snap['p16_ytd'] = $data;
-        $snap['p17_contra_gst'] = $data;
-        $data = $this->expectedSign($data, $o);
-        $snap['p18_expected_sign'] = $data;
-        $data = $this->inverse($data, $o);
-        $snap['p19_inverse'] = $data;
-        $snap['p20_consolidate'] = $data;
-        $data = $this->dynamicBank($data, $o);
-        $snap['p21_dynamic_bank'] = $data;
-        $snap['p22_hide_empty'] = $data;
-        $snap['p23_hide_accounts'] = $data;
-        $snap['p24_format'] = $this->format($data);
+            $scan = $this->scan($from, $to, $horizon, $o);
+            foreach (['p02_scan', 'p03_mf_trackers', 'p04_mapped_in', 'p05_nesting', 'p06_query'] as $st) {
+                $byEntity[$st][$e] = $this->scanAsCells($scan, $from);
+            }
+
+            $data[$e] = $this->cells($data[$e], $scan, $from);
+            $byEntity['p07_cells'][$e] = $data[$e];
+
+            $innerScan = $this->scan($from, $to, $horizon, $inner);
+            $gstVjs[$e] = $this->gstPaymentsRefundsVj($innerScan);
+            $innerWithGst[$e] = $this->addJournals($this->cells($this->p01Empty(), $innerScan, $from), $gstVjs[$e]);
+        }
+
+        // The overdraft sub-report is a pipeline of its own: in a reporting
+        // group its pipes 11 and 20 run too, across the same entities.
+        $innerCells = $this->consolidate($this->offsets($innerWithGst, $farmId, $inner), $farmId, $inner);
+
+        foreach ($entities as $e) {
+            $this->use($e);
+            $innerCashflow = $this->innerCashFlow($innerCells[$e], $e, $from, $horizon);
+            $odVj = $this->overdraftVj($innerCashflow, $e, $to);
+
+            $data[$e] = $this->addJournals($this->addJournals($data[$e], $gstVjs[$e]), $odVj);
+            $byEntity['p08_merge_vj'][$e] = $data[$e];
+            $data[$e] = $this->openingBank($data[$e], $e, $o);
+            $byEntity['p09_opening_bank'][$e] = $data[$e];
+            $data[$e] = $this->openingGst($data[$e], $e, $o);
+            $byEntity['p10_opening_gst'][$e] = $data[$e];
+        }
+
+        $data = $this->offsets($data, $farmId, $o);
+        $byEntity['p11_offsets'] = $data;
+
+        foreach ($entities as $e) {
+            $this->use($e);
+            $byEntity['p12_gst_payments'][$e] = $data[$e];
+            $data[$e] = $this->mergeMapped($data[$e]);
+            $byEntity['p13_merge_mapped'][$e] = $data[$e];
+            $data[$e] = $this->currentYearEarnings($data[$e], $from, $to, $horizon, $o);
+            $byEntity['p14_cye'][$e] = $data[$e];
+            $data[$e] = $this->retainedEarnings($data[$e], $to, $horizon, $o);
+            $byEntity['p15_retained'][$e] = $data[$e];
+            $data[$e] = $this->ytd($data[$e], $o);
+            $byEntity['p16_ytd'][$e] = $data[$e];
+            $byEntity['p17_contra_gst'][$e] = $data[$e];
+            $data[$e] = $this->expectedSign($data[$e], $o);
+            $byEntity['p18_expected_sign'][$e] = $data[$e];
+            $data[$e] = $this->inverse($data[$e], $o);
+            $byEntity['p19_inverse'][$e] = $data[$e];
+        }
+
+        $data = $this->consolidate($data, $farmId, $o);
+        $byEntity['p20_consolidate'] = $data;
+
+        foreach ($entities as $e) {
+            $this->use($e);
+            $data[$e] = $this->dynamicBank($data[$e], $o);
+            $byEntity['p21_dynamic_bank'][$e] = $data[$e];
+            $byEntity['p22_hide_empty'][$e] = $data[$e];
+            $byEntity['p23_hide_accounts'][$e] = $data[$e];
+            $data[$e] = $this->format($data[$e]);
+            $byEntity['p24_format'][$e] = $data[$e];
+        }
+
+        $snap = [];
+        foreach ($byEntity as $stage => $perEntity) {
+            $snap[$stage] = $this->keyed($perEntity, $o->isReportingGroup());
+        }
+        $snap['p25_combine'] = $this->combine($data);
 
         return $snap;
     }
 
-    private function load(string $farmId, string $from, string $to): void
+    /**
+     * One entity's data as the stage's table: keyed by account for a single
+     * farm, `entity|account` for a reporting group, as the command keys the
+     * statement's rows.
+     *
+     * @param array<string, array<string, array<int, int|float>>> $perEntity
+     * @return array<string, array<int, int|float>>
+     */
+    private function keyed(array $perEntity, bool $group): array
     {
-        $farm = DB::table('farms')->where('farm_id', $farmId)->first();
-        $this->fyEndMonth = (int) ($farm->financial_year_end_month ?? 6);
+        $out = [];
+        foreach ($perEntity as $entity => $accounts) {
+            foreach ($accounts as $id => $byIdx) {
+                $out[$group ? "{$entity}|{$id}" : $id] = $byIdx;
+            }
+        }
 
-        $this->accounts = [];
-        foreach (DB::table('accounts')->where(fn ($q) => $q->whereNull('farm_id')->orWhere('farm_id', $farmId))->get() as $a) {
-            $this->accounts[(string) $a->account_id] = (array) $a;
+        return $out;
+    }
+
+    /**
+     * `CombineReports`: the finished reports summed by account and interval.
+     *
+     * @param array<string, array<string, array<int, float>>> $data
+     * @return array<string, array<int, float>>
+     */
+    private function combine(array $data): array
+    {
+        $out = [];
+        foreach ($data as $accounts) {
+            foreach ($accounts as $id => $byIdx) {
+                foreach ($byIdx as $idx => $amt) {
+                    $out[$id][$idx] = ($out[$id][$idx] ?? 0.0) + $amt;
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Pipe 11: inter-entity transfers — the rule the builder's CTE states.
+     *
+     * @param array<string, array<string, array<int, int>>> $data entity => data
+     * @return array<string, array<string, array<int, int>>>
+     */
+    private function offsets(array $data, string $parentId, PipelineOptions $o): array
+    {
+        if (!$o->isReportingGroup() || !$o->mergedAccounts) {
+            return $data;
+        }
+        $transfers = DB::table('merged_accounts')->where('parent_farm_id', $parentId)
+            ->whereIn('from_farm_id', $o->reportingGroupEntities)
+            ->whereIn('to_farm_id', $o->reportingGroupEntities)
+            ->get();
+
+        $additions = [];
+        $zero = [];
+        foreach ($transfers as $t) {
+            $from = (string) $t->from_farm_id;
+            $fromAccount = (string) $t->from_account_id;
+            if (!isset($data[$from][$fromAccount])) {
+                continue;
+            }
+            foreach ($data[$from] as $id => $byIdx) {
+                $mapped = $this->state[$from]['accounts'][$id]['mapped_to_account_id'] ?? null;
+                if ($id !== $fromAccount && $mapped !== $fromAccount) {
+                    continue;
+                }
+                $zero[$from][$id] = true;
+                foreach ($byIdx as $idx => $amt) {
+                    $additions[(string) $t->to_farm_id][(string) $t->to_account_id][$idx] =
+                        ($additions[(string) $t->to_farm_id][(string) $t->to_account_id][$idx] ?? 0) + $amt;
+                }
+            }
+        }
+
+        foreach ($data as $entity => $accounts) {
+            foreach ($accounts as $id => $byIdx) {
+                foreach ($byIdx as $idx => $amt) {
+                    $data[$entity][$id][$idx] = isset($zero[$entity][$id])
+                        ? 0
+                        : $amt + ($additions[$entity][$id][$idx] ?? 0);
+                }
+            }
+        }
+
+        return $data;
+    }
+
+    /**
+     * Pipe 20: consolidated accounts — old zeroed, new gains its cells.
+     *
+     * @param array<string, array<string, array<int, int>>> $data entity => data
+     * @return array<string, array<string, array<int, int>>>
+     */
+    private function consolidate(array $data, string $parentId, PipelineOptions $o): array
+    {
+        if (!$o->isReportingGroup() || !$o->consolidateAccounts) {
+            return $data;
+        }
+        $consolidations = DB::table('consolidated_accounts')->where('parent_farm_id', $parentId)
+            ->distinct()->get(['old_account_id', 'new_account_id']);
+
+        foreach ($data as $entity => $accounts) {
+            foreach ($consolidations as $c) {
+                $old = (string) $c->old_account_id;
+                $new = (string) $c->new_account_id;
+                if (!isset($accounts[$old])) {
+                    continue;
+                }
+                foreach ($data[$entity][$old] as $idx => $amt) {
+                    $data[$entity][$new][$idx] = ($data[$entity][$new][$idx] ?? 0) + $amt;
+                    $data[$entity][$old][$idx] = 0;
+                }
+            }
+        }
+
+        return $data;
+    }
+
+    /** Switch the pipes to one entity's lines and accounts. */
+    private function use(string $entity): void
+    {
+        $this->entity = $entity;
+        $this->lines = $this->state[$entity]['lines'];
+        $this->accounts = $this->state[$entity]['accounts'];
+    }
+
+    private function load(string $farmId): void
+    {
+        $accounts = [];
+        foreach (DB::table('accounts')->where(fn ($q) => $q->whereNull('farm_id')->orWhere('farm_id', $farmId))->orderBy('account_id')->get() as $a) {
+            $accounts[(string) $a->account_id] = (array) $a;
         }
 
         // Lines are read pre-bucketed by (account, month, type, tag). Every
@@ -120,7 +298,7 @@ final class DataPipelineOracle
         // SUM is the only thing that has happened to it. A million lines
         // become a few thousand rows and the transliteration stays a
         // transliteration at volume.
-        $this->lines = [];
+        $lines = [];
         $sql = sprintf(
             "SELECT account_id, CAST(date_trunc('month', date) AS VARCHAR) AS date, SUM(amount) AS amount, tag, type
              FROM %s.transaction_lines WHERE farm_id = '%s'
@@ -129,7 +307,7 @@ final class DataPipelineOracle
             str_replace("'", "''", $farmId),
         );
         foreach ($this->db->query($sql)->rows(true) as $r) {
-            $this->lines[] = [
+            $lines[] = [
                 'account_id' => (string) $r['account_id'],
                 'date' => substr((string) $r['date'], 0, 10),
                 'amount' => (int) (string) $r['amount'],
@@ -138,6 +316,12 @@ final class DataPipelineOracle
             ];
         }
 
+        $this->state[$farmId] = ['lines' => $lines, 'accounts' => $accounts];
+    }
+
+    /** The month spine, on the report farm's financial year. */
+    private function buildMonths(string $from, string $to): void
+    {
         $this->months = [];
         $cursor = strtotime(substr($from, 0, 7).'-01');
         $end = strtotime(substr($to, 0, 7).'-01');
@@ -184,10 +368,8 @@ final class DataPipelineOracle
                 $ids[(string) $mapped] = true;
             }
         }
-        foreach ($this->accounts as $id => $a) {
-            if (($a['system_account'] ?? null) !== null) {
-                $ids[$id] = true;
-            }
+        foreach ($this->systemAccounts() as $id) {
+            $ids[$id] = true;
         }
         ksort($ids);
 
@@ -261,15 +443,46 @@ final class DataPipelineOracle
         return $data;
     }
 
+    /**
+     * The entity's account of one system kind: its own before a global one,
+     * then the lowest id — the builder's `sys_accounts` rule.
+     */
     private function systemAccount(string $system): ?string
     {
-        foreach ($this->accounts as $id => $a) {
-            if (($a['system_account'] ?? null) === $system) {
-                return $id;
+        return $this->systemAccounts()[$system] ?? null;
+    }
+
+    /** @return array<string, string> system kind => account id */
+    private function systemAccounts(): array
+    {
+        $chosen = [];
+        foreach ([true, false] as $farmSpecific) {
+            foreach ($this->accounts as $id => $a) {
+                $kind = $a['system_account'] ?? null;
+                if ($kind === null || isset($chosen[$kind]) || (($a['farm_id'] ?? null) !== null) !== $farmSpecific) {
+                    continue;
+                }
+                $chosen[(string) $kind] = (string) $id;
             }
         }
 
-        return null;
+        return $chosen;
+    }
+
+    /**
+     * The default bank among the entity's report accounts, its own first —
+     * the builder's `entity_accounts.bank_id` rule.
+     */
+    private function defaultBank(): ?string
+    {
+        $candidates = array_values(array_filter(
+            $this->reportAccounts(),
+            fn (string $id): bool => (bool) ($this->accounts[$id]['is_default_bank_account'] ?? false),
+        ));
+        usort($candidates, fn (string $a, string $b): int => [($this->accounts[$a]['farm_id'] ?? null) === null, $a]
+            <=> [($this->accounts[$b]['farm_id'] ?? null) === null, $b]);
+
+        return $candidates[0] ?? null;
     }
 
     /**
@@ -441,12 +654,7 @@ final class DataPipelineOracle
         if ($o->type !== 'budget') {
             return $data;
         }
-        $bank = null;
-        foreach ($this->accounts as $id => $a) {
-            if ($a['is_default_bank_account']) {
-                $bank = $id;
-            }
-        }
+        $bank = $this->defaultBank();
         $re = $this->systemAccount('RETAINED_EARNINGS');
         $seen = [];
         foreach ($this->months as $m) {
@@ -648,15 +856,10 @@ final class DataPipelineOracle
     /** Pipe 21. */
     private function dynamicBank(array $data, PipelineOptions $o): array
     {
-        if (!$o->dynamicBankAccount) {
+        if (!$o->dynamicBankAccount || $o->isReportingGroup()) {
             return $data;
         }
-        $bank = null;
-        foreach ($this->accounts as $id => $a) {
-            if ($a['is_default_bank_account']) {
-                $bank = $id;
-            }
-        }
+        $bank = $this->defaultBank();
         $liability = $this->systemAccount('LIABILITY');
         if ($bank === null || $liability === null || !isset($data[$bank], $data[$liability])) {
             return $data;

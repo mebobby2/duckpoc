@@ -11,6 +11,7 @@ use App\Services\CashFlow\OverdraftQuery;
 use App\Services\CashFlow\ParquetFileLister;
 use App\Services\CashFlow\QueryProfiler;
 use App\Services\CashFlow\QueryTrace;
+use App\Services\CashFlow\ReportingGroupEntities;
 use App\Services\CashFlow\StorageRequestProfile;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -55,7 +56,7 @@ class OverdraftReportController extends Controller
         $alias = config('duckdb.attached_alias');
         $appAlias = config('duckdb.app_database.alias');
 
-        $farms = $this->farmsWithOverdrafts();
+        $farms = $this->reportableFarms();
         $farmId = (string) $request->query('farm_id', $farms[0]['farm_id'] ?? OverdraftOracleSeeder::FARM_ID);
         $periodFrom = (string) $request->query('period_from', self::DEFAULT_PERIOD_FROM);
         $periodTo = (string) $request->query('period_to', self::DEFAULT_PERIOD_TO);
@@ -80,6 +81,10 @@ class OverdraftReportController extends Controller
             showExpectedSign: $all || $request->boolean('expected_sign'),
             dynamicBankAccount: $all || $request->boolean('dynamic_bank'),
         );
+        $entities = ReportingGroupEntities::for($farmId);
+        if ($entities !== []) {
+            $options = $options->forReportingGroup($entities);
+        }
 
         // The lines behind the report share the pipeline scan's predicate —
         // farm, cash basis, period, horizon — so the Phase 3 query's listing
@@ -98,7 +103,7 @@ class OverdraftReportController extends Controller
         $sourceRowsMs = null;
 
         if ($farms === []) {
-            $error = 'No farm has an overdraft configured. Run: php artisan duckdb:pipeline --seed';
+            $error = 'No farm has an overdraft or a reporting group. Run: php artisan duckdb:pipeline --seed';
         } else {
             try {
                 $requests = new StorageRequestProfile($db);
@@ -114,12 +119,13 @@ class OverdraftReportController extends Controller
                 $trace = $tracer?->collect();
 
                 $startedAt = microtime(true);
-                $sourceSummary = $scope->sourceSummary($farmId, $periodFrom, $periodTo, $horizon);
-                $sourceRows = $scope->sourceRows($farmId, $periodFrom, $periodTo, $horizon, self::SOURCE_ROW_LIMIT);
+                // A reporting group's lines are its children's; the parent has none.
+                $sourceSummary = $scope->sourceSummary($farmId, $periodFrom, $periodTo, $horizon, $entities);
+                $sourceRows = $scope->sourceRows($farmId, $periodFrom, $periodTo, $horizon, self::SOURCE_ROW_LIMIT, $entities);
                 $sourceRowsMs = (microtime(true) - $startedAt) * 1000;
 
                 $files = (new ParquetFileLister($db, $alias))->forQuery(
-                    ['farm_id' => $farmId, 'farm_type' => 'dairy', 'region' => $this->regionFor($farms, $farmId)],
+                    ['farm_id' => $farmId, 'farm_ids' => $entities ?: [$farmId], 'farm_type' => 'dairy', 'region' => $this->regionFor($farms, $farmId)],
                     $periodFrom,
                     $periodTo,
                 );
@@ -211,16 +217,25 @@ class OverdraftReportController extends Controller
     /**
      * @return list<array<string, mixed>>
      */
-    private function farmsWithOverdrafts(): array
+    /**
+     * Farms with an overdraft, plus reporting-group parents: a parent has no
+     * overdraft of its own, but its children's interest is in its report.
+     */
+    private function reportableFarms(): array
     {
         try {
+            $parents = DB::table('reporting_group_farms as g')
+                ->join('farms as f', 'f.farm_id', '=', 'g.parent_farm_id')
+                ->select(['g.parent_farm_id as farm_id', 'f.region']);
+
             return array_map(
                 static fn (object $row): array => (array) $row,
                 DB::table('overdrafts as o')
                     ->join('farms as f', 'f.farm_id', '=', 'o.farm_id')
-                    ->groupBy('o.farm_id', 'f.region')
-                    ->orderBy('o.farm_id')
-                    ->get(['o.farm_id', 'f.region'])
+                    ->select(['o.farm_id', 'f.region'])
+                    ->union($parents)
+                    ->orderBy('farm_id')
+                    ->get()
                     ->all()
             );
         } catch (Throwable) {

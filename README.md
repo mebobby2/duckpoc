@@ -2494,7 +2494,7 @@ Mongo query and result arrays; *logic* pipes change numbers.
 |---|---|---|---|---|---|
 | 1 | `PrepareEmptyArray` | data | always | zero cell per account × interval | the month spine |
 | 2 | `BuildAggregationPipeline` | data | always | the Mongo `$match`/`$group`; ytd start, basis, tags, `excludeEoyJournals` (MYOB only: `$nin` tag) | `p02_scan` — horizon split, YTD widening, EOY tag `$nin` |
-| 3 | `UpdatePipelineForV3MultiFarmTrackers` | data | mf trackers | maps tracker ids onto multi-farm tracking options | n/a — one tracking dimension |
+| 3 | `UpdatePipelineForV3MultiFarmTrackers` | data | mf trackers | maps tracker ids onto multi-farm tracking options | pass-through — it widens tracking-option filters, and the scan filters no tracking |
 | 4 | `AddMappedAccountsToPipeline` | data | always | adds internal Figured accounts mapped to Xero accounts to the query | `report_accounts` includes mapped targets |
 | 5 | `CheckMaxNesting` | data | always | guards Mongo query depth | n/a |
 | 6 | `QueryMongo` | data | always | runs it | the scan |
@@ -2502,7 +2502,7 @@ Mongo query and result arrays; *logic* pipes change numbers.
 | 8 | `MergeVirtualJournals` | data | VJs present | adds VJ amounts by account/interval/basis/tracking; **overdraft (150) and GST payments/refunds (145) arrive here** | `p08_merge_vj` — GST handler + overdraft recurrence, each over its nested report |
 | 9 | `AddOpeningBudgetBankBalance` | logic | budget, budget_id 0 | opening bank → default bank account, contra → retained earnings, first interval of each FY; value from `Balance::getReport()` | `p09_opening_bank` from `opening_balances` (budget) |
 | 10 | `AddOpeningBudgetGstBalance` | logic | budget, ytd, `includeOpeningBudgetGst`, GST/RE rows present | opening GST → GST account (inverse), contra → retained earnings | `p10_opening_gst` |
-| 11 | `ReportingGroupOffsetAccounts` | logic | reporting group, `mergedAccounts` | inter-entity transfers: adds the *from* entity's account balances (a nested `AccountBalances` run per source farm) onto the *to* account, zeroes the *from* — including its mapped alias | **pass-through — next tranche** |
+| 11 | `ReportingGroupOffsetAccounts` | logic | reporting group, `mergedAccounts` | inter-entity transfers: adds the *from* entity's account balances (a nested `AccountBalances` run per source farm) onto the *to* account, zeroes the *from* — including its mapped alias | `p11_offsets` — across entities in one statement; also inside the overdraft sub-report (second tranche) |
 | 12 | `AddGstPaymentsRefunds` | logic | **hard-disabled** — `return false;` since `d43fc7ab0d2` / `3c1c742f797` (FIG-16282, Feb–Mar 2024) | predicted GST payments/refunds line; actual payments removed from net GST | dead in Figured; logic now lives in `GstPaymentsRefundsVirtualJournal` at pipe 8 |
 | 13 | `MergeMappedResults` | logic | always | folds each internal Figured account's cells into its Xero account and drops the internal row; includes adopted accounts | `p13_merge_mapped` (adopted accounts not modelled) |
 | 14 | `CurrentYearEarnings` | logic | `calculateCurrentYearEarnings` | runs a **nested YTD sub-report** (`allincome - allexpenses`) and copies the inverted total into the CYE equity account | `p14_cye` — nested YTD scan |
@@ -2511,7 +2511,7 @@ Mongo query and result arrays; *logic* pipes change numbers.
 | 17 | `ContraGstPaymentsRefunds` | logic | **hard-disabled**, same commits | contra the GST payments line against the bank | dead; see 12 |
 | 18 | `ShowExpectedSign` | logic | `showExpectedSign` | flips accounts the user views inverted | `p18_expected_sign` from `accounts.inverted_for_user` |
 | 19 | `InverseAmounts` | logic | `inverse` | multiplies every cell by −1 | `p19_inverse` |
-| 20 | `ReportingGroupConsolidateAccounts` | logic | reporting group, `consolidateAccounts` | moves each `old_account_id`'s cells onto `new_account_id`, summing when several map to one | **pass-through — next tranche** |
+| 20 | `ReportingGroupConsolidateAccounts` | logic | reporting group, `consolidateAccounts` | moves each `old_account_id`'s cells onto `new_account_id`, summing when several map to one | `p20_consolidate` (second tranche) |
 | 21 | `DynamicBankBalance` | logic | `dynamicBankAccount`, liability account exists, not reporting group | a negative default-bank cell moves to the Figured liability account (US lines of credit) | `p21_dynamic_bank` |
 | 22 | `HideEmpty` | data | `hideEmpty` | flags all-zero rows | n/a |
 | 23 | `HideEmptyAccounts` | data | `hideEmptyAccounts` | flags all-zero internal/mapped/typed rows | n/a |
@@ -2643,12 +2643,9 @@ ordering itself under test. It is one `WITH RECURSIVE` statement of ~16 KB.
 #### What this tranche does not yet do — stated so it is not mistaken for done
 
 - **Pipes 3, 11 and 20** (`UpdatePipelineForV3MultiFarmTrackers`,
-  `ReportingGroupOffsetAccounts`, `ReportingGroupConsolidateAccounts`) are
-  pass-throughs. They need a multi-entity scan — a parent farm whose report
-  sums child entities — and the seed farm is single-entity. The dimension
-  tables for them exist (`reporting_group_farms`, `merged_accounts`,
-  `consolidated_accounts`); the stages do not. This is the "pickle" Richard
-  named, and it is the next tranche.
+  `ReportingGroupOffsetAccounts`, `ReportingGroupConsolidateAccounts`) were
+  pass-throughs here. 11 and 20 landed in the second tranche below; 3 stays a
+  pass-through for the reason in the pipe table.
 - **The GST payment schedule** is NZ two-monthly with the exception-month
   *dates* applied (December → 15 January, April → 7 May) but the
   exception-month *windows* unverified against `PaymentsDates::getSchedule()`,
@@ -2699,6 +2696,14 @@ farm's shape over thirty years, generated in SQL from a hash of each row's
 coordinates so it reseeds identically, with the overdraft-triggering purchase
 sized from the data — and runs the full check against it. Four decades of
 volume, every gate on, the same twelve-month period each time:
+
+*Correction, 2026-09-28:* the purchase was sized at four months of net inflow
+and lands in January, after six months of it — so at volume these farms never
+went overdrawn, and the interest row checked here was zeros on both sides. It
+is now nine months; `pipeline-scale-1m` accrues $23,013 from January to March.
+The farms below that were not reseeded since, 500M and 1B among them, still
+carry the old purchase. The recursion was never where the time went, so the
+timings stand; the claim that they exercised the overdraft did not.
 
 | lines | seed | p02 scan | p07 cells | p08 merge | p14 CYE | p15 RE | p24 final | stages |
 |---|---|---|---|---|---|---|---|---|
@@ -2798,11 +2803,149 @@ pipes are the ones that grow (p16 YTD 119 ms, p15 RE 105), as they should:
 they are windows over accounts × months. The PHP transliteration, which loops
 over cells, went from 33 ms to 395.
 
-**Multi-entity** — the reporting-group "pickle": pipes 3, 11 and 20 are
-pass-throughs, and this is the shape most likely to break the "composes as
-SQL" claim, because a parent farm's report is the sum of its children's and
-each child's offsets are a nested `AccountBalances` run against *another*
-farm. Not a stress test; a build. It is the next tranche.
+**Multi-entity** — the reporting-group "pickle", and the shape most likely to
+break the "composes as SQL" claim, because a parent farm's report is the sum
+of its children's and each child's offsets are a nested `AccountBalances` run
+against *another* farm. Not a stress test; a build — the second tranche below.
+
+#### Second tranche — reporting groups, landed 2026-09-28
+
+**How Figured does it.** A reporting-group report is not one pipeline run.
+`ReportingGroupReportService` fans out one HTTP request per child entity; each
+child runs the full pipeline with the parent's financial year forced onto it
+(`normaliseParentChildEndDates`, at the start of the child request), and the
+parent sums the responses in `CombineReports`. Inside each child's run, pipe
+11 compares against `active_farm_id()`: on the *to* entity it adds the *from*
+entity's balances, fetched by a nested `AccountBalances` report on the other
+farm; on the *from* entity it zeroes the account and its mapped alias. Pipe 20
+moves child accounts onto a consolidated account, which is the only way two
+children's rows ever meet in the combined report — Xero account ids are per
+organisation. Pipe 21 is off for reporting groups ("having combined Liability
+line is not an option").
+
+**How the SQL does it.** One statement. `farm_id` is now the entity key on
+every stage — `(farm_id, account_id, interval_index, amount)` — every window
+partitions by it, and every child runs the whole chain side by side. The
+overdraft recurrence advances every entity in the same iteration, joined on
+`(farm_id, n)`: months deep, not entities × months. Pipe 11 is the one stage
+that reads across entities; `p25_combine` is `CombineReports`, a `GROUP BY`
+that changes nothing for a single farm. `duckdb:pipeline --farm=<parent>`
+detects a group from `reporting_group_farms`; `--seed-group` seeds one.
+
+**The seed** (`ReportingGroupSeeder`): `rg-parent` (June year end, no lines)
+over `rg-child-a` (June) and `rg-child-b` (March), each with its own chart of
+accounts. A lends B $20,000 in August and tops it up $1,000 in March through an
+internal planning account mapped onto A's loan; both children's wages
+consolidate onto `rg-wages`; only A has an overdraft; B's May lines fall in a
+different season on the parent's year than on its own.
+
+**Result: 25/25 stages** on `rg-parent` with every gate on, and every mechanism
+visible in the numbers rather than only in the diff:
+
+| check | result |
+|---|---|
+| p10 → p11, A's loan and B's liability | +$20,000 / −$20,000 in August, +$1,000 alias / −$1,000 in March → all four zero |
+| p13, A's internal loan alias | gone — folded after pipe 11 zeroed it |
+| p20, wages | `rg-wages` $20,000 a month (A's $12,000 + B's $8,000); `rga-wages`, `rgb-wages` zero |
+| bank legs | untouched by offsets — A −$20,000, B +$20,000, netting to zero across the group |
+| year end, B's retained earnings | **$79,000 in the group, $35,000 alone** — the parent's June year puts both May seasons before the report year |
+| pipe 11 inside the overdraft sub-report | **A's interest $2,173.85 alone, $1,651.85 in the group.** January differs by $83.34; $20,000 at 5% for a month is $83.33 — the loan outflow, exactly, gone from the balance the interest is charged on |
+
+That last row is a Figured behaviour worth knowing: `CashflowReport::getApplicableOptions()`
+builds the overdraft sub-report's options from scratch, so `mergedAccounts` is
+never off there — a child's overdraft interest is charged on its cash position
+*after* inter-entity offsets, whatever the outer report asked for.
+
+**What the build found.** System accounts were resolved with an unordered
+`LIMIT 1` (GST, overdraft) or by flag on every row (CYE, RE, liability), with no
+preference between a farm's own account and a global one. A reporting group
+makes that ambiguous at once — every child sees its own and the global ones —
+and it is exactly what broke `cfaf-dairy-*` from p08 (a farm GST account beside
+the global `pl-gst`). Each entity now resolves one account per kind, its own
+first, in both the SQL and the transliteration; `cfaf-dairy-farm-1b` and
+`cfaf-dairy-nz` went from failing at p08 to 25/25. The default bank is resolved
+among the entity's own report accounts, because two global default banks exist
+(`gm-bank`, `pl-bank`).
+
+**Single-farm cost of the entity key: none.** Same process, alternating, 5 runs
+each, against the builder before this tranche:
+
+| farm | period | gates | before | after |
+|---|---|---|---|---|
+| 500M | 12 months | every gate | 606 ms | 615 ms |
+| 500M | 12 months | no RE | 224 ms | 125 ms |
+| 500M | 348 months | every gate | 763 ms | 810 ms |
+| 1B | 12 months | every gate | 1,249 ms | 1,243 ms |
+| 1B | 12 months | no RE | 425 ms | 212 ms |
+| 1B | 348 months | every gate | 1,389 ms | 1,434 ms |
+
+A single farm keeps the literal-`farm_id` fast paths. The no-RE gain is the
+account list reading the table once, not twice.
+
+**Not modelled — stated so it is not mistaken for done:**
+
+- The nested `AccountBalances` run behind pipe 11 loads the *from* farm fresh,
+  so it takes that farm's own financial year; the port takes the parent's. It
+  only differs for a *from* entity whose year end differs from the parent's,
+  and the seed's transfer is from the one whose does not.
+- Transfers apply at once, not in Figured's loop order; that differs only when
+  an account is both a *from* and a *to*.
+- Offsets inside the CYE and RE sub-reports. Both pass `multiEntityChildFarmIds`
+  on and would apply pipe 11, but they sum revenue and expense classes, so a
+  balance-sheet transfer like the seed's cannot move them. A transfer between
+  P&L accounts would.
+- Annual-plan snapshots per child (`useAnnualPlanSnapshots`, the interval
+  lookups `CombineReports` translates through), deleted child farms, and the
+  Intuit account-id prefix `CombineReports` adds for QBO.
+
+**At volume — one statement, one branch per entity.** `rg-scale` groups
+`pipeline-scale-1000m` and `pipeline-scale-500m`: 1.5B lines, every gate on,
+median of 5, alternating in one process:
+
+| period | grouped scan | UNION ALL per entity | per child, run in turn and summed |
+|---|---|---|---|
+| 12 months | 2,837 ms | **1,748 ms** | 1,806 ms |
+| 348 months | 3,219 ms | **2,109 ms** | 2,350 ms |
+
+The first version collapsed every child's lines in one grouped scan with
+`farm_id` as a key — hashing a string that is constant within every file, on
+every line. One `UNION ALL` branch per child, each filtering and tagging with
+its own literal `farm_id`, removes that: 38% faster, the same totals to the
+cent. The account list reads the table the same way.
+
+The third column is Figured's fan-out with the HTTP, the nested
+`AccountBalances` re-runs and the PHP combine taken away — the best that
+architecture could do on this node — and one statement still wins, if only by
+3–10%: DuckDB already spreads a single farm's statement across every core, so
+running children one after another leaves little idle. The case for one
+statement is the work it does not do — no nested re-run per transfer source,
+no round trips, no merge — and that pipe 11 is a join, not a report. Its
+totals differ from the group's by design: pipe 21 runs for a single farm and is
+off for a reporting group.
+
+**A realistic group — ten farms, a million lines each.**
+`duckdb:pipeline --seed-scale-group=1000000 --group-farms=10` seeds `rg-10x1m`
+(`ReportingGroupScaleSeeder`): ten child entities, each the scale farm's
+thirty-year shape on a chart of accounts of its own (the same generator as
+`pipeline-scale-*`), with year ends mixed June / March / September. Five
+inter-entity loans — child 1 to 2, 3 to 4, … — advance every August with both
+bank legs and top up every March through the lender's mapped internal account;
+every child's wages and sales consolidate onto one group line each; the five
+odd children carry an overdraft. 10,004,360 lines, seeded in 5.7 s.
+
+**25/25 stages** with every gate on. The loans cancel on both sides, every
+child's own wages and sales rows are zero with the group lines carrying their
+sum, and the five overdrafts accrue $26,879 to $29,691 each over the year — the
+recurrence running ten entities in one pass, five of them with nothing to
+charge.
+
+| period | report statement, median of 7 |
+|---|---|
+| 12 months | 214 ms |
+| 360 months, the whole history | 936 ms |
+
+The per-stage check — the transliteration plus twenty-five full runs — takes
+4.6 s at this size; the PHP side is 263 ms of it.
 
 ## Concurrency — the axis every other number here omits
 

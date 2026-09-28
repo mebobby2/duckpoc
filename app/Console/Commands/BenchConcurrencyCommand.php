@@ -10,6 +10,7 @@ use App\Services\CashFlow\GrossMarginV2Query;
 use App\Services\CashFlow\DataPipelineSqlBuilder;
 use App\Services\CashFlow\OverdraftQuery;
 use App\Services\CashFlow\PipelineOptions;
+use App\Services\CashFlow\ReportingGroupEntities;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Saturio\DuckDB\DuckDB;
@@ -225,11 +226,16 @@ class BenchConcurrencyCommand extends Command
         if ($report === 'pipeline') {
             // The whole DataPipeline with every gate on — the report the
             // overdraft page renders — as one prepared statement per run.
-            $sql = (new DataPipelineSqlBuilder($alias, $appAlias, new PipelineOptions(
+            $options = new PipelineOptions(
                 ytd: true, excludeEoyJournals: true, includeOpeningBudgetGst: true,
                 calculateCurrentYearEarnings: true, calculateRetained: true,
                 showExpectedSign: true, dynamicBankAccount: true,
-            )))->build();
+            );
+            $entities = ReportingGroupEntities::for($farm);
+            if ($entities !== []) {
+                $options = $options->forReportingGroup($entities);
+            }
+            $sql = (new DataPipelineSqlBuilder($alias, $appAlias, $options))->build();
 
             return static function () use ($duck, $sql, $farm, $from, $to, $horizon): void {
                 $statement = $duck->preparedStatement($sql);

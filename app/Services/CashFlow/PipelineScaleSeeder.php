@@ -22,7 +22,7 @@ use Saturio\DuckDB\DuckDB;
  * row's own coordinates so a reseed reproduces them exactly.
  *
  * The capital purchase that sends the farm into overdraft is sized from the
- * seeded data — four months of the actuals half's average net inflow — so the
+ * seeded data — nine months of the actuals half's average net inflow — so the
  * recurrence fires at every scale rather than only at the one the number was
  * chosen for.
  */
@@ -32,8 +32,8 @@ final class PipelineScaleSeeder
     public const string PERIOD_FROM = PipelineOracleSeeder::PERIOD_FROM;
     public const string PERIOD_TO = PipelineOracleSeeder::PERIOD_TO;
 
-    private const int FIRST_YEAR = 1996;
-    private const int LAST_YEAR = 2025;
+    public const int FIRST_YEAR = 1996;
+    public const int LAST_YEAR = 2025;
     private const int FIXED_POINT = 10000;
 
     public function __construct(
@@ -61,8 +61,6 @@ final class PipelineScaleSeeder
     public function seed(int $targetLines, int $extraAccounts = 0): int
     {
         $farmId = self::farmId($targetLines).($extraAccounts > 0 ? '-'.$extraAccounts.'acc' : '');
-        $months = (self::LAST_YEAR - self::FIRST_YEAR + 1) * 12;
-        $perMonth = max(6, intdiv($targetLines, $months));
 
         $this->clear($farmId);
 
@@ -99,6 +97,37 @@ final class PipelineScaleSeeder
                 'is_gst_account' => false, 'is_default_bank_account' => false,
             ], $extraIds));
         }
+
+        return $this->writeLines($farmId, 'pipeline-scale', $targetLines, [
+            'sales' => PipelineOracleSeeder::SALES,
+            'wages' => PipelineOracleSeeder::WAGES,
+            'fertiliser' => PipelineOracleSeeder::FERTILISER,
+            'fertiliser_internal' => PipelineOracleSeeder::FERTILISER_INTERNAL,
+            'depreciation' => PipelineOracleSeeder::DEPRECIATION,
+            'loan' => PipelineOracleSeeder::LOAN,
+            'gst' => PipelineOracleSeeder::GST,
+            'bank' => PipelineOracleSeeder::BANK,
+            'bank_2' => PipelineOracleSeeder::BANK_2,
+            'machinery' => PipelineOracleSeeder::MACHINERY,
+        ], $extraIds);
+    }
+
+    /**
+     * The farm's lines: thirty years of the oracle farm's shape at about
+     * `$targetLines`, onto the accounts in `$accounts` — the oracle's global
+     * ones for `pipeline-scale-*`, a child entity's own chart for a reporting
+     * group. The dimension rows (farm, settings, accounts) are the caller's.
+     *
+     * @param array{sales: string, wages: string, fertiliser: string, fertiliser_internal: string, depreciation: string, loan: string, gst: string, bank: string, bank_2: string, machinery: string} $accounts
+     * @param list<string> $extraIds expense accounts to spread the bulk expense lines across
+     * @return int rows the farm now has
+     */
+    public function writeLines(string $farmId, string $region, int $targetLines, array $accounts, array $extraIds = []): int
+    {
+        $months = (self::LAST_YEAR - self::FIRST_YEAR + 1) * 12;
+        $perMonth = max(6, intdiv($targetLines, $months));
+        $w = $accounts['wages'];
+
         // Bulk lines whose slot is an expense get an extra account by hash
         // when there are extras, so width grows without changing the totals'
         // shape.
@@ -107,19 +136,19 @@ final class PipelineScaleSeeder
             : "CASE WHEN CAST(hash('acc' || strftime(ms, '%Y%m') || i) % ".(count($extraIds) + 1)." AS INTEGER) = 0 THEN '{$w}' ELSE 'ps-exp-' || lpad(CAST(1 + CAST(hash('acc' || strftime(ms, '%Y%m') || i) % ".count($extraIds)." AS INTEGER) AS VARCHAR), 3, '0') END";
 
         $f = str_replace("'", "''", $farmId);
+        $rg = str_replace("'", "''", $region);
         $horizon = self::HORIZON;
         $first = self::FIRST_YEAR;
         $last = self::LAST_YEAR;
-        $s = PipelineOracleSeeder::SALES;
-        $w = PipelineOracleSeeder::WAGES;
-        $fe = PipelineOracleSeeder::FERTILISER;
-        $fi = PipelineOracleSeeder::FERTILISER_INTERNAL;
-        $d = PipelineOracleSeeder::DEPRECIATION;
-        $lo = PipelineOracleSeeder::LOAN;
-        $g = PipelineOracleSeeder::GST;
-        $b = PipelineOracleSeeder::BANK;
-        $b2 = PipelineOracleSeeder::BANK_2;
-        $m = PipelineOracleSeeder::MACHINERY;
+        $s = $accounts['sales'];
+        $fe = $accounts['fertiliser'];
+        $fi = $accounts['fertiliser_internal'];
+        $d = $accounts['depreciation'];
+        $lo = $accounts['loan'];
+        $g = $accounts['gst'];
+        $b = $accounts['bank'];
+        $b2 = $accounts['bank_2'];
+        $m = $accounts['machinery'];
         $tagEoy = PipelineOracleSeeder::TAG_EOY;
         $tagPay = PipelineOracleSeeder::TAG_GST_PAYMENT;
 
@@ -130,7 +159,7 @@ final class PipelineScaleSeeder
             INSERT INTO {$this->alias}.transaction_lines
                 (farm_id, farm_type, region, line_id, account_id, type, basis, date, amount, tracker_id, tag)
             SELECT
-                '{$f}', 'dairy', 'pipeline-scale',
+                '{$f}', 'dairy', '{$rg}',
                 'ps-' || strftime(ms, '%Y%m') || '-' || i,
                 CASE (i % 10)
                     WHEN 0 THEN '{$s}' WHEN 1 THEN '{$s}' WHEN 2 THEN '{$s}' WHEN 3 THEN '{$s}'
@@ -153,41 +182,43 @@ final class PipelineScaleSeeder
         $this->db->query(<<<SQL
             INSERT INTO {$this->alias}.transaction_lines
                 (farm_id, farm_type, region, line_id, account_id, type, basis, date, amount, tracker_id, tag)
-            SELECT '{$f}', 'dairy', 'pipeline-scale', 'ps-gst-' || strftime(ms, '%Y%m'), '{$g}',
+            SELECT '{$f}', 'dairy', '{$rg}', 'ps-gst-' || strftime(ms, '%Y%m'), '{$g}',
                    CASE WHEN ms <= DATE '{$horizon}' THEN 'actuals' ELSE 'forecast' END, 'cash',
                    ms + INTERVAL 27 DAY,
                    -(200 + CAST(hash('gst' || strftime(ms, '%Y%m')) % 400 AS BIGINT)) * {$perMonth} * {$this->fp()} / 10,
                    NULL, NULL
             FROM generate_series(DATE '{$first}-01-01', DATE '{$last}-12-01', INTERVAL 1 MONTH) AS g(ms)
             UNION ALL
-            SELECT '{$f}', 'dairy', 'pipeline-scale', 'ps-settle-' || strftime(ms, '%Y%m'), '{$g}',
+            SELECT '{$f}', 'dairy', '{$rg}', 'ps-settle-' || strftime(ms, '%Y%m'), '{$g}',
                    'actuals', 'cash', ms + INTERVAL 27 DAY,
                    (300 + CAST(hash('pay' || strftime(ms, '%Y%m')) % 500 AS BIGINT)) * {$perMonth} * {$this->fp()} / 10,
                    NULL, '{$tagPay}'
             FROM generate_series(DATE '{$first}-01-01', DATE '{$horizon}', INTERVAL 1 MONTH) AS g(ms)
             WHERE month(ms) % 2 = 0
             UNION ALL
-            SELECT '{$f}', 'dairy', 'pipeline-scale', 'ps-eoy-' || y, '{$w}',
+            SELECT '{$f}', 'dairy', '{$rg}', 'ps-eoy-' || y, '{$w}',
                    CASE WHEN make_date(y, 6, 30) <= DATE '{$horizon}' THEN 'actuals' ELSE 'forecast' END, 'cash',
                    make_date(y, 6, 30), 9000 * {$this->fp()}, NULL, '{$tagEoy}'
             FROM generate_series({$first}, {$last}) AS yy(y)
             UNION ALL
-            SELECT '{$f}', 'dairy', 'pipeline-scale', 'ps-xfer-out-' || y, '{$b}',
+            SELECT '{$f}', 'dairy', '{$rg}', 'ps-xfer-out-' || y, '{$b}',
                    CASE WHEN make_date(y, 9, 3) <= DATE '{$horizon}' THEN 'actuals' ELSE 'forecast' END, 'cash',
                    make_date(y, 9, 3), -5000 * {$this->fp()}, NULL, NULL
             FROM generate_series({$first}, {$last}) AS yy(y)
             UNION ALL
-            SELECT '{$f}', 'dairy', 'pipeline-scale', 'ps-xfer-in-' || y, '{$b2}',
+            SELECT '{$f}', 'dairy', '{$rg}', 'ps-xfer-in-' || y, '{$b2}',
                    CASE WHEN make_date(y, 9, 3) <= DATE '{$horizon}' THEN 'actuals' ELSE 'forecast' END, 'cash',
                    make_date(y, 9, 3), 5000 * {$this->fp()}, NULL, NULL
             FROM generate_series({$first}, {$last}) AS yy(y)
             UNION ALL
-            SELECT '{$f}', 'dairy', 'pipeline-scale', 'ps-bank-open', '{$b}', 'actuals', 'cash',
+            SELECT '{$f}', 'dairy', '{$rg}', 'ps-bank-open', '{$b}', 'actuals', 'cash',
                    DATE '2024-06-30', 8000 * {$this->fp()}, NULL, NULL
             SQL);
 
-        // Size the purchase from the data: four months of the actuals half's
-        // average net inflow, so the balance goes negative at any scale.
+        // Size the purchase from the data: nine months of the actuals half's
+        // average net inflow. It lands in January, after six months of that
+        // inflow, so it has to outweigh them to overdraw the farm — four
+        // months, the first sizing, never did at volume.
         $net = 0;
         foreach ($this->db->query(<<<SQL
             SELECT CAST(-SUM(tl.amount) / 6 AS BIGINT) AS monthly_net
@@ -199,12 +230,12 @@ final class PipelineScaleSeeder
             SQL)->rows(true) as $r) {
             $net = (int) (string) $r['monthly_net'];
         }
-        $purchase = max(4 * $net, 200_000 * self::FIXED_POINT);
+        $purchase = max(9 * $net, 200_000 * self::FIXED_POINT);
 
         $this->db->query(<<<SQL
             INSERT INTO {$this->alias}.transaction_lines
                 (farm_id, farm_type, region, line_id, account_id, type, basis, date, amount, tracker_id, tag)
-            VALUES ('{$f}', 'dairy', 'pipeline-scale', 'ps-machinery', '{$m}', 'forecast', 'cash',
+            VALUES ('{$f}', 'dairy', '{$rg}', 'ps-machinery', '{$m}', 'forecast', 'cash',
                     DATE '2025-01-20', {$purchase}, NULL, NULL)
             SQL);
 
