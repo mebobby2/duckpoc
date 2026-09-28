@@ -1635,7 +1635,8 @@ if either errors.
 
 Phased per the architecture conversation this PoC came out of. **Phases 0
 (scaffold), 1 (Cash Flow), 1b (tracker sections) and 3 (overdraft interest)
-are done.** Phase 2 has been rescoped (below); Phases 4 and 5 are not started.
+are done.** Phase 2 has been rescoped (below); Phase 4 has largely been done
+along the way (below); Phase 5 is not started.
 
 1. ~~**Phase 1 — Cash Flow.**~~ **Done.** Schema + partitioning, the oracle
    captured from Figured's real engine, the report as one DuckDB query, and a
@@ -1833,9 +1834,27 @@ are done.** Phase 2 has been rescoped (below); Phases 4 and 5 are not started.
    DuckDB and AlloyDB, at parity with Figured's oracle, with a conservation
    check across every repayment term. Both engines have their own report page
    and diagnostics. See the overdraft sections above.
-5. **Phase 4 — Scale/latency test**, only once 1–3 are correct at small
-   scale, on the hardest real report shape (not Cash Flow, which real
-   per-farm row counts already suggest isn't a meaningful performance risk).
+5. **Phase 4 — Scale/latency test. Largely done along the way** rather than
+   as a phase of its own: every report was taken to hundreds of millions of
+   lines as it was built, with its parity check still on. The results live
+   in each report's section; in brief:
+
+   | report | scaled to | result |
+   |---|---|---|
+   | Cash Flow, actuals + forecast | 500M, then 1B lines | 2.3 s at 1B, one statement |
+   | Gross Margin V2 | 500M report lines; 1.75B rows non-aggregated | 9,846 ms non-aggregated, 4,101 ms sorted by account |
+   | `DataPipeline` (overdraft) | 10K–10M, then 500M and 1B lines | 1B: 1.2 s for 12 months, 1.34 s for 30 years |
+   | reporting groups | 10 × 1M, 50 × 10M (500M lines) | 50 × 10M: 1,349 ms for 12 months, 2,776 ms for 30 years |
+
+   Concurrency has its own section. What Phase 4 has **not** covered:
+   - **cold serving** — every number above is a warm process; a page request
+     starts DuckDB cold and pays ~0.8 s more on the 50-farm group, reading the
+     footers of 4,500 files (see *Reporting groups*);
+   - **AlloyDB at realistic volume** — its column store cannot hold
+     non-aggregated data beside the other farms, so it was not measured there
+     (see *AlloyDB and the non-aggregated farm*);
+   - **practice-wide runs** — many unrelated farms in one statement, the shape
+     Phase 5 needs, beyond the fifty-entity reporting group.
 6. **Phase 5 — The additive derived-facts Parquet layer for BigQuery** /
    practice-wide benchmarking, built on report logic now proven correct on
    the hard case, not just the easy one.
@@ -2131,6 +2150,40 @@ Both framings agree, which the earlier comparison could not claim: it put
 chaff-free PoC data against Figured's chaff-laden data and reported ~90x. The
 honest figure is **~70x**, and it is now apples to apples whichever way the
 lines are counted.
+
+### AlloyDB and the non-aggregated farm — not measured, and why
+
+The DuckDB result above has no AlloyDB counterpart, deliberately. AlloyDB's
+speed here comes from its in-memory column store, and three facts rule it out
+at this volume before a row is loaded:
+
+- **The store is per table, not per farm.** Every farm's rows share
+  `transaction_lines`, so a farm competes with all the others for the budget.
+- **It was already full.** At 1.02B rows the Gross Margin report's eight
+  columns used 8.7 GB of the 9 GB budget (see the Cash Flow actuals + forecast
+  AlloyDB section). The table now holds ~1.52B rows; the non-aggregated farm
+  would take it to ~3.3B, roughly 28 GB of those columns.
+- **A partial store is no store.** A query uses it only when every column it
+  touches is held, and otherwise scans the row store — 465 ms against 62 ms
+  for the same 1M-line report here.
+
+So AlloyDB at realistic volume means AlloyDB from its row store, and the
+AlloyDB Gross Margin figures in this README were all measured on the
+all-report-account farms. They are not like-for-like with the Mongo baseline
+the way the DuckDB non-aggregated figures now are.
+
+Two loads were started and abandoned. `gm-dairy-farm-250M-non-aggregated`
+holds 236,978,864 of its ~875M rows, from an earlier attempt that deregistered
+the column store to break a DDL lock; it is incomplete, left in place, and
+should not be benchmarked. `gm-dairy-farm-500M-non-aggregated-alloy-chaff`
+(2026-09-28) never reached its first insert: after a restart the column
+store's background rebuild holds the table, and `alloydb:setup`'s
+`DROP INDEX` for a bulk load waits behind it. `alloydb:setup --raw` already
+emits the GST, payable/receivable and bank legs `GrossMarginV2Seeder` does, so
+nothing is missing from the seeder.
+
+Measuring it properly would need the column store to hold one farm: the table
+partitioned by farm, or a dedicated instance. Neither is done.
 
 ## Nested vs flat — what Figured's document shape costs a columnar engine
 
