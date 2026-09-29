@@ -26,6 +26,14 @@ final class InsightsSession
      */
     private const string WORK_MEM = '256MB';
 
+    /**
+     * The statements join small dimension CTEs whose sizes the planner
+     * cannot estimate, and every nested loop it chose on them was wrong: the
+     * worst joined 400K report lines to 250 farm windows row by row, 102M
+     * comparisons. A hash join is never the loser at these sizes.
+     */
+    private const bool NESTED_LOOPS = false;
+
     /** @var WeakMap<ConnectionInterface, true>|null */
     private static ?WeakMap $configured = null;
 
@@ -39,6 +47,7 @@ final class InsightsSession
         $db->statement(sprintf('SET max_parallel_workers = %d', self::PARALLEL_WORKERS));
         $db->statement(sprintf('SET max_parallel_workers_per_gather = %d', self::PARALLEL_WORKERS - 1));
         $db->statement(sprintf("SET work_mem = '%s'", self::WORK_MEM));
+        $db->statement(sprintf('SET enable_nestloop = %s', self::NESTED_LOOPS ? 'on' : 'off'));
         self::$configured[$db] = true;
     }
 }

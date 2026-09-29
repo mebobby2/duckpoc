@@ -93,15 +93,19 @@ final class ReportLinesSqlBuilder
     }
 
     /**
-     * The farm filter on the journal table. The farm list goes through a
-     * subquery rather than straight into `= ANY`: a literal array of 250
-     * farms made AlloyDB drop the column store and scan the heap, where the
-     * subquery's array is evaluated once at run time and the columnar scan
-     * applies it.
+     * The farm filter on the journal table, as a semi-join on the farm list.
+     *
+     * Two simpler spellings each lost a column-store benefit on the 250-farm
+     * practice. A literal `= ANY ('{...}')` array makes AlloyDB skip the
+     * column store and read the index. `= ANY (ARRAY(subquery))` keeps the
+     * columnar scan, but the planner guesses such an array holds ten
+     * elements, expects 850K rows instead of 21M, and groups them all in one
+     * process: 3.3 s. As a semi-join the farm list has a known size, and each
+     * worker aggregates its own share: 1.3 s.
      */
     public static function journalFarmFilter(string $alias = 'tl'): string
     {
-        return "{$alias}.farm_id = ANY (ARRAY(SELECT unnest(CAST(:farm_ids AS INTEGER[]))))";
+        return "{$alias}.farm_id IN (SELECT unnest(CAST(:farm_ids AS INTEGER[])))";
     }
 
     private function farmCte(): string
@@ -140,6 +144,11 @@ final class ReportLinesSqlBuilder
     /**
      * Literal casts rather than a join to a parameters CTE: a filter the scan
      * can see is one the column store applies before it hands rows up.
+     *
+     * Bank legs leave here rather than in `report_lines`: they are a third of
+     * the cash lines, every reader drops them, and the opening balance reads
+     * them separately. Filtered in the column store they are never grouped,
+     * which took the 250-farm statement from 1.44 s to 1.21 s.
      */
     private function scanPredicate(): string
     {
@@ -151,6 +160,7 @@ final class ReportLinesSqlBuilder
                   AND tl.basis = 'cash'
                   AND tl.date BETWEEN CAST(:period_from AS DATE) AND CAST(:period_to AS DATE)
                   AND {$horizon}
+                  AND tl.account_id <> ALL (ARRAY(SELECT accountid FROM accounts WHERE account_type = 'BANK'))
             SQL;
     }
 
@@ -159,10 +169,10 @@ final class ReportLinesSqlBuilder
      * at their own dates.
      *
      * Month, not day: every reader buckets by month or season, and on the
-     * 250-farm practice grouping by day left 3M groups out of 21M lines, whose
-     * gather and sort were 5 of the statement's 9 seconds. Grouping on an
-     * expression gives up the column store's in-scan aggregation, but each
-     * worker still pre-aggregates its share, and the groups are 7x fewer.
+     * 250-farm practice grouping by day left 3M groups out of 21M lines. The
+     * month is the stored `month` column rather than date_trunc(date):
+     * grouping on an expression stops the column store aggregating inside
+     * its scan, and the planner then gathered all 21M lines into one process.
      * Settlements are matched against payment dates, so they keep the day;
      * there are a few per farm per year.
      */
@@ -173,11 +183,11 @@ final class ReportLinesSqlBuilder
         $where = $this->scanPredicate();
 
         return <<<SQL
-            SELECT tl.farm_id, date_trunc('month', tl.date)::DATE AS date, tl.account_id, CAST(NULL AS TEXT) AS tag, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
+            SELECT tl.farm_id, tl.month AS date, tl.account_id, CAST(NULL AS TEXT) AS tag, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
             FROM {$s}.transaction_lines tl
             {$where}
               AND (tl.tag IS NULL OR tl.tag <> '{$tag}')
-            GROUP BY 1, 2, 3
+            GROUP BY tl.farm_id, tl.month, tl.account_id
             UNION ALL
             SELECT tl.farm_id, tl.date, tl.account_id, '{$tag}', CAST(SUM(tl.net_amount) AS BIGINT)
             FROM {$s}.transaction_lines tl

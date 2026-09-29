@@ -43,7 +43,7 @@ final class InsightsSchema
      * engine only aggregates inside the scan when all of them are in the
      * store, so this list is the memory budget.
      */
-    public const array COLUMNAR_COLUMNS = ['farm_id', 'basis', 'type', 'date', 'account_id', 'net_amount', 'tag'];
+    public const array COLUMNAR_COLUMNS = ['farm_id', 'basis', 'type', 'date', 'month', 'account_id', 'net_amount', 'tag'];
 
     public function __construct(
         private readonly ConnectionInterface $db,
@@ -239,14 +239,20 @@ final class InsightsSchema
                 account_id     TEXT NOT NULL,
                 net_amount     BIGINT NOT NULL,
                 tax_amount     BIGINT NOT NULL DEFAULT 0,
-                tag            TEXT
+                tag            TEXT,
+                -- Derived, not stored in Mongo. Every report buckets by month,
+                -- and the column store only aggregates inside its scan when
+                -- the grouping keys are real columns: grouping on
+                -- date_trunc(date) sent all 21M cash lines of the 250-farm
+                -- practice up to one process to be grouped.
+                month          DATE GENERATED ALWAYS AS (date_trunc('month', date::timestamp)::date) STORED
             )
             SQL);
 
         // Groups on (date, account) inside each farm are far from independent;
         // without this the planner overestimated the scan's groups by 8,000x
         // in the cash flow phase and gathered raw rows into one aggregate.
-        $this->db->statement("CREATE STATISTICS {$s}.transaction_lines_scan_groups (ndistinct) ON farm_id, date, account_id FROM {$s}.transaction_lines");
+        $this->db->statement("CREATE STATISTICS {$s}.transaction_lines_scan_groups (ndistinct) ON farm_id, month, account_id FROM {$s}.transaction_lines");
     }
 
     /**
@@ -260,6 +266,10 @@ final class InsightsSchema
         $this->db->statement("SET maintenance_work_mem = '2GB'");
         $this->db->statement('SET max_parallel_maintenance_workers = 4');
         $this->db->statement("CREATE INDEX IF NOT EXISTS transaction_lines_scope_idx ON {$s}.transaction_lines (farm_id, basis, date)");
+
+        // Sized from the table, the planner gave the portfolio scan 7 workers
+        // on a 16-core host; all 15 took 1.63 s to 1.44 s.
+        $this->db->statement("ALTER TABLE {$s}.transaction_lines SET (parallel_workers = 15)");
 
         foreach (['transaction_lines', 'transactions', 'xero_accounts', 'categories', 'category_xero_account', 'milk_productions', 'farms', 'farm_practice'] as $table) {
             $this->db->statement("ANALYZE {$s}.{$table}");
