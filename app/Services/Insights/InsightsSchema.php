@@ -30,6 +30,9 @@ use Throwable;
  *    by a concatenated name; here they are `milk_tracker_prices` rows.
  *  - A milk tracker's income account, which Figured resolves in code, is a
  *    column on `milk_trackers`.
+ *  - Livestock values per head. Figured keeps valuations in Mongo and
+ *    resolves them per scheme in PHP; here they are `stock_class_valuations`
+ *    rows, one per class per season.
  *
  * Lives in its own `insights` schema so it cannot collide with the earlier
  * phases' simplified tables of the same names in `public`.
@@ -44,6 +47,10 @@ final class InsightsSchema
      * store, so this list is the memory budget.
      */
     public const array COLUMNAR_COLUMNS = ['farm_id', 'basis', 'type', 'date', 'month', 'account_id', 'net_amount', 'tag'];
+
+    private const int QUERY_WORKERS = 15;
+
+    private const int POPULATION_WORKERS = 4;
 
     public function __construct(
         private readonly ConnectionInterface $db,
@@ -135,6 +142,7 @@ final class InsightsSchema
                 type           TEXT NOT NULL,
                 system_account TEXT,
                 source         TEXT NOT NULL DEFAULT 'xero',
+                virtual        BOOLEAN NOT NULL DEFAULT false,
                 PRIMARY KEY (id, _valid_from)
             )
             SQL);
@@ -211,6 +219,71 @@ final class InsightsSchema
             )
             SQL);
 
+        // Livestock, as Figured's MySQL holds it: a tracker per mob, its
+        // stock type, the classes within it, and every movement as a
+        // `stock_transactions` row whose transition says which way it went.
+        $this->db->statement(<<<SQL
+            CREATE TABLE {$s}.stock_types (
+                uuid         UUID PRIMARY KEY,
+                name         TEXT NOT NULL,
+                tracker_type TEXT NOT NULL DEFAULT 'stock'
+            )
+            SQL);
+
+        $this->db->statement(<<<SQL
+            CREATE TABLE {$s}.stock_classes (
+                uuid            UUID PRIMARY KEY,
+                stock_type_uuid UUID NOT NULL,
+                name            TEXT NOT NULL
+            )
+            SQL);
+
+        $this->db->statement(<<<SQL
+            CREATE TABLE {$s}.trackers (
+                id              INTEGER NOT NULL,
+                _valid_from     BIGINT NOT NULL,
+                _valid_to       BIGINT,
+                uuid            UUID NOT NULL,
+                farm_id         INTEGER NOT NULL,
+                name            TEXT NOT NULL,
+                tracker_number  INTEGER NOT NULL,
+                stock_type_uuid UUID NOT NULL,
+                PRIMARY KEY (id, _valid_from)
+            )
+            SQL);
+
+        $this->db->statement(<<<SQL
+            CREATE TABLE {$s}.stock_transactions (
+                id               BIGSERIAL,
+                _valid_from      BIGINT NOT NULL,
+                _valid_to        BIGINT,
+                farm_id          INTEGER NOT NULL,
+                tracker_id       INTEGER NOT NULL,
+                stock_class_uuid UUID NOT NULL,
+                quantity         NUMERIC(19, 4) NOT NULL,
+                type             TEXT NOT NULL,
+                budget_id        INTEGER NOT NULL DEFAULT 0,
+                transition       TEXT NOT NULL,
+                transaction_date DATE NOT NULL,
+                PRIMARY KEY (id, _valid_from)
+            )
+            SQL);
+        $this->db->statement("CREATE INDEX stock_transactions_farm_idx ON {$s}.stock_transactions (farm_id, transaction_date)");
+
+        // Changed: Figured keeps valuations in Mongo `figured_valuations`,
+        // resolved per scheme in PHP. Here each class has a value per head
+        // per season, which is what the scheme resolves to.
+        $this->db->statement(<<<SQL
+            CREATE TABLE {$s}.stock_class_valuations (
+                farm_id          INTEGER NOT NULL,
+                tracker_id       INTEGER NOT NULL,
+                stock_class_uuid UUID NOT NULL,
+                season           INTEGER NOT NULL,
+                value_per_head   BIGINT NOT NULL,
+                PRIMARY KEY (farm_id, tracker_id, stock_class_uuid, season)
+            )
+            SQL);
+
         // Mongo's `transactions` header. No foreign keys anywhere below: at
         // tens of millions of rows the checks would dominate the load, and
         // Mongo enforces none either.
@@ -269,9 +342,9 @@ final class InsightsSchema
 
         // Sized from the table, the planner gave the portfolio scan 7 workers
         // on a 16-core host; all 15 took 1.63 s to 1.44 s.
-        $this->db->statement("ALTER TABLE {$s}.transaction_lines SET (parallel_workers = 15)");
+        $this->db->statement("ALTER TABLE {$s}.transaction_lines SET (parallel_workers = ".self::QUERY_WORKERS.')');
 
-        foreach (['transaction_lines', 'transactions', 'xero_accounts', 'categories', 'category_xero_account', 'milk_productions', 'farms', 'farm_practice'] as $table) {
+        foreach (['transaction_lines', 'transactions', 'xero_accounts', 'categories', 'category_xero_account', 'milk_productions', 'farms', 'farm_practice', 'stock_transactions', 'stock_class_valuations', 'trackers'] as $table) {
             $this->db->statement("ANALYZE {$s}.{$table}");
         }
     }
@@ -286,11 +359,22 @@ final class InsightsSchema
     {
         $relation = self::SCHEMA.'.transaction_lines';
 
-        foreach (self::COLUMNAR_COLUMNS as $column) {
-            $this->db->statement('SELECT google_columnar_engine_add(?, ?)', [$relation, $column]);
-        }
+        // Population runs as many workers as the table's parallel_workers,
+        // each allocating a 250 MB shared-memory segment: at the 15 the
+        // queries want, that is 3.75 GB against the container's 2 GB
+        // /dev/shm, and population fails "No space left on device". Four
+        // while populating, then back.
+        $this->db->statement("ALTER TABLE {$relation} SET (parallel_workers = ".self::POPULATION_WORKERS.')');
 
-        $this->db->statement('SELECT google_columnar_engine_refresh(?)', [$relation]);
+        try {
+            foreach (self::COLUMNAR_COLUMNS as $column) {
+                $this->db->statement('SELECT google_columnar_engine_add(?, ?)', [$relation, $column]);
+            }
+
+            $this->db->statement('SELECT google_columnar_engine_refresh(?)', [$relation]);
+        } finally {
+            $this->db->statement("ALTER TABLE {$relation} SET (parallel_workers = ".self::QUERY_WORKERS.')');
+        }
 
         return $this->columnStore();
     }

@@ -33,6 +33,7 @@
     };
     $query = static fn (array $overrides = []): string => http_build_query(array_filter(array_merge([
         'practice' => $practiceId,
+        'basis' => $basis->value,
         'summary' => $summary,
         'line' => $selectedLine->value,
         'season' => $selectedSeason,
@@ -40,7 +41,7 @@
         'a' => $specs,
     ], $overrides), static fn ($v) => $v !== null && $v !== []));
     $fy = static fn (int $season): string => 'FY' . $season;
-    $totalRows = [\App\Services\Insights\PortfolioLine::TotalIncome, \App\Services\Insights\PortfolioLine::TotalOperatingExpenses, \App\Services\Insights\PortfolioLine::OperatingSurplus, \App\Services\Insights\PortfolioLine::ClosingCash];
+    $totalRows = [\App\Services\Insights\PortfolioLine::TotalIncome, \App\Services\Insights\PortfolioLine::TotalOperatingExpenses, \App\Services\Insights\PortfolioLine::OperatingSurplus, \App\Services\Insights\PortfolioLine::ClosingCash, \App\Services\Insights\PortfolioLine::NetProfit];
 @endphp
 
 {{-- Page header, after FIP's MainContentHeader: icon + title, the summary strip, and the buttons. --}}
@@ -50,6 +51,7 @@
             <svg class="h-6 w-6 text-emerald-700" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 6-6"/></svg>
             <h1 class="text-xl font-semibold text-slate-900">Portfolio Modelling</h1>
             <form method="GET" class="ml-4">
+                <input type="hidden" name="basis" value="{{ $basis->value }}">
                 <select name="practice" onchange="this.form.submit()" class="rounded border border-slate-300 bg-white px-2 py-1 text-sm">
                     @foreach ($practices as $p)
                         <option value="{{ $p['id'] }}" @selected($p['id'] === $practiceId)>{{ $p['name'] }} ({{ $p['farms'] }} farms)</option>
@@ -68,7 +70,10 @@
         @if ($seasons !== [])
             <span>{{ $fy($seasons[0]) }} – {{ $fy(end($seasons)) }}</span>
         @endif
-        <span>Cash basis</span>
+        <span class="inline-flex overflow-hidden rounded border border-slate-300">
+            <a href="?{{ $query(['basis' => 'cash']) }}" class="px-3 py-1 {{ $basis->value === 'cash' ? 'bg-slate-800 text-white' : 'bg-white hover:bg-slate-50' }}">Cash</a>
+            <a href="?{{ $query(['basis' => 'accrual']) }}" class="px-3 py-1 {{ $basis->value === 'accrual' ? 'bg-slate-800 text-white' : 'bg-white hover:bg-slate-50' }}">Accrual</a>
+        </span>
         <span class="ml-auto inline-flex overflow-hidden rounded border border-slate-300">
             <a href="?{{ $query(['summary' => 'average']) }}" class="px-3 py-1 {{ $isAverage ? 'bg-slate-800 text-white' : 'bg-white hover:bg-slate-50' }}">Average per farm</a>
             <a href="?{{ $query(['summary' => 'total']) }}" class="px-3 py-1 {{ $isAverage ? 'bg-white hover:bg-slate-50' : 'bg-slate-800 text-white' }}">Total</a>
@@ -87,7 +92,7 @@
             <div class="mb-3 flex items-center justify-between">
                 <h2 class="font-semibold text-slate-900">{{ $selectedLine->label() }} <span class="font-normal text-slate-500">· {{ $isAverage ? 'average per farm' : 'portfolio total' }}</span></h2>
                 <form method="GET">
-                    @foreach (['practice' => $practiceId, 'summary' => $summary, 'season' => $selectedSeason, 'sort' => $sort] as $k => $v)
+                    @foreach (['practice' => $practiceId, 'basis' => $basis->value, 'summary' => $summary, 'season' => $selectedSeason, 'sort' => $sort] as $k => $v)
                         <input type="hidden" name="{{ $k }}" value="{{ $v }}">
                     @endforeach
                     @foreach ($specs as $spec)
@@ -131,7 +136,7 @@
                 @endif
 
                 <form method="GET" class="grid grid-cols-6 items-end gap-2 border-t border-slate-100 pt-4">
-                    @foreach (['practice' => $practiceId, 'summary' => $summary, 'line' => $selectedLine->value, 'season' => $selectedSeason, 'sort' => $sort] as $k => $v)
+                    @foreach (['practice' => $practiceId, 'basis' => $basis->value, 'summary' => $summary, 'line' => $selectedLine->value, 'season' => $selectedSeason, 'sort' => $sort] as $k => $v)
                         <input type="hidden" name="{{ $k }}" value="{{ $v }}">
                     @endforeach
                     @foreach ($specs as $spec)
@@ -257,7 +262,7 @@
     <footer class="mt-6 rounded-lg border border-emerald-200 bg-emerald-50 px-5 py-3 text-sm text-emerald-900">
         Computed live from {{ number_format($journalLines) }} raw journal lines in AlloyDB, no synced copy:
         one statement for the whole portfolio in <strong>{{ $elapsedMs === null ? '–' : number_format($elapsedMs, 0) }} ms</strong>.
-        Same report logic as the single-farm cash flow (<code>ReportLinesSqlBuilder</code>).
+        Same report logic as the single-farm {{ $basis->value === 'cash' ? 'cash flow' : 'profit and loss' }} (<code>ReportLinesSqlBuilder</code>).
     </footer>
 </main>
 

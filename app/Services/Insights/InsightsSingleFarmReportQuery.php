@@ -7,18 +7,23 @@ namespace App\Services\Insights;
 use Illuminate\Database\ConnectionInterface;
 
 /**
- * Runs the single-farm cash flow over the `insights` tables.
+ * Runs a single-farm monthly report over the `insights` tables: the cash
+ * flow on cash basis, the profit and loss on accrual.
  */
-final class InsightsCashFlowQuery
+final class InsightsSingleFarmReportQuery
 {
     public function __construct(
         private readonly ConnectionInterface $db,
+        private readonly ReportBasis $basis = ReportBasis::Cash,
     ) {
     }
 
-    public function sql(): string
+    public function builder(): InsightsMonthlyReportSqlBuilder
     {
-        return (new InsightsCashFlowSqlBuilder())->build();
+        return match ($this->basis) {
+            ReportBasis::Cash => new InsightsCashFlowSqlBuilder(),
+            ReportBasis::Accrual => new InsightsProfitLossSqlBuilder(),
+        };
     }
 
     /**
@@ -28,13 +33,15 @@ final class InsightsCashFlowQuery
     {
         InsightsSession::configure($this->db);
 
-        $rows = $this->db->select($this->sql(), [
+        $bindings = [
             'farm_ids' => '{'.$farmId.'}',
             'horizon' => $horizon,
             'period_from' => $periodFrom,
             'period_to' => $periodTo,
-            'opening_before' => $periodFrom,
-        ]);
+        ];
+        if ($this->basis === ReportBasis::Cash) {
+            $bindings['opening_before'] = $periodFrom;
+        }
 
         return array_map(static fn (object $r): array => [
             'kind' => (string) $r->kind,
@@ -45,6 +52,6 @@ final class InsightsCashFlowQuery
             'month' => (string) $r->month,
             'column_type' => (string) $r->column_type,
             'amount' => (float) $r->amount,
-        ], $rows);
+        ], $this->db->select($this->builder()->build(), $bindings));
     }
 }

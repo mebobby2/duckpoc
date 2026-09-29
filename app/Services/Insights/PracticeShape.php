@@ -117,4 +117,30 @@ final class PracticeShape
 
     /** The corporate dairy type runs many supplies whatever its size. */
     public const int MILK_TRACKERS_LARGE_HERD = 8;
+
+    /**
+     * Mobs by farm type: [tracker name, stock type, farm types, classes].
+     * Each class is [name, head on a medium farm, share of that head held at
+     * the opening date, $ per head, the transition stock arrives by, share of
+     * the head arriving per calendar month (January first), the transition it
+     * leaves by, share leaving per month]. In and out balance over a year, so
+     * heads swing with the season rather than drift, and the valuation change
+     * is the season's swing plus the change in value per head.
+     *
+     * @var list<array{0: string, 1: string, 2: list<string>, 3: list<array{0: string, 1: int, 2: float, 3: int, 4: string, 5: list<float>, 6: string, 7: list<float>}>}>
+     */
+    public const array LIVESTOCK = [
+        ['Dairy herd', 'Dairy Cattle', ['dairy', 'dairy_large'], [
+            ['MA Cows', 400, 1.0, 2_200, 'purchase', [0, 0, 0, 0, 0, 0.22, 0, 0, 0, 0, 0, 0], 'sale', [0.04, 0.05, 0.06, 0.05, 0.02, 0, 0, 0, 0, 0, 0, 0]],
+            ['Heifers', 100, 1.0, 1_400, 'birth', [0, 0, 0, 0, 0, 0, 0, 0.12, 0.12, 0, 0, 0], 'sale', [0, 0, 0, 0, 0, 0.22, 0, 0, 0, 0, 0, 0]],
+        ]],
+        ['Sheep flock', 'Sheep', ['sheep_beef'], [
+            ['Ewes', 2_500, 1.0, 180, 'purchase', [0, 0, 0, 0.2, 0, 0, 0, 0, 0, 0, 0, 0], 'sale', [0.1, 0.1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
+            // Born in spring, all sold by autumn: none on hand at the balance date.
+            ['Lambs', 3_000, 0.0, 110, 'birth', [0, 0, 0, 0, 0, 0, 0, 0, 0.5, 0.5, 0, 0], 'sale', [0.25, 0.25, 0.25, 0.25, 0, 0, 0, 0, 0, 0, 0, 0]],
+        ]],
+        ['Beef cattle', 'Beef Cattle', ['sheep_beef'], [
+            ['Steers', 300, 1.0, 1_300, 'purchase', [0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0, 0], 'sale', [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.25, 0.25]],
+        ]],
+    ];
 }

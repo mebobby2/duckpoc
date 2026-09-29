@@ -16,9 +16,9 @@ final class PortfolioModellingQuery
     ) {
     }
 
-    public function sql(bool $withBreakdown = true): string
+    public function sql(bool $withBreakdown = true, ReportBasis $basis = ReportBasis::Cash): string
     {
-        return (new PortfolioModellingSqlBuilder($withBreakdown))->build();
+        return (new PortfolioModellingSqlBuilder($withBreakdown, $basis))->build();
     }
 
     /**
@@ -29,7 +29,7 @@ final class PortfolioModellingQuery
     {
         $this->configureSession();
 
-        $rows = $this->db->select($this->sql($withBreakdown), $scope->bindings($this->db, PortfolioAssumption::toJson($assumptions)));
+        $rows = $this->db->select($this->sql($withBreakdown, $scope->basis), $scope->bindings($this->db, PortfolioAssumption::toJson($assumptions)));
 
         return array_map(static fn (object $r): array => [
             'farm_id' => $r->farm_id === null ? null : (int) $r->farm_id,
@@ -51,7 +51,7 @@ final class PortfolioModellingQuery
     {
         $this->configureSession();
 
-        $rows = $this->db->select('EXPLAIN (ANALYZE, BUFFERS, VERBOSE) '.$this->sql($withBreakdown), $scope->bindings($this->db, PortfolioAssumption::toJson($assumptions)));
+        $rows = $this->db->select('EXPLAIN (ANALYZE, BUFFERS, VERBOSE) '.$this->sql($withBreakdown, $scope->basis), $scope->bindings($this->db, PortfolioAssumption::toJson($assumptions)));
 
         return implode("\n", array_map(static fn (object $r): string => (string) array_values((array) $r)[0], $rows));
     }

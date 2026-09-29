@@ -9,6 +9,7 @@ use App\Services\Insights\PortfolioAssumption;
 use App\Services\Insights\PortfolioLine;
 use App\Services\Insights\PortfolioModellingQuery;
 use App\Services\Insights\PortfolioScope;
+use App\Services\Insights\ReportBasis;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -43,7 +44,12 @@ class InsightsPortfolioController extends Controller
 
         $practiceId = (int) $request->query('practice', (string) ($practices[0]['id'] ?? 1));
         $summary = $request->query('summary') === self::SUMMARY_TOTAL ? self::SUMMARY_TOTAL : self::SUMMARY_AVERAGE;
+        $basis = ReportBasis::tryFrom((string) $request->query('basis', '')) ?? ReportBasis::Cash;
+        $lines = PortfolioLine::forBasis($basis);
         $selectedLine = PortfolioLine::tryFrom((string) $request->query('line', '')) ?? PortfolioLine::OperatingSurplus;
+        if (!in_array($selectedLine, $lines, true)) {
+            $selectedLine = PortfolioLine::OperatingSurplus;
+        }
         $selectedSeason = (int) $request->query('season', (string) PortfolioScope::CURRENT_SEASON);
 
         [$specs, $error] = $this->assumptionSpecs($request);
@@ -55,7 +61,7 @@ class InsightsPortfolioController extends Controller
         $farms = [];
 
         try {
-            $scope = PortfolioScope::forPractice($db, $practiceId);
+            $scope = PortfolioScope::forPractice($db, $practiceId, basis: $basis);
             $started = microtime(true);
             $rows = (new PortfolioModellingQuery($db))->run($scope, $assumptions);
             $elapsedMs = (microtime(true) - $started) * 1000;
@@ -88,14 +94,15 @@ class InsightsPortfolioController extends Controller
         });
 
         if ($request->query('export') === 'csv') {
-            return $this->csv($totals, $seasons, $summary);
+            return $this->csv($totals, $seasons, $summary, $lines);
         }
 
         return view('insights-portfolio', [
             'practices' => $practices,
             'practiceId' => $practiceId,
             'summary' => $summary,
-            'lines' => PortfolioLine::cases(),
+            'lines' => $lines,
+            'basis' => $basis,
             'seasons' => $seasons,
             'selectedLine' => $selectedLine,
             'selectedSeason' => $selectedSeason,
@@ -186,10 +193,11 @@ class InsightsPortfolioController extends Controller
     /**
      * @param array<string, array<int, array<string, mixed>>> $totals
      * @param list<int> $seasons
+     * @param list<PortfolioLine> $lines
      */
-    private function csv(array $totals, array $seasons, string $summary): StreamedResponse
+    private function csv(array $totals, array $seasons, string $summary, array $lines): StreamedResponse
     {
-        return response()->streamDownload(function () use ($totals, $seasons, $summary): void {
+        return response()->streamDownload(function () use ($totals, $seasons, $summary, $lines): void {
             $out = fopen('php://output', 'w');
             $header = ['Line'];
             foreach ($seasons as $season) {
@@ -197,7 +205,7 @@ class InsightsPortfolioController extends Controller
             }
             fputcsv($out, $header);
 
-            foreach (PortfolioLine::cases() as $line) {
+            foreach ($lines as $line) {
                 $row = [$line->label()];
                 foreach ($seasons as $season) {
                     $cell = $totals[$line->value][$season] ?? null;

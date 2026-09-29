@@ -6,38 +6,55 @@ namespace App\Services\Insights;
 
 /**
  * The one place the report business logic lives: every rule that turns
- * journals into cash-basis report lines, for any number of farms.
+ * journals into report lines, on either basis, for any number of farms.
  *
- * Both consumers build on these CTEs and add only their own presentation:
- * the single-farm cash flow (InsightsCashFlowSqlBuilder) buckets the lines by
- * month into sections, and Portfolio Modelling (PortfolioModellingSqlBuilder)
- * buckets them by season and applies assumptions. Neither classifies,
- * filters or synthesises a line itself, so a change to a rule here reaches
- * both, and `insights:portfolio --check-cashflow` proves they still agree.
+ * Every consumer builds on these CTEs and adds only its own presentation:
+ * the single-farm cash flow (InsightsCashFlowSqlBuilder) and profit and loss
+ * (InsightsProfitLossSqlBuilder) bucket the lines by month into sections,
+ * and Portfolio Modelling (PortfolioModellingSqlBuilder) buckets them by
+ * season and applies assumptions. None classifies, filters or synthesises a
+ * line itself, so a change to a rule here reaches all of them, and
+ * `insights:portfolio --check-single` proves they still agree.
  *
- * The rules, in the order the cash flow phase's Figured reproduction applies
- * them:
+ * Cash basis, in the order the cash flow phase's Figured reproduction
+ * applies the rules:
  *
  *   1. the scan: cash-basis lines, actuals to the horizon and forecast after,
- *      summed to (farm, date, account) on raw columns so the column store can
- *      aggregate inside the scan;
+ *      bank legs out, summed to (farm, month, account);
  *   2. opening: each farm's bank balance the day before its window;
  *   3. milk virtual journals: production x price for cheques after the
  *      horizon;
  *   4. GST virtual journals: two-monthly settlements predicted after the
  *      horizon, and recorded settlements moved to the payments line;
- *   5. report lines: ledger plus virtual journals, bank lines out, each line
- *      carrying its account's category, inside its farm's window.
+ *   5. report lines: ledger plus virtual journals, each line carrying its
+ *      account's category, inside its farm's window.
+ *
+ * Accrual basis, the profit and loss:
+ *
+ *   1. the scan: accrual-basis lines on profit and loss accounts only, so
+ *      payables, GST, bank, loans, capital and drawings never leave the
+ *      column store;
+ *   2. milk virtual journals: production x price in the month produced, for
+ *      production not yet invoiced by the horizon;
+ *   3. livestock valuation: each class's head at every month end, valued at
+ *      its season's rate per head; the month's change in value is a non-cash
+ *      income line, the virtual journal Figured computes in PHP;
+ *   4. report lines: ledger plus virtual journals inside each farm's window.
  *
  * The consumer supplies `report_window(farm_id, window_start, window_end)`,
- * one row per farm, and binds `:farm_ids`, `:horizon`, `:period_from`,
- * `:period_to` (the widest window) and `:opening_before` (the latest window
- * start).
+ * one row per farm, and binds `:farm_ids`, `:horizon`, `:period_from` and
+ * `:period_to` (the widest window), plus `:opening_before` (the latest
+ * window start) on cash basis.
  */
 final class ReportLinesSqlBuilder
 {
     /** Fonterra-style: production in month M is paid on the 20th of M+1. */
     private const string MILK_PAYMENT_OFFSET = "INTERVAL '1 month 19 days'";
+
+    public function __construct(
+        public readonly ReportBasis $basis = ReportBasis::Cash,
+    ) {
+    }
 
     /**
      * @param string $reportWindowBody the consumer's `report_window` CTE body
@@ -45,6 +62,21 @@ final class ReportLinesSqlBuilder
      */
     public function ctes(string $reportWindowBody): array
     {
+        if ($this->basis === ReportBasis::Accrual) {
+            return [
+                'farm' => $this->farmCte(),
+                'report_window' => $reportWindowBody,
+                'accounts' => $this->accountsCte(),
+                'scan' => $this->accrualScanCte(),
+                'milk_vj' => $this->accrualMilkVjCte(),
+                'stock_net' => $this->stockNetCte(),
+                'stock_heads' => $this->stockHeadsCte(),
+                'stock_values' => $this->stockValuesCte(),
+                'valuation_vj' => $this->valuationVjCte(),
+                'report_lines' => $this->accrualReportLinesCte(),
+            ];
+        }
+
         return [
             'farm' => $this->farmCte(),
             'report_window' => $reportWindowBody,
@@ -361,6 +393,165 @@ final class ReportLinesSqlBuilder
             JOIN accounts a ON a.farm_id = l.farm_id AND a.accountid = l.account_id
             JOIN report_window w ON w.farm_id = l.farm_id
             WHERE a.account_type <> 'BANK'
+              AND l.date BETWEEN date_trunc('month', w.window_start)::DATE AND w.window_end
+            SQL;
+    }
+
+    private static function profitAndLossGroups(): string
+    {
+        return implode(', ', array_map(static fn (string $g): string => "'{$g}'", ReportBasis::PROFIT_AND_LOSS_GROUPS));
+    }
+
+    /**
+     * Accrual lines on profit and loss accounts, summed to (farm, month,
+     * account). The balance-sheet legs (payables, GST, bank, loans, capital)
+     * are most of the accrual lines and no reader of a P&L wants them, so the
+     * column store drops them in its scan.
+     *
+     * Written as an exclusion, not `= ANY` over the P&L accounts: the planner
+     * guesses an array from a subquery holds ten elements, so the inclusion
+     * looked 600x more selective than it is and the 7M surviving lines were
+     * grouped in one process (1.8 s). An exclusion it estimates as keeping
+     * most rows, and each worker aggregates its own share.
+     */
+    private function accrualScanCte(): string
+    {
+        $s = InsightsSchema::SCHEMA;
+        $horizon = self::horizonPredicate();
+        $farms = self::journalFarmFilter();
+        $groups = self::profitAndLossGroups();
+
+        return <<<SQL
+            SELECT tl.farm_id, tl.month AS date, tl.account_id, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
+            FROM {$s}.transaction_lines tl
+            WHERE {$farms}
+                  AND tl.basis = 'accrual'
+                  AND tl.date BETWEEN CAST(:period_from AS DATE) AND CAST(:period_to AS DATE)
+                  AND {$horizon}
+                  AND tl.account_id <> ALL (ARRAY(SELECT accountid FROM accounts WHERE grp NOT IN ({$groups})))
+            GROUP BY tl.farm_id, tl.month, tl.account_id
+            SQL;
+    }
+
+    /**
+     * On accrual, milk is income in the month it is produced. Production
+     * whose month closes after the horizon has no invoice yet, so it is
+     * priced here, dated to the month like the ledger it sits beside.
+     */
+    private function accrualMilkVjCte(): string
+    {
+        $s = InsightsSchema::SCHEMA;
+
+        return <<<SQL
+            SELECT mt.farm_id, mt.income_accountid AS account_id,
+                   mp.transaction_date AS date,
+                   -(CAST(mp.production AS BIGINT) * pr.price) AS amount
+            FROM {$s}.milk_productions mp
+            JOIN {$s}.milk_trackers mt ON mt.id = mp.milk_tracker_id AND mt._valid_to IS NULL
+            JOIN {$s}.milk_tracker_prices pr ON pr.milk_tracker_id = mt.id AND pr.month = mp.transaction_date
+            WHERE mp.farm_id = ANY (CAST(:farm_ids AS INTEGER[]))
+              AND mp._valid_to IS NULL AND mp.budget_id = 0 AND mp.production > 0
+              AND (mp.transaction_date + INTERVAL '1 month' - INTERVAL '1 day')::DATE > CAST(:horizon AS DATE)
+              AND mp.transaction_date <= CAST(:period_to AS DATE)
+            SQL;
+    }
+
+    /**
+     * Each class's net movement per month: arrivals (opening, purchase,
+     * birth) in, departures (sale, death) out. Actual movements to the
+     * horizon, forecast after, the same split as the journals.
+     */
+    private function stockNetCte(): string
+    {
+        $s = InsightsSchema::SCHEMA;
+
+        return <<<SQL
+            SELECT st.farm_id, st.tracker_id, st.stock_class_uuid,
+                   date_trunc('month', st.transaction_date)::DATE AS ms,
+                   SUM(CASE WHEN st.transition IN ('opening', 'purchase', 'birth') THEN st.quantity ELSE -st.quantity END) AS net
+            FROM {$s}.stock_transactions st
+            WHERE st.farm_id = ANY (CAST(:farm_ids AS INTEGER[]))
+              AND st._valid_to IS NULL AND st.budget_id = 0
+              AND st.transaction_date <= CAST(:period_to AS DATE)
+              AND ((st.transaction_date <= CAST(:horizon AS DATE) AND st.type = 'actual')
+                OR (st.transaction_date > CAST(:horizon AS DATE) AND st.type = 'forecast'))
+            GROUP BY 1, 2, 3, 4
+            SQL;
+    }
+
+    /**
+     * Head on hand at every month end, from each class's first movement to
+     * its farm's window end, as a running sum, so a month with no movement
+     * still carries its head.
+     */
+    private function stockHeadsCte(): string
+    {
+        return <<<SQL
+            SELECT c.farm_id, c.tracker_id, c.stock_class_uuid, m::DATE AS ms,
+                   SUM(COALESCE(n.net, 0)) OVER (PARTITION BY c.farm_id, c.tracker_id, c.stock_class_uuid ORDER BY m) AS head
+            FROM (
+                SELECT farm_id, tracker_id, stock_class_uuid, min(ms) AS first_ms
+                FROM stock_net
+                GROUP BY 1, 2, 3
+            ) c
+            JOIN report_window w ON w.farm_id = c.farm_id
+            CROSS JOIN LATERAL generate_series(c.first_ms, w.window_end, INTERVAL '1 month') AS m
+            LEFT JOIN stock_net n ON n.farm_id = c.farm_id AND n.tracker_id = c.tracker_id
+                                 AND n.stock_class_uuid = c.stock_class_uuid AND n.ms = m::DATE
+            SQL;
+    }
+
+    /** Each farm's livestock value at every month end: head x its season's value per head. */
+    private function stockValuesCte(): string
+    {
+        $s = InsightsSchema::SCHEMA;
+
+        return <<<SQL
+            SELECT h.farm_id, h.ms, SUM(h.head * v.value_per_head) AS value
+            FROM stock_heads h
+            JOIN farm f ON f.farm_id = h.farm_id
+            JOIN {$s}.stock_class_valuations v
+              ON v.farm_id = h.farm_id AND v.tracker_id = h.tracker_id AND v.stock_class_uuid = h.stock_class_uuid
+             AND v.season = EXTRACT(YEAR FROM h.ms)::int + CASE WHEN EXTRACT(MONTH FROM h.ms)::int > f.fy_month THEN 1 ELSE 0 END
+            GROUP BY 1, 2
+            SQL;
+    }
+
+    /**
+     * The month's change in livestock value, posted to the farm's virtual
+     * valuation account. A rise is income, so it is credit-negative like any
+     * revenue line.
+     */
+    private function valuationVjCte(): string
+    {
+        return <<<SQL
+            SELECT v.farm_id, a.accountid AS account_id, v.ms AS date, CAST(round(-(v.value - v.previous)) AS BIGINT) AS amount
+            FROM (
+                SELECT farm_id, ms, value, LAG(value) OVER (PARTITION BY farm_id ORDER BY ms) AS previous
+                FROM stock_values
+            ) v
+            JOIN accounts a ON a.farm_id = v.farm_id AND a.category = 'Livestock Valuation Change'
+            WHERE v.previous IS NOT NULL
+            SQL;
+    }
+
+    /** Ledger plus virtual journals on profit and loss accounts, inside each farm's window. */
+    private function accrualReportLinesCte(): string
+    {
+        $groups = self::profitAndLossGroups();
+
+        return <<<SQL
+            SELECT l.farm_id, l.date, l.account_id, l.amount, a.grp, a.category
+            FROM (
+                SELECT farm_id, date, account_id, amount FROM scan
+                UNION ALL
+                SELECT farm_id, date, account_id, amount FROM milk_vj
+                UNION ALL
+                SELECT farm_id, date, account_id, amount FROM valuation_vj
+            ) l
+            JOIN accounts a ON a.farm_id = l.farm_id AND a.accountid = l.account_id
+            JOIN report_window w ON w.farm_id = l.farm_id
+            WHERE a.grp IN ({$groups})
               AND l.date BETWEEN date_trunc('month', w.window_start)::DATE AND w.window_end
             SQL;
     }

@@ -9,8 +9,9 @@ namespace App\Services\Insights;
  *
  * Four are read straight from the ledger and can carry an assumption. The
  * rest are calculated from them, so an assumption on milk income flows into
- * total income, operating surplus, net cash movement and — season after
- * season — closing cash, which is FIP's flow-on behaviour.
+ * total income and operating surplus, then on cash basis into net cash
+ * movement and, season after season, closing cash (FIP's flow-on), and on
+ * accrual basis into net profit.
  */
 enum PortfolioLine: string
 {
@@ -23,6 +24,24 @@ enum PortfolioLine: string
     case OperatingSurplus = 'operating_surplus';
     case NetCashMovement = 'net_cash_movement';
     case ClosingCash = 'closing_cash';
+    case NetProfit = 'net_profit';
+
+    /**
+     * @return list<self>
+     */
+    public static function forBasis(ReportBasis $basis): array
+    {
+        $shared = [
+            self::MilkIncome, self::OtherIncome, self::TotalIncome,
+            self::Fertiliser, self::OtherOperatingExpenses, self::TotalOperatingExpenses,
+            self::OperatingSurplus,
+        ];
+
+        return match ($basis) {
+            ReportBasis::Cash => [...$shared, self::NetCashMovement, self::ClosingCash],
+            ReportBasis::Accrual => [...$shared, self::NetProfit],
+        };
+    }
 
     public function isAssumable(): bool
     {
@@ -44,6 +63,7 @@ enum PortfolioLine: string
             self::OperatingSurplus => 'Operating Surplus',
             self::NetCashMovement => 'Net Cash Movement',
             self::ClosingCash => 'Closing Cash',
+            self::NetProfit => 'Net Profit',
         };
     }
 }

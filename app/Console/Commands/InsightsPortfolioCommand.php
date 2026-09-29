@@ -4,13 +4,14 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Services\Insights\InsightsCashFlowQuery;
+use App\Services\Insights\InsightsSingleFarmReportQuery;
 use App\Services\Insights\InsightsSchema;
 use App\Services\Insights\PortfolioAssumption;
 use App\Services\Insights\PortfolioLine;
 use App\Services\Insights\PortfolioModellingOracle;
 use App\Services\Insights\PortfolioModellingQuery;
 use App\Services\Insights\PortfolioScope;
+use App\Services\Insights\ReportBasis;
 use Illuminate\Console\Command;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Support\Facades\DB;
@@ -20,12 +21,13 @@ class InsightsPortfolioCommand extends Command
 {
     protected $signature = 'insights:portfolio
         {--practice=1 : Practice whose farms make up the portfolio}
+        {--basis=cash : cash (cash flow, closing cash) or accrual (profit and loss, net profit)}
         {--limit= : Only the practice\'s first N farms}
         {--assumption=* : line:season:percent, e.g. milk_income:2027:-5}
         {--runs=5 : Timed runs}
         {--summary : Portfolio totals only, no per-farm breakdown}
         {--check=0 : Recompute this many farms in PHP and compare every value}
-        {--check-cashflow=0 : Run this many farms\' single-farm cash flow over the window and compare its season totals}
+        {--check-single=0 : Run this many farms\' single-farm report (cash flow or P&L, by basis) over the window and compare its season totals}
         {--explain : Print EXPLAIN ANALYZE instead of timing}';
 
     protected $description = 'Run FIP\'s Portfolio Modelling over a practice, live from raw journals, and time it';
@@ -37,7 +39,9 @@ class InsightsPortfolioCommand extends Command
 
         try {
             $limit = $this->option('limit');
-            $scope = PortfolioScope::forPractice($db, (int) $this->option('practice'), $limit === null ? null : (int) $limit);
+            $basis = ReportBasis::tryFrom((string) $this->option('basis'))
+                ?? throw new \InvalidArgumentException('--basis is cash or accrual.');
+            $scope = PortfolioScope::forPractice($db, (int) $this->option('practice'), $limit === null ? null : (int) $limit, $basis);
             $assumptions = array_map(PortfolioAssumption::parse(...), (array) $this->option('assumption'));
             if ($assumptions === []) {
                 $assumptions = [
@@ -49,8 +53,9 @@ class InsightsPortfolioCommand extends Command
             $breakdown = !$this->option('summary');
 
             $this->info(sprintf(
-                'Portfolio of %s farms, seasons %d-%d, horizon %s, %d assumption(s)%s',
+                'Portfolio of %s farms, %s, seasons %d-%d, horizon %s, %d assumption(s)%s',
                 number_format(count($scope->farmIds)),
+                strtolower($basis->label()),
                 $scope->firstSeason,
                 $scope->lastSeason,
                 $scope->horizon,
@@ -95,8 +100,8 @@ class InsightsPortfolioCommand extends Command
                 $status = self::FAILURE;
             }
 
-            $checkCashFlow = (int) $this->option('check-cashflow');
-            if ($checkCashFlow > 0 && $this->checkCashFlow($db, $scope, $rows, $checkCashFlow, $breakdown) !== self::SUCCESS) {
+            $checkSingle = (int) $this->option('check-single');
+            if ($checkSingle > 0 && $this->checkSingleFarm($db, $scope, $rows, $checkSingle, $breakdown) !== self::SUCCESS) {
                 $status = self::FAILURE;
             }
 
@@ -122,7 +127,7 @@ class InsightsPortfolioCommand extends Command
             return self::FAILURE;
         }
 
-        $sample = new PortfolioScope(array_slice($scope->farmIds, 0, $farms), $scope->horizon, $scope->firstSeason, $scope->lastSeason);
+        $sample = new PortfolioScope(array_slice($scope->farmIds, 0, $farms), $scope->horizon, $scope->firstSeason, $scope->lastSeason, $scope->basis);
         $this->info(sprintf('Recomputing %d farm(s) in PHP…', count($sample->farmIds)));
         $expected = (new PortfolioModellingOracle($db))->compute($sample, $assumptions);
 
@@ -154,14 +159,15 @@ class InsightsPortfolioCommand extends Command
     }
 
     /**
-     * The shared-logic constraint, checked: each farm's single-farm cash flow
-     * over its whole window, rolled up into seasons, must equal the
-     * portfolio's original values. Both run on ReportLinesSqlBuilder, so a
-     * difference here is a presentation bug in one of them.
+     * The shared-logic constraint, checked: each farm's single-farm report
+     * (the cash flow, or the P&L on accrual) over its whole window, rolled up
+     * into seasons, must equal the portfolio's original values. Both run on
+     * ReportLinesSqlBuilder, so a difference here is a presentation bug in
+     * one of them.
      *
      * @param list<array<string, mixed>> $rows
      */
-    private function checkCashFlow(ConnectionInterface $db, PortfolioScope $scope, array $rows, int $farms, bool $breakdown): int
+    private function checkSingleFarm(ConnectionInterface $db, PortfolioScope $scope, array $rows, int $farms, bool $breakdown): int
     {
         if (!$breakdown) {
             $this->warn('Parity needs the per-farm breakdown; rerun without --summary.');
@@ -176,7 +182,9 @@ class InsightsPortfolioCommand extends Command
             }
         }
 
-        $cashFlow = new InsightsCashFlowQuery($db);
+        $isCash = $scope->basis === ReportBasis::Cash;
+        $report = new InsightsSingleFarmReportQuery($db, $scope->basis);
+        $reportName = $isCash ? 'cash flow' : 'profit and loss';
         $s = InsightsSchema::SCHEMA;
         $compared = 0;
         $mismatches = [];
@@ -189,17 +197,19 @@ class InsightsPortfolioCommand extends Command
             $to = sprintf('%04d-%02d-%02d', $scope->lastSeason, $fyMonth, (int) $farm->d);
 
             $t = hrtime(true);
-            $report = $cashFlow->run($farmId, $from, $to, $scope->horizon);
+            $result = $report->run($farmId, $from, $to, $scope->horizon);
             $timings[] = (hrtime(true) - $t) / 1e6;
 
             $seasons = [];
-            foreach ($report as $r) {
+            foreach ($result as $r) {
                 if ($r['month'] === 'Total') {
                     continue;
                 }
                 $season = (int) substr($r['month'], 0, 4) + ((int) substr($r['month'], 5, 2) > $fyMonth ? 1 : 0);
                 $v = &$seasons[$season];
-                $v ??= ['milk_income' => 0.0, 'total_income' => 0.0, 'fertiliser' => 0.0, 'total_operating_expenses' => 0.0, 'operating_surplus' => 0.0, 'net_cash_movement' => 0.0, 'closing_cash' => 0.0];
+                $v ??= $isCash
+                    ? ['milk_income' => 0.0, 'total_income' => 0.0, 'fertiliser' => 0.0, 'total_operating_expenses' => 0.0, 'operating_surplus' => 0.0, 'net_cash_movement' => 0.0, 'closing_cash' => 0.0]
+                    : ['milk_income' => 0.0, 'total_income' => 0.0, 'fertiliser' => 0.0, 'total_operating_expenses' => 0.0, 'operating_surplus' => 0.0, 'net_profit' => 0.0];
                 match (true) {
                     $r['kind'] === 'category' && $r['category'] === 'Milk Income' => $v['milk_income'] += $r['amount'],
                     $r['kind'] === 'category' && $r['category'] === 'Fertiliser' => $v['fertiliser'] += $r['amount'],
@@ -207,6 +217,7 @@ class InsightsPortfolioCommand extends Command
                     $r['kind'] === 'section' && $r['field'] === 'operating_expenses' => $v['total_operating_expenses'] += $r['amount'],
                     $r['kind'] === 'calculation' && $r['field'] === 'operating_surplus' => $v['operating_surplus'] += $r['amount'],
                     $r['kind'] === 'calculation' && $r['field'] === 'net_cash_movement' => $v['net_cash_movement'] += $r['amount'],
+                    $r['kind'] === 'calculation' && $r['field'] === 'net_profit' => $v['net_profit'] += $r['amount'],
                     $r['kind'] === 'balance' && $r['field'] === 'closing' => $v['closing_cash'] = $r['amount'],
                     default => null,
                 };
@@ -219,8 +230,8 @@ class InsightsPortfolioCommand extends Command
                 foreach ($v as $line => $amount) {
                     $compared++;
                     $want = $portfolio[$farmId][$season][$line] ?? null;
-                    // Monthly rounding in the cash flow against seasonal
-                    // rounding in the portfolio: a cent per month at most.
+                    // Monthly rounding in the single-farm report against
+                    // seasonal rounding in the portfolio: a cent per month at most.
                     if ($want === null || abs($want - $amount) > 0.13) {
                         $mismatches[] = [$farmId, $season, $line, $want === null ? 'missing' : number_format($want, 2), number_format($amount, 2)];
                     }
@@ -229,16 +240,16 @@ class InsightsPortfolioCommand extends Command
         }
 
         sort($timings);
-        $this->line(sprintf('  single-farm cash flow over the window: median %.1f ms per farm', $timings[intdiv(count($timings), 2)]));
+        $this->line(sprintf('  single-farm %s over the window: median %.1f ms per farm', $reportName, $timings[intdiv(count($timings), 2)]));
 
         if ($mismatches === []) {
-            $this->info(sprintf('Shared logic: %s season values match the single-farm cash flow.', number_format($compared)));
+            $this->info(sprintf('Shared logic: %s season values match the single-farm %s.', number_format($compared), $reportName));
 
             return self::SUCCESS;
         }
 
-        $this->error(sprintf('Shared logic: %d of %s season values differ from the single-farm cash flow.', count($mismatches), number_format($compared)));
-        $this->table(['farm', 'season', 'line', 'portfolio', 'cash flow'], array_slice($mismatches, 0, 40));
+        $this->error(sprintf('Shared logic: %d of %s season values differ from the single-farm %s.', count($mismatches), number_format($compared), $reportName));
+        $this->table(['farm', 'season', 'line', 'portfolio', $reportName], array_slice($mismatches, 0, 40));
 
         return self::FAILURE;
     }

@@ -30,10 +30,13 @@ final class PortfolioModellingSqlBuilder
 {
     private const int FIXED_POINT = 10000;
 
+    private readonly ReportLinesSqlBuilder $reportLines;
+
     public function __construct(
         private readonly bool $withBreakdown = true,
-        private readonly ReportLinesSqlBuilder $reportLines = new ReportLinesSqlBuilder(),
+        private readonly ReportBasis $basis = ReportBasis::Cash,
     ) {
+        $this->reportLines = new ReportLinesSqlBuilder($basis);
     }
 
     public function build(): string
@@ -87,24 +90,43 @@ final class PortfolioModellingSqlBuilder
                    -SUM(l.amount) FILTER (WHERE l.grp = 'income') AS total_income,
                    SUM(l.amount) FILTER (WHERE l.category = 'Fertiliser') AS fertiliser,
                    SUM(l.amount) FILTER (WHERE l.grp = 'operating_expenses') AS total_operating_expenses,
-                   -SUM(l.amount) AS net_cash_movement
+                   -SUM(l.amount) AS bottom_line
             FROM report_lines l
             JOIN farm f ON f.farm_id = l.farm_id
             GROUP BY 1, 2
             SQL;
     }
 
+    /**
+     * The report's bottom line is -amount over every report line: net cash
+     * movement on cash basis, where the lines are every non-bank movement,
+     * and net profit on accrual, where they are the P&L. Only cash carries a
+     * balance from season to season.
+     */
     private function originalCte(): string
     {
-        return <<<SQL
+        $common = <<<SQL
             SELECT s.farm_id, s.season,
                    COALESCE(b.milk_income, 0) AS milk_income,
                    COALESCE(b.total_income, 0) - COALESCE(b.milk_income, 0) AS other_income,
                    COALESCE(b.fertiliser, 0) AS fertiliser,
                    COALESCE(b.total_operating_expenses, 0) - COALESCE(b.fertiliser, 0) AS other_operating_expenses,
-                   COALESCE(b.net_cash_movement, 0) AS net_cash_movement,
+            SQL;
+
+        if ($this->basis === ReportBasis::Accrual) {
+            return $common.<<<SQL
+
+                   COALESCE(b.bottom_line, 0) AS net_profit
+            FROM seasons s
+            LEFT JOIN by_season b ON b.farm_id = s.farm_id AND b.season = s.season
+            SQL;
+        }
+
+        return $common.<<<SQL
+
+                   COALESCE(b.bottom_line, 0) AS net_cash_movement,
                    o.opening_balance
-                       + SUM(COALESCE(b.net_cash_movement, 0)) OVER (PARTITION BY s.farm_id ORDER BY s.season) AS closing_cash
+                       + SUM(COALESCE(b.bottom_line, 0)) OVER (PARTITION BY s.farm_id ORDER BY s.season) AS closing_cash
             FROM seasons s
             LEFT JOIN by_season b ON b.farm_id = s.farm_id AND b.season = s.season
             JOIN opening o ON o.farm_id = s.farm_id
@@ -150,11 +172,20 @@ final class PortfolioModellingSqlBuilder
     }
 
     /**
-     * The surplus change is the only thing an assumption moves in net cash,
-     * and closing cash carries every earlier season's change forward.
+     * The surplus change is the only thing an assumption moves below the
+     * surplus. On cash it moves net cash, and closing cash carries every
+     * earlier season's change forward; on accrual it moves net profit.
      */
     private function flowOnCte(): string
     {
+        if ($this->basis === ReportBasis::Accrual) {
+            return <<<SQL
+                SELECT m.*,
+                       m.net_profit + (m.operating_surplus_m - m.operating_surplus) AS net_profit_m
+                FROM modelled m
+                SQL;
+        }
+
         return <<<SQL
             SELECT m.*,
                    m.net_cash_movement + (m.operating_surplus_m - m.operating_surplus) AS net_cash_movement_m,
@@ -176,10 +207,11 @@ final class PortfolioModellingSqlBuilder
             PortfolioLine::OperatingSurplus->value => 'operating_surplus',
             PortfolioLine::NetCashMovement->value => 'net_cash_movement',
             PortfolioLine::ClosingCash->value => 'closing_cash',
+            PortfolioLine::NetProfit->value => 'net_profit',
         ];
 
         $rows = [];
-        foreach (PortfolioLine::cases() as $i => $line) {
+        foreach (PortfolioLine::forBasis($this->basis) as $i => $line) {
             $column = $columns[$line->value];
             $rows[] = sprintf("                ('%s', %d, CAST(w.%s AS NUMERIC), CAST(w.%s_m AS NUMERIC))", $line->value, $i, $column, $column);
         }

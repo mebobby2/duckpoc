@@ -76,6 +76,7 @@ final class InsightsPracticeSeeder
         $counts['farms'] = $this->farms();
         $counts['accounts'] = $this->accounts();
         $counts['milk_trackers'] = $this->milk();
+        $counts['stock_transactions'] = $this->livestock();
         $counts['transactions'] = $this->events();
         $counts['transaction_lines'] = $this->lines();
         $counts['gst_settlements'] = $this->gstSettlements();
@@ -406,7 +407,12 @@ final class InsightsPracticeSeeder
                 JOIN seasonal se ON se.m = mp.transaction_date
                 WHERE mt.farm_id BETWEEN {$this->firstFarmId} AND {$this->lastFarmId()}
                   AND mp.production > 0
-                  AND (mp.transaction_date + INTERVAL '1 month 19 days')::date <= DATE '{$horizon}'
+                  -- Invoiced at month end, so accrual basis has the income
+                  -- for every month produced by the horizon; the cheque
+                  -- lands the month after, and on cash basis one paid after
+                  -- the horizon is left to the statement's milk virtual
+                  -- journal.
+                  AND (mp.transaction_date + INTERVAL '1 month' - INTERVAL '1 day')::date <= DATE '{$horizon}'
             )
             SELECT *, accrual_date + 20 AS cash_date FROM actual
             UNION ALL
@@ -557,6 +563,132 @@ final class InsightsPracticeSeeder
             "SELECT count(*) AS n FROM {$s}.transactions WHERE farm_id BETWEEN ? AND ? AND tags @> ARRAY[?]",
             [$this->firstFarmId, $this->lastFarmId(), $tag],
         )->n;
+    }
+
+    /**
+     * Mobs, their movements and their values, for the farm types that run
+     * stock, plus the virtual account the valuation change posts to.
+     *
+     * Movements are monthly: each class arrives and leaves by its transition
+     * on its calendar shares of the class's head, scaled to the farm. Arrivals
+     * carry up to 15% jitter so no two farms or seasons match. Before the
+     * horizon a movement is `actual`, after it `forecast`. Values per head
+     * move each season within +/-10% of the class's price.
+     */
+    private function livestock(): int
+    {
+        $s = InsightsSchema::SCHEMA;
+        $vf = self::VALID_FROM;
+        $horizon = self::HORIZON;
+        $opening = self::OPENING_DATE;
+
+        $mobs = [];
+        $classes = [];
+        $monthly = [];
+        foreach (PracticeShape::LIVESTOCK as $m => [$tracker, $stockType, $types, $classDefs]) {
+            $mobs[] = sprintf('(%d, %s, %s, %s)', $m + 1, $this->quote($tracker), $this->quote($stockType), $this->textArray($types));
+            foreach ($classDefs as [$name, $head, $openingShare, $value, $inTransition, $in, $outTransition, $out]) {
+                $classes[] = sprintf('(%d, %s, %d, %F, %d)', $m + 1, $this->quote($name), $head, $openingShare, $value);
+                for ($month = 1; $month <= 12; $month++) {
+                    if ($in[$month - 1] > 0) {
+                        $monthly[] = sprintf('(%d, %s, %d, %s, %F)', $m + 1, $this->quote($name), $month, $this->quote($inTransition), $in[$month - 1]);
+                    }
+                    if ($out[$month - 1] > 0) {
+                        $monthly[] = sprintf('(%d, %s, %d, %s, %F)', $m + 1, $this->quote($name), $month, $this->quote($outTransition), $out[$month - 1]);
+                    }
+                }
+            }
+        }
+        $mobValues = implode(', ', $mobs);
+        $classValues = implode(', ', $classes);
+        $monthlyValues = implode(', ', $monthly);
+        $firstSeason = (int) substr(self::FIRST_MONTH, 0, 4);
+        $lastSeason = (int) substr(self::LAST_MONTH, 0, 4);
+
+        $this->db->statement(<<<SQL
+            INSERT INTO {$s}.stock_types (uuid, name)
+            SELECT md5('stock-type-' || t.name)::uuid, t.name
+            FROM (VALUES {$mobValues}) t(mob, tracker, name, farm_types)
+            ON CONFLICT DO NOTHING
+            SQL);
+
+        $this->db->statement(<<<SQL
+            INSERT INTO {$s}.stock_classes (uuid, stock_type_uuid, name)
+            SELECT md5('stock-class-' || c.name)::uuid, md5('stock-type-' || t.name)::uuid, c.name
+            FROM (VALUES {$classValues}) c(mob, name, head, opening_share, value)
+            JOIN (VALUES {$mobValues}) t(mob, tracker, name, farm_types) ON t.mob = c.mob
+            ON CONFLICT DO NOTHING
+            SQL);
+
+        $this->db->statement(<<<SQL
+            INSERT INTO {$s}.trackers (id, _valid_from, uuid, farm_id, name, tracker_number, stock_type_uuid)
+            SELECT p.farm_id * 100 + 50 + t.mob, {$vf}, md5('tracker-' || p.farm_id || '-' || t.mob)::uuid, p.farm_id,
+                   t.tracker, t.mob, md5('stock-type-' || t.name)::uuid
+            FROM {$s}.seed_farm_profile p
+            JOIN (VALUES {$mobValues}) t(mob, tracker, name, farm_types) ON p.farm_type = ANY (t.farm_types)
+            SQL);
+
+        $this->db->statement(<<<SQL
+            INSERT INTO {$s}.stock_transactions (_valid_from, farm_id, tracker_id, stock_class_uuid, quantity, type, transition, transaction_date)
+            SELECT {$vf}, tr.farm_id, tr.id, md5('stock-class-' || c.name)::uuid,
+                   round(c.head * p.scale * c.opening_share), 'actual', 'opening', DATE '{$opening}'
+            FROM {$s}.trackers tr
+            JOIN {$s}.seed_farm_profile p ON p.farm_id = tr.farm_id
+            JOIN (VALUES {$classValues}) c(mob, name, head, opening_share, value) ON c.mob = tr.tracker_number
+            WHERE c.opening_share > 0
+            UNION ALL
+            SELECT {$vf}, tr.farm_id, tr.id, md5('stock-class-' || c.name)::uuid,
+                   round(c.head * p.scale * mv.share
+                         * CASE WHEN mv.transition IN ('birth', 'purchase')
+                                THEN 1 + (abs(hashint8(tr.id::bigint * 131 + EXTRACT(EPOCH FROM m)::bigint + length(c.name))) % 150) / 1000.0
+                                ELSE 1 END),
+                   CASE WHEN m::date <= DATE '{$horizon}' THEN 'actual' ELSE 'forecast' END,
+                   mv.transition,
+                   (m + INTERVAL '14 days')::date
+            FROM {$s}.trackers tr
+            JOIN {$s}.seed_farm_profile p ON p.farm_id = tr.farm_id
+            JOIN (VALUES {$classValues}) c(mob, name, head, opening_share, value) ON c.mob = tr.tracker_number
+            JOIN (VALUES {$monthlyValues}) mv(mob, name, month, transition, share) ON mv.mob = c.mob AND mv.name = c.name
+            CROSS JOIN generate_series(DATE '{$this->firstMonth()}', DATE '{$this->lastMonth()}', INTERVAL '1 month') m
+            WHERE EXTRACT(MONTH FROM m)::int = mv.month
+            SQL);
+
+        $fp = 10_000;
+        $this->db->statement(<<<SQL
+            INSERT INTO {$s}.stock_class_valuations (farm_id, tracker_id, stock_class_uuid, season, value_per_head)
+            SELECT tr.farm_id, tr.id, md5('stock-class-' || c.name)::uuid, season,
+                   round(c.value * {$fp} * (0.9 + (abs(hashint8(tr.id::bigint * 17 + season * 7 + length(c.name))) % 201) / 1000.0))::bigint
+            FROM {$s}.trackers tr
+            JOIN {$s}.seed_farm_profile p ON p.farm_id = tr.farm_id
+            JOIN (VALUES {$classValues}) c(mob, name, head, opening_share, value) ON c.mob = tr.tracker_number
+            CROSS JOIN generate_series({$firstSeason}, {$lastSeason}) season
+            SQL);
+
+        // The virtual account the valuation change posts to, under its own
+        // income category, on every farm that runs stock.
+        $this->db->statement(<<<SQL
+            INSERT INTO {$s}.xero_accounts (_valid_from, farm_id, accountid, code, name, class, type, virtual)
+            SELECT DISTINCT {$vf}, tr.farm_id, md5(tr.farm_id || '-livestock-valuation')::uuid::text, 'LVC', 'Livestock Valuation Change', 'REVENUE', 'REVENUE', true
+            FROM {$s}.trackers tr
+            JOIN {$s}.seed_farm_profile p ON p.farm_id = tr.farm_id
+            SQL);
+
+        $this->db->statement(<<<SQL
+            INSERT INTO {$s}.categories (_valid_from, farm_id, name, "group", system_category_name)
+            SELECT DISTINCT {$vf}, tr.farm_id, 'Livestock Valuation Change', 'income', 'Livestock Valuation Change'
+            FROM {$s}.trackers tr
+            JOIN {$s}.seed_farm_profile p ON p.farm_id = tr.farm_id
+            SQL);
+
+        $this->db->statement(<<<SQL
+            INSERT INTO {$s}.category_xero_account (category_id, xero_account_id, farm_id)
+            SELECT c.id, md5(c.farm_id || '-livestock-valuation')::uuid::text, c.farm_id
+            FROM {$s}.categories c
+            JOIN {$s}.seed_farm_profile p ON p.farm_id = c.farm_id
+            WHERE c.name = 'Livestock Valuation Change'
+            SQL);
+
+        return (int) $this->db->selectOne("SELECT count(*) AS n FROM {$s}.stock_transactions WHERE farm_id BETWEEN ? AND ?", [$this->firstFarmId, $this->lastFarmId()])->n;
     }
 
     private function firstMonth(): string

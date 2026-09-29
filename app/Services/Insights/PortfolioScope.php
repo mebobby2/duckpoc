@@ -27,6 +27,7 @@ final readonly class PortfolioScope
         public string $horizon = InsightsPracticeSeeder::HORIZON,
         public int $firstSeason = self::CURRENT_SEASON - 3,
         public int $lastSeason = self::CURRENT_SEASON + 2,
+        public ReportBasis $basis = ReportBasis::Cash,
     ) {
         if ($farmIds === []) {
             throw new InvalidArgumentException('A portfolio needs at least one farm.');
@@ -36,7 +37,7 @@ final readonly class PortfolioScope
         }
     }
 
-    public static function forPractice(ConnectionInterface $db, int $practiceId, ?int $limit = null): self
+    public static function forPractice(ConnectionInterface $db, int $practiceId, ?int $limit = null, ReportBasis $basis = ReportBasis::Cash): self
     {
         $s = InsightsSchema::SCHEMA;
         $sql = "SELECT farm_id FROM {$s}.farm_practice WHERE practice_id = ? AND view ORDER BY farm_id";
@@ -49,7 +50,7 @@ final readonly class PortfolioScope
             throw new InvalidArgumentException("Practice {$practiceId} has no farms.");
         }
 
-        return new self($ids);
+        return new self($ids, basis: $basis);
     }
 
     public function farmIdsLiteral(): string
@@ -88,15 +89,22 @@ final readonly class PortfolioScope
     {
         [$from, $to, $openingBefore] = $this->period($db);
 
-        return [
+        $bindings = [
             'farm_ids' => $this->farmIdsLiteral(),
             'horizon' => $this->horizon,
             'period_from' => $from,
             'period_to' => $to,
-            'opening_before' => $openingBefore,
             'first_season' => $this->firstSeason,
             'last_season' => $this->lastSeason,
             'assumptions' => $assumptionsJson,
         ];
+
+        // Only the cash statement reads an opening bank balance, and PDO
+        // refuses a binding the statement has no placeholder for.
+        if ($this->basis === ReportBasis::Cash) {
+            $bindings['opening_before'] = $openingBefore;
+        }
+
+        return $bindings;
     }
 }
