@@ -138,6 +138,25 @@
             </p>
         </a>
 
+        <a href="{{ route('insights-duckdb-portfolio') }}"
+           class="block rounded-lg border border-amber-300 bg-white p-5 shadow-sm ring-1 ring-amber-200 hover:border-amber-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Insights — Portfolio Modelling (DuckDB + DuckLake)</h2>
+                <span class="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+                    no sync, two stores
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                The same page on DuckDB: journal lines in DuckLake on MinIO, farms, accounts, milk and
+                livestock in MySQL, joined in one statement. Same numbers as the AlloyDB page, to the cent.
+                Needs the MinIO app (<code>app-minio</code>, port 8081).
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: the shared report layer ported rule for rule · practices of 12, 250 and 5,000
+                farms · 1.12B journal lines in one statement · MySQL reads that stay farm-filtered
+            </p>
+        </a>
+
         <a href="{{ route('alloydb-gross-margin') }}"
            class="block rounded-lg border border-sky-300 bg-white p-5 shadow-sm ring-1 ring-sky-200 hover:border-sky-400">
             <div class="flex items-baseline justify-between gap-4">
