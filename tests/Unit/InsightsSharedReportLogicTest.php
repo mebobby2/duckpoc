@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
-use App\Services\Insights\InsightsCashFlowSqlBuilder;
-use App\Services\Insights\InsightsMonthlyReportSqlBuilder;
-use App\Services\Insights\InsightsProfitLossSqlBuilder;
+use App\Services\Insights\AlloyDB\InsightsCashFlowSqlBuilder;
+use App\Services\Insights\AlloyDB\InsightsMonthlyReportSqlBuilder;
+use App\Services\Insights\AlloyDB\InsightsProfitLossSqlBuilder;
 use App\Services\Insights\PortfolioLine;
-use App\Services\Insights\PortfolioModellingSqlBuilder;
+use App\Services\Insights\AlloyDB\PortfolioModellingSqlBuilder;
 use App\Services\Insights\ReportBasis;
-use App\Services\Insights\ReportLinesSqlBuilder;
+use App\Services\Insights\AlloyDB\ReportLinesSqlBuilder;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 

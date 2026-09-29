@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Services\Insights\InsightsPracticeSeeder;
-use App\Services\Insights\InsightsSchema;
+use App\Services\Insights\AlloyDB\InsightsPracticeSeeder;
+use App\Services\Insights\AlloyDB\InsightsSchema;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Throwable;

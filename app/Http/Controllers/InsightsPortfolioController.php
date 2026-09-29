@@ -4,11 +4,11 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
-use App\Services\Insights\InsightsSchema;
+use App\Services\Insights\AlloyDB\InsightsSchema;
 use App\Services\Insights\PortfolioAssumption;
 use App\Services\Insights\PortfolioLine;
-use App\Services\Insights\PortfolioModellingQuery;
-use App\Services\Insights\PortfolioScope;
+use App\Services\Insights\AlloyDB\PortfolioModellingQuery;
+use App\Services\Insights\AlloyDB\PortfolioScope;
 use App\Services\Insights\ReportBasis;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Http\Request;

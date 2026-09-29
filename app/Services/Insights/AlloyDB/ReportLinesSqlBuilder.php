@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
-namespace App\Services\Insights;
+namespace App\Services\Insights\AlloyDB;
+
+use App\Services\Insights\ReportBasis;
 
 /**
  * The one place the report business logic lives: every rule that turns

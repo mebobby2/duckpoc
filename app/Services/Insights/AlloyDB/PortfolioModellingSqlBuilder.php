@@ -2,7 +2,10 @@
 
 declare(strict_types=1);
 
-namespace App\Services\Insights;
+namespace App\Services\Insights\AlloyDB;
+
+use App\Services\Insights\PortfolioLine;
+use App\Services\Insights\ReportBasis;
 
 /**
  * FIP's Portfolio Modelling page as ONE AlloyDB statement over raw journals.

@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
-namespace App\Services\Insights;
+namespace App\Services\Insights\AlloyDB;
+
+use App\Services\Insights\ReportBasis;
 
 /**
  * The single-farm actuals-plus-forecast cash flow: cash-basis report lines
