@@ -66,7 +66,7 @@ final class InsightsDuckDbSharedReportLogicTest extends TestCase
         $single = (new $singleFarm(self::FARM_ID))->build();
         $portfolio = (new PortfolioModellingSqlBuilder([self::FARM_ID], [], true, $basis))->build();
 
-        foreach ([InsightsDuckDb::lines(), InsightsDuckDb::table('stock_transactions'), InsightsDuckDb::table('milk_productions')] as $table) {
+        foreach ([InsightsDuckDb::lines(), 'stock_transactions', 'milk_productions', 'milk_tracker_prices'] as $table) {
             $sharedReads = substr_count($shared, $table);
             self::assertSame($sharedReads, substr_count($single, $table), "the single-farm report reads {$table} itself");
             self::assertSame($sharedReads, substr_count($portfolio, $table), "the portfolio reads {$table} itself");

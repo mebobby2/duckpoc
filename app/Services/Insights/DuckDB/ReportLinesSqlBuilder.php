@@ -177,7 +177,7 @@ final class ReportLinesSqlBuilder
             FROM {$xa} xa
             JOIN {$cxa} cxa ON cxa.xero_account_id = xa.accountid AND cxa.farm_id = xa.farm_id
             JOIN {$c} c ON c.id = cxa.category_id
-            WHERE {$this->farmFilter('xa.farm_id')}
+            WHERE {$this->farmFilter('xa.farm_id')} AND {$this->farmFilter('c.farm_id')}
               AND xa._valid_to IS NULL AND c._valid_to IS NULL
             SQL;
     }
@@ -197,6 +197,11 @@ final class ReportLinesSqlBuilder
     /**
      * The ledger summed to (farm, month, account), bank legs out, and GST
      * settlements kept at their own dates for the payment calendar.
+     *
+     * Accounts are excluded after the sum, not during the scan: account_id is
+     * a group key, so the result is the same, and the lookup runs over a
+     * farm's few thousand groups instead of its hundreds of thousands of
+     * lines — at book scale, 6M groups instead of 700M lines.
      */
     private function scanCte(): string
     {
@@ -205,19 +210,20 @@ final class ReportLinesSqlBuilder
         $where = $this->scanPredicate('cash');
 
         return <<<SQL
-            SELECT tl.farm_id, tl.month AS date, tl.account_id, CAST(NULL AS VARCHAR) AS tag, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
-            FROM {$lines} tl
-            {$where}
-              AND (tl.tag IS NULL OR tl.tag <> '{$tag}')
-              AND tl.account_id NOT IN (SELECT accountid FROM accounts WHERE account_type = 'BANK')
-            GROUP BY tl.farm_id, tl.month, tl.account_id
-            UNION ALL
-            SELECT tl.farm_id, tl.date, tl.account_id, '{$tag}', CAST(SUM(tl.net_amount) AS BIGINT)
-            FROM {$lines} tl
-            {$where}
-              AND tl.tag = '{$tag}'
-              AND tl.account_id NOT IN (SELECT accountid FROM accounts WHERE account_type = 'BANK')
-            GROUP BY tl.farm_id, tl.date, tl.account_id
+            SELECT g.* FROM (
+                SELECT tl.farm_id, tl.month AS date, tl.account_id, CAST(NULL AS VARCHAR) AS tag, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
+                FROM {$lines} tl
+                {$where}
+                  AND (tl.tag IS NULL OR tl.tag <> '{$tag}')
+                GROUP BY tl.farm_id, tl.month, tl.account_id
+                UNION ALL
+                SELECT tl.farm_id, tl.date, tl.account_id, '{$tag}', CAST(SUM(tl.net_amount) AS BIGINT)
+                FROM {$lines} tl
+                {$where}
+                  AND tl.tag = '{$tag}'
+                GROUP BY tl.farm_id, tl.date, tl.account_id
+            ) g
+            WHERE g.account_id NOT IN (SELECT accountid FROM accounts WHERE account_type = 'BANK')
             SQL;
     }
 
@@ -246,21 +252,14 @@ final class ReportLinesSqlBuilder
 
     private function milkVjCte(): string
     {
-        $mp = self::mysql('milk_productions');
-        $mt = self::mysql('milk_trackers');
-        $pr = self::mysql('milk_tracker_prices');
         $offset = self::MILK_PAYMENT_OFFSET;
 
         return <<<SQL
-            SELECT mt.farm_id, mt.income_accountid AS account_id,
+            SELECT mp.farm_id, mp.account_id,
                    CAST(mp.transaction_date + {$offset} AS DATE) AS date,
-                   -(CAST(mp.production AS BIGINT) * pr.price) AS amount
-            FROM {$mp} mp
-            JOIN {$mt} mt ON mt.id = mp.milk_tracker_id AND mt._valid_to IS NULL
-            JOIN {$pr} pr ON pr.milk_tracker_id = mt.id AND pr.month = mp.transaction_date
-            WHERE {$this->farmFilter('mp.farm_id')}
-              AND mp._valid_to IS NULL AND mp.budget_id = 0 AND mp.production > 0
-              AND CAST(mp.transaction_date + {$offset} AS DATE) > CAST(\$horizon AS DATE)
+                   -mp.value AS amount
+            FROM {$this->pricedMilkProduction()} mp
+            WHERE CAST(mp.transaction_date + {$offset} AS DATE) > CAST(\$horizon AS DATE)
               AND CAST(mp.transaction_date + {$offset} AS DATE) <= CAST(\$period_to AS DATE)
             SQL;
     }
@@ -387,30 +386,47 @@ final class ReportLinesSqlBuilder
         $where = $this->scanPredicate('accrual');
 
         return <<<SQL
-            SELECT tl.farm_id, tl.month AS date, tl.account_id, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
-            FROM {$lines} tl
-            {$where}
-              AND tl.account_id NOT IN (SELECT accountid FROM accounts WHERE grp NOT IN ({$groups}))
-            GROUP BY tl.farm_id, tl.month, tl.account_id
+            SELECT g.* FROM (
+                SELECT tl.farm_id, tl.month AS date, tl.account_id, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
+                FROM {$lines} tl
+                {$where}
+                GROUP BY tl.farm_id, tl.month, tl.account_id
+            ) g
+            WHERE g.account_id NOT IN (SELECT accountid FROM accounts WHERE grp NOT IN ({$groups}))
             SQL;
+    }
+
+    /**
+     * Each month's milk production priced at its tracker's price, as a
+     * subquery MySQL runs itself. The price table is keyed by tracker, not
+     * farm, so DuckDB cannot push a farm filter into its scan and would read
+     * every tracker's prices on every report; handed the whole join, MySQL
+     * walks its indexes from the farm list instead. The rules — which months
+     * become a virtual journal, and on what date — stay in the two callers.
+     */
+    private function pricedMilkProduction(): string
+    {
+        $sql = <<<SQL
+            SELECT mp.farm_id, mt.income_accountid AS account_id, mp.transaction_date,
+                   CAST(mp.production AS SIGNED) * pr.price AS value
+            FROM milk_productions mp
+            JOIN milk_trackers mt ON mt.id = mp.milk_tracker_id AND mt._valid_to IS NULL
+            JOIN milk_tracker_prices pr ON pr.milk_tracker_id = mt.id AND pr.month = mp.transaction_date
+            WHERE {$this->farmFilter('mp.farm_id')}
+              AND mp._valid_to IS NULL AND mp.budget_id = 0 AND mp.production > 0
+            SQL;
+
+        return sprintf("mysql_query('%s', '%s')", InsightsDuckDb::MYSQL_ALIAS, str_replace("'", "''", $sql));
     }
 
     private function accrualMilkVjCte(): string
     {
-        $mp = self::mysql('milk_productions');
-        $mt = self::mysql('milk_trackers');
-        $pr = self::mysql('milk_tracker_prices');
-
         return <<<SQL
-            SELECT mt.farm_id, mt.income_accountid AS account_id,
+            SELECT mp.farm_id, mp.account_id,
                    mp.transaction_date AS date,
-                   -(CAST(mp.production AS BIGINT) * pr.price) AS amount
-            FROM {$mp} mp
-            JOIN {$mt} mt ON mt.id = mp.milk_tracker_id AND mt._valid_to IS NULL
-            JOIN {$pr} pr ON pr.milk_tracker_id = mt.id AND pr.month = mp.transaction_date
-            WHERE {$this->farmFilter('mp.farm_id')}
-              AND mp._valid_to IS NULL AND mp.budget_id = 0 AND mp.production > 0
-              AND CAST(mp.transaction_date + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) > CAST(\$horizon AS DATE)
+                   -mp.value AS amount
+            FROM {$this->pricedMilkProduction()} mp
+            WHERE CAST(mp.transaction_date + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) > CAST(\$horizon AS DATE)
               AND mp.transaction_date <= CAST(\$period_to AS DATE)
             SQL;
     }
@@ -463,6 +479,7 @@ final class ReportLinesSqlBuilder
             JOIN {$v} v
               ON v.farm_id = h.farm_id AND v.tracker_id = h.tracker_id AND v.stock_class_uuid = h.stock_class_uuid
              AND v.season = year(h.ms) + CASE WHEN month(h.ms) > f.fy_month THEN 1 ELSE 0 END
+            WHERE {$this->farmFilter('v.farm_id')}
             GROUP BY 1, 2
             SQL;
     }
