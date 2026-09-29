@@ -118,6 +118,26 @@
             </p>
         </a>
 
+        <a href="{{ route('insights-portfolio') }}"
+           class="block rounded-lg border border-emerald-300 bg-white p-5 shadow-sm ring-1 ring-emerald-200 hover:border-emerald-400">
+            <div class="flex items-baseline justify-between gap-4">
+                <h2 class="text-lg font-semibold">Insights — Portfolio Modelling (AlloyDB)</h2>
+                <span class="rounded bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800">
+                    no sync
+                </span>
+            </div>
+            <p class="mt-2 text-sm text-slate-600">
+                FIP's Portfolio Modelling page over a whole practice, computed live from raw journals
+                in the MySQL-shaped <code>insights</code> schema: what-if assumptions per season,
+                baseline, modelled and variance per line, closing cash carried forward, and a
+                per-farm breakdown.
+            </p>
+            <p class="mt-2 text-xs text-slate-500">
+                Exercises: one report layer shared with the single-farm cash flow · 250 farms and
+                58.7M journal lines in one statement · the column store under a multi-farm filter
+            </p>
+        </a>
+
         <a href="{{ route('alloydb-gross-margin') }}"
            class="block rounded-lg border border-sky-300 bg-white p-5 shadow-sm ring-1 ring-sky-200 hover:border-sky-400">
             <div class="flex items-baseline justify-between gap-4">
