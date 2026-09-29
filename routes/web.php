@@ -6,6 +6,7 @@ use App\Http\Controllers\GrossMarginReportController;
 use App\Http\Controllers\AlloyDbGrossMarginController;
 use App\Http\Controllers\AlloyDbOverdraftController;
 use App\Http\Controllers\GrossMarginV2ReportController;
+use App\Http\Controllers\InsightsDuckDbPortfolioController;
 use App\Http\Controllers\InsightsPortfolioController;
 use App\Http\Controllers\MongoGrossMarginController;
 use App\Http\Controllers\OverdraftReportController;
@@ -30,3 +31,4 @@ Route::get('/alloydb/overdraft', AlloyDbOverdraftController::class)->name('alloy
 Route::post('/alloydb/overdraft/config', [AlloyDbOverdraftController::class, 'save'])->name('alloydb-overdraft.save');
 Route::get('/valuation', ValuationReportController::class)->name('valuation');
 Route::get('/insights/portfolio-modelling', InsightsPortfolioController::class)->name('insights-portfolio');
+Route::get('/insights/duckdb/portfolio-modelling', InsightsDuckDbPortfolioController::class)->name('insights-duckdb-portfolio');
