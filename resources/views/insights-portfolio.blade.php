@@ -23,12 +23,11 @@
     };
     $cellValue = static function (?array $cell, string $field) use ($isAverage): ?float {
         if ($cell === null) { return null; }
-        return $isAverage ? $cell[$field] / max(1, $cell['farms']) : $cell[$field];
+        return $isAverage ? $cell[$field . '_per_farm'] : $cell[$field];
     };
     // FIP's variance colours: a rise is a gain on income and cash, a loss on a cost.
-    $varianceClass = static function (?float $v, \App\Services\Insights\PortfolioLine $line): string {
+    $varianceClass = static function (?float $v, bool $isCost): string {
         if ($v === null || abs($v) < 0.5) { return 'text-slate-400'; }
-        $isCost = in_array($line, [\App\Services\Insights\PortfolioLine::Fertiliser, \App\Services\Insights\PortfolioLine::OtherOperatingExpenses, \App\Services\Insights\PortfolioLine::TotalOperatingExpenses], true);
         return ($v > 0) !== $isCost ? 'gain' : 'loss';
     };
     $query = static fn (array $overrides = []): string => http_build_query(array_filter(array_merge([
@@ -203,7 +202,7 @@
                             <td class="num border-l border-slate-100 px-4 py-2 text-right">{{ $money($cellValue($cell, 'original')) }}</td>
                             @if ($hasAssumptions)
                                 <td class="num px-4 py-2 text-right">{{ $money($cellValue($cell, 'modelled')) }}</td>
-                                <td class="num px-4 py-2 text-right {{ $varianceClass($variance, $line) }}">{{ $money($variance) }}</td>
+                                <td class="num px-4 py-2 text-right {{ $varianceClass($variance, $cell['is_cost'] ?? false) }}">{{ $money($variance) }}</td>
                             @endif
                         @endforeach
                     </tr>
@@ -244,13 +243,13 @@
                 <tbody>
                     @foreach ($breakdown as $r)
                         <tr class="border-b border-slate-100 hover:bg-slate-50">
-                            <td class="px-4 py-1.5">{{ $r['farm']['name'] ?? $r['farm_id'] }}</td>
-                            <td class="px-4 py-1.5 text-slate-600">{{ $r['farm']['region'] ?? '' }}</td>
-                            <td class="px-4 py-1.5 text-slate-600">{{ $r['farm']['type'] ?? '' }}</td>
+                            <td class="px-4 py-1.5">{{ $r['farm_name'] ?? $r['farm_id'] }}</td>
+                            <td class="px-4 py-1.5 text-slate-600">{{ $r['region'] ?? '' }}</td>
+                            <td class="px-4 py-1.5 text-slate-600">{{ $r['farm_type'] ?? '' }}</td>
                             <td class="num px-4 py-1.5 text-right">{{ $money($r['original']) }}</td>
                             @if ($hasAssumptions)
                                 <td class="num px-4 py-1.5 text-right">{{ $money($r['modelled']) }}</td>
-                                <td class="num px-4 py-1.5 text-right {{ $varianceClass($r['variance'], $selectedLine) }}">{{ $money($r['variance']) }}</td>
+                                <td class="num px-4 py-1.5 text-right {{ $varianceClass($r['variance'], $r['is_cost']) }}">{{ $money($r['variance']) }}</td>
                             @endif
                         </tr>
                     @endforeach

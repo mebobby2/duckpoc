@@ -7,6 +7,7 @@ namespace App\Console\Commands;
 use App\Services\Insights\AlloyDB\InsightsSingleFarmReportQuery;
 use App\Services\Insights\AlloyDB\InsightsSchema;
 use App\Services\Insights\PortfolioAssumption;
+use App\Services\Insights\PortfolioBreakdown;
 use App\Services\Insights\PortfolioLine;
 use App\Services\Insights\AlloyDB\PortfolioModellingOracle;
 use App\Services\Insights\AlloyDB\PortfolioModellingQuery;
@@ -51,6 +52,7 @@ class InsightsPortfolioCommand extends Command
                 ];
             }
             $breakdown = !$this->option('summary');
+            $rowsFor = $breakdown ? PortfolioBreakdown::everyLine() : PortfolioBreakdown::none();
 
             $this->info(sprintf(
                 'Portfolio of %s farms, %s, seasons %d-%d, horizon %s, %d assumption(s)%s',
@@ -64,7 +66,7 @@ class InsightsPortfolioCommand extends Command
             ));
 
             if ($this->option('explain')) {
-                $this->line($query->explain($scope, $assumptions, $breakdown));
+                $this->line($query->explain($scope, $assumptions, $rowsFor));
 
                 return self::SUCCESS;
             }
@@ -73,7 +75,7 @@ class InsightsPortfolioCommand extends Command
             $rows = [];
             for ($i = 0; $i < max(1, (int) $this->option('runs')); $i++) {
                 $t = hrtime(true);
-                $rows = $query->run($scope, $assumptions, $breakdown);
+                $rows = $query->run($scope, $assumptions, $rowsFor);
                 $timings[] = (hrtime(true) - $t) / 1e6;
                 $this->line(sprintf('  run %d: %8.1f ms  (%s rows)', $i + 1, end($timings), number_format(count($rows))));
             }

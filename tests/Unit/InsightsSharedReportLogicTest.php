@@ -7,6 +7,8 @@ namespace Tests\Unit;
 use App\Services\Insights\AlloyDB\InsightsCashFlowSqlBuilder;
 use App\Services\Insights\AlloyDB\InsightsMonthlyReportSqlBuilder;
 use App\Services\Insights\AlloyDB\InsightsProfitLossSqlBuilder;
+use App\Services\Insights\PortfolioBreakdown;
+use App\Services\Insights\PortfolioBreakdownSort;
 use App\Services\Insights\PortfolioLine;
 use App\Services\Insights\AlloyDB\PortfolioModellingSqlBuilder;
 use App\Services\Insights\ReportBasis;
@@ -38,7 +40,7 @@ final class InsightsSharedReportLogicTest extends TestCase
     public function testBothReportsEmbedTheSharedReportLinesUnchanged(ReportBasis $basis, InsightsMonthlyReportSqlBuilder $singleFarm): void
     {
         $single = $singleFarm->build();
-        $portfolio = (new PortfolioModellingSqlBuilder(true, $basis))->build();
+        $portfolio = (new PortfolioModellingSqlBuilder(PortfolioBreakdown::everyLine(), $basis))->build();
 
         foreach ((new ReportLinesSqlBuilder($basis))->ctes('') as $name => $body) {
             if ($name === 'report_window') {
@@ -54,7 +56,7 @@ final class InsightsSharedReportLogicTest extends TestCase
     public function testNeitherConsumerReadsTheJournalOrStockTablesItself(ReportBasis $basis, InsightsMonthlyReportSqlBuilder $singleFarm): void
     {
         $shared = implode("\n", (new ReportLinesSqlBuilder($basis))->ctes(''));
-        $portfolio = (new PortfolioModellingSqlBuilder(true, $basis))->build();
+        $portfolio = (new PortfolioModellingSqlBuilder(PortfolioBreakdown::everyLine(), $basis))->build();
 
         foreach (['transaction_lines', 'stock_transactions', 'milk_productions'] as $table) {
             $sharedReads = substr_count($shared, $table);
@@ -79,5 +81,20 @@ final class InsightsSharedReportLogicTest extends TestCase
         self::assertNotContains(PortfolioLine::NetProfit, PortfolioLine::forBasis(ReportBasis::Cash));
         self::assertContains(PortfolioLine::NetProfit, PortfolioLine::forBasis(ReportBasis::Accrual));
         self::assertNotContains(PortfolioLine::ClosingCash, PortfolioLine::forBasis(ReportBasis::Accrual));
+    }
+
+    public function testThePageGetsItsNumbersFromTheStatement(): void
+    {
+        $breakdown = PortfolioBreakdown::of(PortfolioLine::Fertiliser, 2028, PortfolioBreakdownSort::Original);
+        $sql = (new PortfolioModellingSqlBuilder($breakdown))->build();
+
+        foreach (['original_per_farm', 'modelled_per_farm', 'variance_per_farm', 'farm_name', 'region', 'farm_type'] as $column) {
+            self::assertStringContainsString(" AS {$column}", $sql, "the statement returns {$column}");
+        }
+        self::assertStringContainsString('fl.line_order, fl.is_cost', $sql, 'the per-farm rows carry is_cost');
+        self::assertStringContainsString("WHERE line = 'fertiliser' AND season = 2028", $sql);
+        self::assertStringContainsString('ORDER BY farm_id IS NOT NULL, season, line_order, original DESC, farm_id ASC', $sql);
+        self::assertStringContainsString("('fertiliser', 3, true,", $sql, 'fertiliser is a cost');
+        self::assertStringContainsString("('milk_income', 0, false,", $sql, 'milk income is not');
     }
 }

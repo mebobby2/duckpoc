@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Insights\AlloyDB;
 
+use App\Services\Insights\PortfolioBreakdown;
 use App\Services\Insights\PortfolioLine;
 use App\Services\Insights\ReportBasis;
 
@@ -33,13 +34,23 @@ final class PortfolioModellingSqlBuilder
 {
     private const int FIXED_POINT = 10000;
 
+    /** The lines whose rise is a loss, for the page's variance colours. */
+    private const array COST_LINES = [
+        PortfolioLine::Fertiliser,
+        PortfolioLine::OtherOperatingExpenses,
+        PortfolioLine::TotalOperatingExpenses,
+    ];
+
     private readonly ReportLinesSqlBuilder $reportLines;
 
+    private readonly PortfolioBreakdown $breakdown;
+
     public function __construct(
-        private readonly bool $withBreakdown = true,
+        ?PortfolioBreakdown $breakdown = null,
         private readonly ReportBasis $basis = ReportBasis::Cash,
     ) {
         $this->reportLines = new ReportLinesSqlBuilder($basis);
+        $this->breakdown = $breakdown ?? PortfolioBreakdown::everyLine();
     }
 
     public function build(): string
@@ -53,6 +64,9 @@ final class PortfolioModellingSqlBuilder
             'with_flow_on' => $this->flowOnCte(),
             'farm_lines' => $this->farmLinesCte(),
         ];
+        if ($this->breakdown->perFarm) {
+            $ctes['farm_details'] = $this->farmDetailsCte();
+        }
 
         // `seasons` reads `farm`, so it has to follow it.
         $ordered = ['farm' => $ctes['farm'], 'seasons' => $ctes['seasons']] + $ctes;
@@ -216,43 +230,73 @@ final class PortfolioModellingSqlBuilder
         $rows = [];
         foreach (PortfolioLine::forBasis($this->basis) as $i => $line) {
             $column = $columns[$line->value];
-            $rows[] = sprintf("                ('%s', %d, CAST(w.%s AS NUMERIC), CAST(w.%s_m AS NUMERIC))", $line->value, $i, $column, $column);
+            $isCost = in_array($line, self::COST_LINES, true) ? 'true' : 'false';
+            $rows[] = sprintf("                ('%s', %d, %s, CAST(w.%s AS NUMERIC), CAST(w.%s_m AS NUMERIC))", $line->value, $i, $isCost, $column, $column);
         }
         $values = implode(",\n", $rows);
 
         return <<<SQL
-            SELECT w.farm_id, w.season, v.line, v.line_order, v.original, v.modelled
+            SELECT w.farm_id, w.season, v.line, v.line_order, v.is_cost, v.original, v.modelled
             FROM with_flow_on w
             CROSS JOIN LATERAL (VALUES
             {$values}
-            ) AS v(line, line_order, original, modelled)
+            ) AS v(line, line_order, is_cost, original, modelled)
             SQL;
     }
 
+    private function farmDetailsCte(): string
+    {
+        $s = InsightsSchema::SCHEMA;
+
+        return <<<SQL
+            SELECT f.id AS farm_id, f.name AS farm_name, f.region_primary AS region, t.name AS farm_type
+            FROM {$s}.farms f
+            LEFT JOIN {$s}.farms_operation_types o ON o.farm_id = f.id AND o._valid_to IS NULL
+            LEFT JOIN {$s}.farm_types t ON t.uuid = o.farm_type_uuid
+            WHERE f.id = ANY (CAST(:farm_ids AS INTEGER[])) AND f._valid_to IS NULL
+            SQL;
+    }
+
+    /**
+     * Portfolio totals for every line and season, each also as the average
+     * per farm, then the per-farm rows the breakdown asks for. A per-farm
+     * row's average is its own value.
+     */
     private function finalSelect(): string
     {
         $fp = self::FIXED_POINT;
 
-        $farmRows = $this->withBreakdown ? <<<SQL
-            SELECT farm_id, season, line, line_order,
-                   1 AS farms,
-                   round(original / {$fp}.0, 2) AS original,
-                   round(modelled / {$fp}.0, 2) AS modelled,
-                   round((modelled - original) / {$fp}.0, 2) AS variance
-            FROM farm_lines
-            UNION ALL
+        $farmRows = $this->breakdown->perFarm ? <<<SQL
+                SELECT fl.farm_id, d.farm_name, d.region, d.farm_type, fl.season, fl.line, fl.line_order, fl.is_cost,
+                       1 AS farms,
+                       round(fl.original / {$fp}.0, 2) AS original,
+                       round(fl.modelled / {$fp}.0, 2) AS modelled,
+                       round((fl.modelled - fl.original) / {$fp}.0, 2) AS variance,
+                       round(fl.original / {$fp}.0, 2) AS original_per_farm,
+                       round(fl.modelled / {$fp}.0, 2) AS modelled_per_farm,
+                       round((fl.modelled - fl.original) / {$fp}.0, 2) AS variance_per_farm
+                FROM farm_lines fl
+                JOIN farm_details d ON d.farm_id = fl.farm_id
+                WHERE {$this->breakdown->condition()}
+                UNION ALL
 
             SQL : '';
 
         return <<<SQL
-            {$farmRows}SELECT CAST(NULL AS INTEGER) AS farm_id, season, line, line_order,
-                   count(*) AS farms,
-                   round(SUM(original) / {$fp}.0, 2) AS original,
-                   round(SUM(modelled) / {$fp}.0, 2) AS modelled,
-                   round(SUM(modelled - original) / {$fp}.0, 2) AS variance
-            FROM farm_lines
-            GROUP BY season, line, line_order
-            ORDER BY farm_id NULLS FIRST, season, line_order
+            SELECT * FROM (
+            {$farmRows}    SELECT CAST(NULL AS INTEGER) AS farm_id, CAST(NULL AS TEXT) AS farm_name, CAST(NULL AS TEXT) AS region,
+                       CAST(NULL AS TEXT) AS farm_type, season, line, line_order, is_cost,
+                       count(*) AS farms,
+                       round(SUM(original) / {$fp}.0, 2) AS original,
+                       round(SUM(modelled) / {$fp}.0, 2) AS modelled,
+                       round(SUM(modelled - original) / {$fp}.0, 2) AS variance,
+                       round(SUM(original) / count(*) / {$fp}.0, 2) AS original_per_farm,
+                       round(SUM(modelled) / count(*) / {$fp}.0, 2) AS modelled_per_farm,
+                       round(SUM(modelled - original) / count(*) / {$fp}.0, 2) AS variance_per_farm
+                FROM farm_lines
+                GROUP BY season, line, line_order, is_cost
+            ) r
+            ORDER BY farm_id IS NOT NULL, season, line_order, {$this->breakdown->sort->orderBy()}
             SQL;
     }
 }

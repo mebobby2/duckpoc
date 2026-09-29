@@ -54,25 +54,24 @@ final readonly class PortfolioScope
     /**
      * The widest date range any farm's window covers, so the lake scan's date
      * filter is one range; and the latest window start, which bounds the
-     * opening-balance scan the same way.
+     * opening-balance scan the same way. Each farm's own window is cut from
+     * it in the statement.
      *
-     * @return array{0: string, 1: string, 2: string}
+     * @return array{0: string, 1: string, 2: string} from, to, latest start
      */
     public function period(): array
     {
-        $rows = InsightsDuckDb::mysql()->select(
-            'SELECT DISTINCT financial_year_end_month AS m, financial_year_end_day AS d FROM farms
-             WHERE id IN ('.implode(',', array_map('intval', $this->farmIds)).') AND _valid_to IS NULL',
+        $farmIds = implode(',', array_map('intval', $this->farmIds));
+        $row = InsightsDuckDb::mysql()->selectOne(
+            "SELECT MIN(STR_TO_DATE(CONCAT(? - 1, '-', financial_year_end_month, '-', financial_year_end_day), '%Y-%c-%e') + INTERVAL 1 DAY) AS period_from,
+                    MAX(STR_TO_DATE(CONCAT(?, '-', financial_year_end_month, '-', financial_year_end_day), '%Y-%c-%e')) AS period_to,
+                    MAX(STR_TO_DATE(CONCAT(? - 1, '-', financial_year_end_month, '-', financial_year_end_day), '%Y-%c-%e') + INTERVAL 1 DAY) AS opening_before
+             FROM farms
+             WHERE id IN ({$farmIds}) AND _valid_to IS NULL",
+            [$this->firstSeason, $this->lastSeason, $this->firstSeason],
         );
 
-        $starts = [];
-        $ends = [];
-        foreach ($rows as $r) {
-            $starts[] = (new \DateTimeImmutable(sprintf('%04d-%02d-%02d', $this->firstSeason - 1, (int) $r->m, (int) $r->d)))->modify('+1 day')->format('Y-m-d');
-            $ends[] = sprintf('%04d-%02d-%02d', $this->lastSeason, (int) $r->m, (int) $r->d);
-        }
-
-        return [min($starts), max($ends), max($starts)];
+        return [(string) $row->period_from, (string) $row->period_to, (string) $row->opening_before];
     }
 
     /**

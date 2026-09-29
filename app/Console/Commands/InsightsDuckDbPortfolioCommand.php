@@ -10,6 +10,8 @@ use App\Services\Insights\DuckDB\PortfolioModellingOracle;
 use App\Services\Insights\DuckDB\PortfolioModellingQuery;
 use App\Services\Insights\DuckDB\PortfolioScope;
 use App\Services\Insights\PortfolioAssumption;
+use App\Services\Insights\PortfolioBreakdown;
+use App\Services\Insights\PortfolioBreakdownSort;
 use App\Services\Insights\PortfolioLine;
 use App\Services\Insights\ReportBasis;
 use Illuminate\Console\Command;
@@ -25,6 +27,7 @@ class InsightsDuckDbPortfolioCommand extends Command
         {--assumption=* : line:season:percent, e.g. milk_income:2027:-5}
         {--runs=5 : Timed runs}
         {--summary : Portfolio totals only, no per-farm breakdown}
+        {--breakdown-of= : line:season — only that line and season per farm, sorted by variance, as the page asks}
         {--check=0 : Recompute this many farms in PHP and compare every value}
         {--check-single=0 : Run this many farms\' single-farm report (cash flow or P&L, by basis) over the window and compare its season totals}
         {--baseline= : A JSON file of another engine\'s rows (storage/app/insights-baselines) to compare every value against}
@@ -50,7 +53,13 @@ class InsightsDuckDbPortfolioCommand extends Command
                     new PortfolioAssumption(PortfolioLine::MilkIncome, PortfolioScope::CURRENT_SEASON + 1, 3),
                 ];
             }
-            $breakdown = !$this->option('summary');
+            $breakdownOf = $this->option('breakdown-of');
+            $breakdown = match (true) {
+                (bool) $this->option('summary') => PortfolioBreakdown::none(),
+                $breakdownOf !== null => $this->breakdownOf((string) $breakdownOf),
+                default => PortfolioBreakdown::everyLine(),
+            };
+            $everyFarmLine = $breakdown->perFarm && $breakdown->line === null;
 
             $this->info(sprintf(
                 'Portfolio of %s farms, %s, seasons %d-%d, horizon %s, %d assumption(s)%s',
@@ -60,7 +69,11 @@ class InsightsDuckDbPortfolioCommand extends Command
                 $scope->lastSeason,
                 $scope->horizon,
                 count($assumptions),
-                $breakdown ? ', with per-farm breakdown' : ', totals only',
+                match (true) {
+                    $everyFarmLine => ', with per-farm breakdown',
+                    $breakdown->perFarm => sprintf(', per-farm %s FY%d only', $breakdown->line?->label(), $breakdown->season),
+                    default => ', totals only',
+                },
             ));
 
             if ($this->option('explain')) {
@@ -96,17 +109,17 @@ class InsightsDuckDbPortfolioCommand extends Command
             $status = self::SUCCESS;
 
             $check = (int) $this->option('check');
-            if ($check > 0 && $this->check($db, $scope, $assumptions, $rows, $check, $breakdown) !== self::SUCCESS) {
+            if ($check > 0 && $this->check($db, $scope, $assumptions, $rows, $check, $everyFarmLine) !== self::SUCCESS) {
                 $status = self::FAILURE;
             }
 
             $checkSingle = (int) $this->option('check-single');
-            if ($checkSingle > 0 && $this->checkSingleFarm($db, $scope, $rows, $checkSingle, $breakdown) !== self::SUCCESS) {
+            if ($checkSingle > 0 && $this->checkSingleFarm($db, $scope, $rows, $checkSingle, $everyFarmLine) !== self::SUCCESS) {
                 $status = self::FAILURE;
             }
 
             $baseline = $this->option('baseline');
-            if ($baseline !== null && $this->compareBaseline((string) $baseline, $assumptions, $rows) !== self::SUCCESS) {
+            if ($baseline !== null && $this->compareBaseline((string) $baseline, $assumptions, $rows, $everyFarmLine) !== self::SUCCESS) {
                 $status = self::FAILURE;
             }
 
@@ -258,15 +271,28 @@ class InsightsDuckDbPortfolioCommand extends Command
         return self::FAILURE;
     }
 
+    private function breakdownOf(string $spec): PortfolioBreakdown
+    {
+        [$line, $season] = explode(':', $spec) + [1 => ''];
+
+        return PortfolioBreakdown::of(
+            PortfolioLine::tryFrom($line) ?? throw new \InvalidArgumentException("Unknown line '{$line}'."),
+            (int) $season,
+            PortfolioBreakdownSort::Variance,
+        );
+    }
+
     /**
      * Cross-engine parity: the same practice and assumptions run on AlloyDB,
      * recorded, must come out the same here. DuckDB rounds through DOUBLE
-     * where AlloyDB stayed NUMERIC, hence a cent's tolerance.
+     * where AlloyDB stayed NUMERIC, hence a cent's tolerance. The averages
+     * per farm are checked against the recorded totals divided by their farm
+     * count, so they are checked against AlloyDB too, not against themselves.
      *
      * @param list<PortfolioAssumption> $assumptions
      * @param list<array<string, mixed>> $rows
      */
-    private function compareBaseline(string $path, array $assumptions, array $rows): int
+    private function compareBaseline(string $path, array $assumptions, array $rows, bool $everyFarmLine): int
     {
         $baseline = json_decode((string) file_get_contents($path), true, flags: JSON_THROW_ON_ERROR);
         $ours = array_map(static fn (PortfolioAssumption $a): array => [$a->line->value, $a->season, $a->percent], $assumptions);
@@ -277,7 +303,9 @@ class InsightsDuckDbPortfolioCommand extends Command
         $key = static fn (array $r): string => ($r['farm_id'] ?? 'all').'|'.$r['season'].'|'.$r['line'];
         $want = [];
         foreach ($baseline['rows'] as $r) {
-            $want[$key($r)] = $r;
+            if ($everyFarmLine || $r['farm_id'] === null) {
+                $want[$key($r)] = $r;
+            }
         }
 
         $compared = 0;
@@ -291,9 +319,15 @@ class InsightsDuckDbPortfolioCommand extends Command
                 continue;
             }
             foreach (['farms', 'original', 'modelled', 'variance'] as $field) {
-                $compared++;
-                if (abs((float) $w[$field] - (float) $r[$field]) > 0.011) {
-                    $mismatches[] = [$r['farm_id'] ?? 'all', $r['season'], $r['line'], $field, number_format((float) $w[$field], 2), number_format((float) $r[$field], 2)];
+                $expected = ['' => (float) $w[$field], '_per_farm' => $field === 'farms' ? null : (float) $w[$field] / max(1, (int) $w['farms'])];
+                foreach ($expected as $suffix => $value) {
+                    if ($value === null) {
+                        continue;
+                    }
+                    $compared++;
+                    if (abs($value - (float) $r[$field.$suffix]) > 0.011) {
+                        $mismatches[] = [$r['farm_id'] ?? 'all', $r['season'], $r['line'], $field.$suffix, number_format($value, 2), number_format((float) $r[$field.$suffix], 2)];
+                    }
                 }
             }
         }

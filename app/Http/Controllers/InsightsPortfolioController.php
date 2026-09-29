@@ -6,6 +6,8 @@ namespace App\Http\Controllers;
 
 use App\Services\Insights\AlloyDB\InsightsSchema;
 use App\Services\Insights\PortfolioAssumption;
+use App\Services\Insights\PortfolioBreakdown;
+use App\Services\Insights\PortfolioBreakdownSort;
 use App\Services\Insights\PortfolioLine;
 use App\Services\Insights\AlloyDB\PortfolioModellingQuery;
 use App\Services\Insights\AlloyDB\PortfolioScope;
@@ -55,24 +57,26 @@ class InsightsPortfolioController extends Controller
         [$specs, $error] = $this->assumptionSpecs($request);
         $assumptions = array_map(PortfolioAssumption::parse(...), $specs);
 
+        $sort = PortfolioBreakdownSort::tryFrom((string) $request->query('sort', '')) ?? PortfolioBreakdownSort::Variance;
+        $exportCsv = $request->query('export') === 'csv';
+
         $scope = null;
+        $seasons = [];
         $rows = [];
         $elapsedMs = null;
-        $farms = [];
 
         try {
             $scope = PortfolioScope::forPractice($db, $practiceId, basis: $basis);
+            $seasons = range($scope->firstSeason, $scope->lastSeason);
+            if (!in_array($selectedSeason, $seasons, true)) {
+                $selectedSeason = PortfolioScope::CURRENT_SEASON;
+            }
+            $breakdown = $exportCsv ? PortfolioBreakdown::none() : PortfolioBreakdown::of($selectedLine, $selectedSeason, $sort);
             $started = microtime(true);
-            $rows = (new PortfolioModellingQuery($db))->run($scope, $assumptions);
+            $rows = (new PortfolioModellingQuery($db))->run($scope, $assumptions, $breakdown);
             $elapsedMs = (microtime(true) - $started) * 1000;
-            $farms = $this->farms($db, $scope->farmIds);
         } catch (Throwable $e) {
             $error = $e->getMessage();
-        }
-
-        $seasons = $scope === null ? [] : range($scope->firstSeason, $scope->lastSeason);
-        if (!in_array($selectedSeason, $seasons, true) && $seasons !== []) {
-            $selectedSeason = PortfolioScope::CURRENT_SEASON;
         }
 
         $totals = [];
@@ -80,20 +84,12 @@ class InsightsPortfolioController extends Controller
         foreach ($rows as $r) {
             if ($r['farm_id'] === null) {
                 $totals[$r['line']][$r['season']] = $r;
-            } elseif ($r['line'] === $selectedLine->value && $r['season'] === $selectedSeason) {
-                $breakdown[] = $r + ['farm' => $farms[$r['farm_id']] ?? null];
+            } else {
+                $breakdown[] = $r;
             }
         }
 
-        $sort = (string) $request->query('sort', 'variance');
-        usort($breakdown, match ($sort) {
-            'farm' => static fn (array $a, array $b): int => $a['farm_id'] <=> $b['farm_id'],
-            'original' => static fn (array $a, array $b): int => $b['original'] <=> $a['original'],
-            'modelled' => static fn (array $a, array $b): int => $b['modelled'] <=> $a['modelled'],
-            default => static fn (array $a, array $b): int => $a['variance'] <=> $b['variance'] ?: $a['farm_id'] <=> $b['farm_id'],
-        });
-
-        if ($request->query('export') === 'csv') {
+        if ($exportCsv) {
             return $this->csv($totals, $seasons, $summary, $lines);
         }
 
@@ -110,7 +106,7 @@ class InsightsPortfolioController extends Controller
             'specs' => $specs,
             'totals' => $totals,
             'breakdown' => $breakdown,
-            'sort' => $sort,
+            'sort' => $sort->value,
             'farmCount' => $scope === null ? 0 : count($scope->farmIds),
             'horizon' => $scope?->horizon,
             'elapsedMs' => $elapsedMs,
@@ -157,28 +153,6 @@ class InsightsPortfolioController extends Controller
 
     /**
      * @param list<int> $farmIds
-     * @return array<int, array{name: string, region: string, type: string}>
-     */
-    private function farms(ConnectionInterface $db, array $farmIds): array
-    {
-        $s = InsightsSchema::SCHEMA;
-        $farms = [];
-        foreach ($db->select(
-            "SELECT f.id, f.name, f.region_primary, t.name AS type
-             FROM {$s}.farms f
-             LEFT JOIN {$s}.farms_operation_types o ON o.farm_id = f.id AND o._valid_to IS NULL
-             LEFT JOIN {$s}.farm_types t ON t.uuid = o.farm_type_uuid
-             WHERE f.id = ANY (CAST(? AS INTEGER[])) AND f._valid_to IS NULL",
-            ['{'.implode(',', $farmIds).'}'],
-        ) as $f) {
-            $farms[(int) $f->id] = ['name' => (string) $f->name, 'region' => (string) $f->region_primary, 'type' => (string) ($f->type ?? '')];
-        }
-
-        return $farms;
-    }
-
-    /**
-     * @param list<int> $farmIds
      */
     private function journalLines(ConnectionInterface $db, array $farmIds): int
     {
@@ -209,9 +183,9 @@ class InsightsPortfolioController extends Controller
                 $row = [$line->label()];
                 foreach ($seasons as $season) {
                     $cell = $totals[$line->value][$season] ?? null;
-                    $divisor = $summary === self::SUMMARY_AVERAGE && $cell !== null ? max(1, $cell['farms']) : 1;
+                    $suffix = $summary === self::SUMMARY_AVERAGE ? '_per_farm' : '';
                     foreach (['original', 'modelled', 'variance'] as $field) {
-                        $row[] = $cell === null ? '' : round($cell[$field] / $divisor, 2);
+                        $row[] = $cell === null ? '' : $cell[$field . $suffix];
                     }
                 }
                 fputcsv($out, $row);

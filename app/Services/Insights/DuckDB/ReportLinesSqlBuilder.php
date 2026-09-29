@@ -119,12 +119,14 @@ final class ReportLinesSqlBuilder
 
     /**
      * @param array<string, string> $ctes name => body, in dependency order
+     * @param list<string> $alsoMaterialized the consumer's own CTEs it reads more than once
      */
-    public static function statement(array $ctes, string $select): string
+    public static function statement(array $ctes, string $select, array $alsoMaterialized = []): string
     {
+        $materializedNames = [...self::materialized(), ...$alsoMaterialized];
         $parts = [];
         foreach ($ctes as $name => $body) {
-            $materialized = in_array($name, self::materialized(), true) ? ' AS MATERIALIZED' : ' AS';
+            $materialized = in_array($name, $materializedNames, true) ? ' AS MATERIALIZED' : ' AS';
             $parts[] = "{$name}{$materialized} (\n{$body}\n)";
         }
 
@@ -182,21 +184,39 @@ final class ReportLinesSqlBuilder
             SQL;
     }
 
-    private function scanPredicate(string $basis): string
+    /**
+     * One basis's lake lines inside the period, actuals to the horizon and
+     * forecast after it. The horizon rule is written as two branches of plain
+     * conditions rather than one OR, because DuckDB applies plain conditions
+     * inside the scan; the OR ran as a separate filter over every line, 12.6 s
+     * of CPU on the 5,000-farm book.
+     */
+    private function ledger(string $basis): string
     {
-        $horizon = self::horizonPredicate();
-
-        return <<<SQL
-            WHERE {$this->farmFilter('tl.farm_id')}
+        $lines = InsightsDuckDb::lines();
+        $where = <<<SQL
+            {$this->farmFilter('tl.farm_id')}
                   AND tl.basis = '{$basis}'
                   AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
-                  AND {$horizon}
+            SQL;
+
+        return <<<SQL
+                SELECT tl.farm_id, tl.date, tl.month, tl.account_id, tl.tag, tl.net_amount
+                FROM {$lines} tl
+                WHERE {$where}
+                  AND tl.type = 'actuals' AND tl.date <= CAST(\$horizon AS DATE)
+                UNION ALL
+                SELECT tl.farm_id, tl.date, tl.month, tl.account_id, tl.tag, tl.net_amount
+                FROM {$lines} tl
+                WHERE {$where}
+                  AND tl.type = 'forecast' AND tl.date > CAST(\$horizon AS DATE)
             SQL;
     }
 
     /**
      * The ledger summed to (farm, month, account), bank legs out, and GST
-     * settlements kept at their own dates for the payment calendar.
+     * settlements kept at their own dates for the payment calendar, both from
+     * one pass over the lines.
      *
      * Accounts are excluded after the sum, not during the scan: account_id is
      * a group key, so the result is the same, and the lookup runs over a
@@ -205,23 +225,19 @@ final class ReportLinesSqlBuilder
      */
     private function scanCte(): string
     {
-        $lines = InsightsDuckDb::lines();
         $tag = self::TAG_GST_PAYMENT;
-        $where = $this->scanPredicate('cash');
 
         return <<<SQL
             SELECT g.* FROM (
-                SELECT tl.farm_id, tl.month AS date, tl.account_id, CAST(NULL AS VARCHAR) AS tag, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
-                FROM {$lines} tl
-                {$where}
-                  AND (tl.tag IS NULL OR tl.tag <> '{$tag}')
-                GROUP BY tl.farm_id, tl.month, tl.account_id
-                UNION ALL
-                SELECT tl.farm_id, tl.date, tl.account_id, '{$tag}', CAST(SUM(tl.net_amount) AS BIGINT)
-                FROM {$lines} tl
-                {$where}
-                  AND tl.tag = '{$tag}'
-                GROUP BY tl.farm_id, tl.date, tl.account_id
+                SELECT tl.farm_id,
+                       CASE WHEN tl.tag = '{$tag}' THEN tl.date ELSE tl.month END AS date,
+                       tl.account_id,
+                       CASE WHEN tl.tag = '{$tag}' THEN tl.tag END AS tag,
+                       CAST(SUM(tl.net_amount) AS BIGINT) AS amount
+                FROM (
+            {$this->ledger('cash')}
+                ) tl
+                GROUP BY 1, 2, 3, 4
             ) g
             WHERE g.account_id NOT IN (SELECT accountid FROM accounts WHERE account_type = 'BANK')
             SQL;
@@ -381,15 +397,14 @@ final class ReportLinesSqlBuilder
     /** Accrual lake lines on profit and loss accounts, summed to (farm, month, account). */
     private function accrualScanCte(): string
     {
-        $lines = InsightsDuckDb::lines();
         $groups = self::profitAndLossGroups();
-        $where = $this->scanPredicate('accrual');
 
         return <<<SQL
             SELECT g.* FROM (
                 SELECT tl.farm_id, tl.month AS date, tl.account_id, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
-                FROM {$lines} tl
-                {$where}
+                FROM (
+            {$this->ledger('accrual')}
+                ) tl
                 GROUP BY tl.farm_id, tl.month, tl.account_id
             ) g
             WHERE g.account_id NOT IN (SELECT accountid FROM accounts WHERE grp NOT IN ({$groups}))
@@ -397,26 +412,70 @@ final class ReportLinesSqlBuilder
     }
 
     /**
-     * Each month's milk production priced at its tracker's price, as a
-     * subquery MySQL runs itself. The price table is keyed by tracker, not
-     * farm, so DuckDB cannot push a farm filter into its scan and would read
-     * every tracker's prices on every report; handed the whole join, MySQL
-     * walks its indexes from the farm list instead. The rules — which months
-     * become a virtual journal, and on what date — stay in the two callers.
+     * Each month's milk production priced at its tracker's price. MySQL
+     * returns production, trackers and prices as three reads, each cut to the
+     * farm list and to the months either milk virtual journal can use (from
+     * three months before the horizon to the period end); DuckDB joins them.
+     * The price table is keyed by tracker, not farm, which is why each read
+     * runs in MySQL, where the farm list reaches its indexes. The rules —
+     * which months become a virtual journal, and on what date — stay in the
+     * two callers.
      */
     private function pricedMilkProduction(): string
     {
-        $sql = <<<SQL
-            SELECT mp.farm_id, mt.income_accountid AS account_id, mp.transaction_date,
-                   CAST(mp.production AS SIGNED) * pr.price AS value
-            FROM milk_productions mp
-            JOIN milk_trackers mt ON mt.id = mp.milk_tracker_id AND mt._valid_to IS NULL
-            JOIN milk_tracker_prices pr ON pr.milk_tracker_id = mt.id AND pr.month = mp.transaction_date
-            WHERE {$this->farmFilter('mp.farm_id')}
-              AND mp._valid_to IS NULL AND mp.budget_id = 0 AND mp.production > 0
-            SQL;
+        $months = [
+            'from' => "CAST(\$horizon AS DATE) - INTERVAL '3 months'",
+            'to' => "CAST(\$period_to AS DATE)",
+        ];
 
-        return sprintf("mysql_query('%s', '%s')", InsightsDuckDb::MYSQL_ALIAS, str_replace("'", "''", $sql));
+        $production = self::mysqlQuery(<<<SQL
+            SELECT farm_id, milk_tracker_id, transaction_date, production
+            FROM milk_productions
+            WHERE {$this->farmFilter('farm_id')} AND _valid_to IS NULL AND budget_id = 0 AND production > 0
+              AND transaction_date > '{from}' AND transaction_date <= '{to}'
+            SQL, $months);
+
+        $trackers = self::mysqlQuery(<<<SQL
+            SELECT id, income_accountid FROM milk_trackers
+            WHERE {$this->farmFilter('farm_id')} AND _valid_to IS NULL
+            SQL);
+
+        $prices = self::mysqlQuery(<<<SQL
+            SELECT pr.milk_tracker_id, pr.month, pr.price
+            FROM milk_tracker_prices pr
+            JOIN milk_trackers mt ON mt.id = pr.milk_tracker_id
+            WHERE {$this->farmFilter('mt.farm_id')} AND mt._valid_to IS NULL
+              AND pr.month > '{from}' AND pr.month <= '{to}'
+            SQL, $months);
+
+        return <<<SQL
+            (
+                SELECT p.farm_id, mt.income_accountid AS account_id, p.transaction_date,
+                       CAST(p.production AS BIGINT) * pr.price AS value
+                FROM {$production} p
+                JOIN {$trackers} mt ON mt.id = p.milk_tracker_id
+                JOIN {$prices} pr ON pr.milk_tracker_id = p.milk_tracker_id AND pr.month = p.transaction_date
+            )
+            SQL;
+    }
+
+    /**
+     * A MySQL query MySQL runs itself. Each `{name}` in it takes a DuckDB
+     * date expression, printed as an ISO date, so a bound parameter reaches
+     * MySQL as a date and never as text of its own.
+     *
+     * @param array<string, string> $dates placeholder => DuckDB date expression
+     */
+    private static function mysqlQuery(string $sql, array $dates = []): string
+    {
+        $pieces = [];
+        foreach (preg_split('/\{(\w+)\}/', $sql, -1, PREG_SPLIT_DELIM_CAPTURE) as $i => $piece) {
+            $pieces[] = $i % 2 === 0
+                ? "'".str_replace("'", "''", $piece)."'"
+                : "strftime(CAST({$dates[$piece]} AS DATE), '%Y-%m-%d')";
+        }
+
+        return sprintf("mysql_query('%s', %s)", InsightsDuckDb::MYSQL_ALIAS, implode(' || ', $pieces));
     }
 
     private function accrualMilkVjCte(): string
