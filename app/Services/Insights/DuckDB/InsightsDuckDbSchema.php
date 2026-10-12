@@ -31,7 +31,7 @@ final class InsightsDuckDbSchema
 
         foreach (['practices', 'farms', 'farm_practice', 'farm_types', 'farms_operation_types', 'xero_accounts', 'categories',
             'category_xero_account', 'milk_trackers', 'milk_productions', 'milk_tracker_prices', 'stock_types', 'stock_classes',
-            'trackers', 'stock_transactions', 'stock_class_valuations'] as $table) {
+            'trackers', 'stock_transactions', 'stock_class_valuations', 'active_plans', 'plan_drifts'] as $table) {
             $db->statement("DROP TABLE IF EXISTS {$table}");
         }
 
@@ -148,6 +148,35 @@ final class InsightsDuckDbSchema
                 farm_id INT NOT NULL, tracker_id INT NOT NULL, stock_class_uuid CHAR(36) NOT NULL,
                 season INT NOT NULL, value_per_head BIGINT NOT NULL,
                 PRIMARY KEY (farm_id, tracker_id, stock_class_uuid, season)
+            )
+            SQL);
+
+        $this->createPlanTables();
+    }
+
+    /**
+     * Each farm's active plan: the season it covers, the horizon its forecast
+     * was agreed at, and how far actuals have come in since. Seeded farms
+     * have no row until actuals are advanced past the plan.
+     *
+     * `plan_drifts` is the seeder's ground truth, what it did to each farm's
+     * actuals, so a variance check can be scored against it. Figured has no
+     * such table.
+     */
+    public function createPlanTables(): void
+    {
+        $db = InsightsDuckDb::mysql();
+
+        $db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS active_plans (
+                farm_id INT PRIMARY KEY, name VARCHAR(64) NOT NULL, season INT NOT NULL,
+                plan_horizon DATE NOT NULL, actuals_to DATE NOT NULL
+            )
+            SQL);
+
+        $db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS plan_drifts (
+                farm_id INT PRIMARY KEY, kind VARCHAR(32) NOT NULL, description VARCHAR(255) NOT NULL
             )
             SQL);
     }

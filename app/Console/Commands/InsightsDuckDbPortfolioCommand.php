@@ -24,6 +24,7 @@ class InsightsDuckDbPortfolioCommand extends Command
         {--practice=1 : Practice whose farms make up the portfolio}
         {--basis=cash : cash (cash flow, closing cash) or accrual (profit and loss, net profit)}
         {--limit= : Only the practice\'s first N farms}
+        {--horizon= : Where actuals stop, if not the seeded horizon}
         {--assumption=* : line:season:percent, e.g. milk_income:2027:-5}
         {--runs=5 : Timed runs}
         {--summary : Portfolio totals only, no per-farm breakdown}
@@ -45,6 +46,9 @@ class InsightsDuckDbPortfolioCommand extends Command
             $basis = ReportBasis::tryFrom((string) $this->option('basis'))
                 ?? throw new \InvalidArgumentException('--basis is cash or accrual.');
             $scope = PortfolioScope::forPractice((int) $this->option('practice'), $limit === null ? null : (int) $limit, $basis);
+            if ($this->option('horizon') !== null) {
+                $scope = new PortfolioScope($scope->farmIds, (string) $this->option('horizon'), basis: $basis);
+            }
             $assumptions = array_map(PortfolioAssumption::parse(...), (array) $this->option('assumption'));
             if ($assumptions === []) {
                 $assumptions = [

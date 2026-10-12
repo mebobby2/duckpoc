@@ -46,8 +46,10 @@ use InvalidArgumentException;
  * written into the statement as literals rather than bound: it has to reach
  * the lake scan as a constant for DuckDB to prune row groups and files on it.
  * The consumer supplies `report_window(farm_id, window_start, window_end)`
- * and binds `$horizon`, `$period_from`, `$period_to` and, on cash basis,
- * `$opening_before`.
+ * and binds the horizon, `$period_from`, `$period_to` and, on cash basis,
+ * `$opening_before`. The horizon is `$horizon` unless the consumer names
+ * another parameter, which is how one statement holds the same report at two
+ * horizons: the plan as it stood, and actuals to date.
  */
 final class ReportLinesSqlBuilder
 {
@@ -65,6 +67,7 @@ final class ReportLinesSqlBuilder
     public function __construct(
         array $farmIds,
         public readonly ReportBasis $basis = ReportBasis::Cash,
+        private readonly string $horizonParameter = 'horizon',
     ) {
         if ($farmIds === []) {
             throw new InvalidArgumentException('A report needs at least one farm.');
@@ -133,9 +136,21 @@ final class ReportLinesSqlBuilder
         return "WITH\n".implode(",\n\n", $parts)."\n\n".$select;
     }
 
-    public static function horizonPredicate(string $alias = 'tl', string $actual = 'actuals'): string
+    public static function horizonPredicate(string $alias = 'tl', string $actual = 'actuals', string $parameter = 'horizon'): string
     {
-        return "(({$alias}.date <= CAST(\$horizon AS DATE) AND {$alias}.type = '{$actual}') OR ({$alias}.date > CAST(\$horizon AS DATE) AND {$alias}.type = 'forecast'))";
+        $horizon = self::horizonOf($parameter);
+
+        return "(({$alias}.date <= {$horizon} AND {$alias}.type = '{$actual}') OR ({$alias}.date > {$horizon} AND {$alias}.type = 'forecast'))";
+    }
+
+    private static function horizonOf(string $parameter): string
+    {
+        return "CAST(\${$parameter} AS DATE)";
+    }
+
+    private function horizon(): string
+    {
+        return self::horizonOf($this->horizonParameter);
     }
 
     /**
@@ -204,12 +219,12 @@ final class ReportLinesSqlBuilder
                 SELECT tl.farm_id, tl.date, tl.month, tl.account_id, tl.tag, tl.net_amount
                 FROM {$lines} tl
                 WHERE {$where}
-                  AND tl.type = 'actuals' AND tl.date <= CAST(\$horizon AS DATE)
+                  AND tl.type = 'actuals' AND tl.date <= {$this->horizon()}
                 UNION ALL
                 SELECT tl.farm_id, tl.date, tl.month, tl.account_id, tl.tag, tl.net_amount
                 FROM {$lines} tl
                 WHERE {$where}
-                  AND tl.type = 'forecast' AND tl.date > CAST(\$horizon AS DATE)
+                  AND tl.type = 'forecast' AND tl.date > {$this->horizon()}
             SQL;
     }
 
@@ -247,7 +262,7 @@ final class ReportLinesSqlBuilder
     private function openingCte(): string
     {
         $lines = InsightsDuckDb::lines();
-        $horizon = self::horizonPredicate();
+        $horizon = self::horizonPredicate('tl', 'actuals', $this->horizonParameter);
 
         return <<<SQL
             SELECT w.farm_id, COALESCE(SUM(b.amount), 0) AS opening_balance
@@ -275,7 +290,7 @@ final class ReportLinesSqlBuilder
                    CAST(mp.transaction_date + {$offset} AS DATE) AS date,
                    -mp.value AS amount
             FROM {$this->pricedMilkProduction()} mp
-            WHERE CAST(mp.transaction_date + {$offset} AS DATE) > CAST(\$horizon AS DATE)
+            WHERE CAST(mp.transaction_date + {$offset} AS DATE) > {$this->horizon()}
               AND CAST(mp.transaction_date + {$offset} AS DATE) <= CAST(\$period_to AS DATE)
             SQL;
     }
@@ -355,7 +370,7 @@ final class ReportLinesSqlBuilder
             FROM gst_window_net w
             JOIN gst_accounts g ON g.farm_id = w.farm_id
             LEFT JOIN gst_settlements st ON st.farm_id = w.farm_id AND st.date > w.window_end AND st.date <= w.pay_date
-            WHERE w.pay_date > CAST(\$horizon AS DATE)
+            WHERE w.pay_date > {$this->horizon()}
             GROUP BY w.farm_id, g.payments_id, w.pay_date, w.net
             SQL;
     }
@@ -416,6 +431,9 @@ final class ReportLinesSqlBuilder
      * returns production, trackers and prices as three reads, each cut to the
      * farm list and to the months either milk virtual journal can use (from
      * three months before the horizon to the period end); DuckDB joins them.
+     * Production is actual to the horizon and forecast after it, the ledger's
+     * rule: once a month's actual production is recorded, its forecast row
+     * stays behind as the plan.
      * The price table is keyed by tracker, not farm, which is why each read
      * runs in MySQL, where the farm list reaches its indexes. The rules —
      * which months become a virtual journal, and on what date — stay in the
@@ -424,8 +442,9 @@ final class ReportLinesSqlBuilder
     private function pricedMilkProduction(): string
     {
         $months = [
-            'from' => "CAST(\$horizon AS DATE) - INTERVAL '3 months'",
+            'from' => "{$this->horizon()} - INTERVAL '3 months'",
             'to' => "CAST(\$period_to AS DATE)",
+            'horizon' => $this->horizon(),
         ];
 
         $production = self::mysqlQuery(<<<SQL
@@ -433,6 +452,7 @@ final class ReportLinesSqlBuilder
             FROM milk_productions
             WHERE {$this->farmFilter('farm_id')} AND _valid_to IS NULL AND budget_id = 0 AND production > 0
               AND transaction_date > '{from}' AND transaction_date <= '{to}'
+              AND ((transaction_date <= '{horizon}' AND type = 'actual') OR (transaction_date > '{horizon}' AND type = 'forecast'))
             SQL, $months);
 
         $trackers = self::mysqlQuery(<<<SQL
@@ -485,7 +505,7 @@ final class ReportLinesSqlBuilder
                    mp.transaction_date AS date,
                    -mp.value AS amount
             FROM {$this->pricedMilkProduction()} mp
-            WHERE CAST(mp.transaction_date + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) > CAST(\$horizon AS DATE)
+            WHERE CAST(mp.transaction_date + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) > {$this->horizon()}
               AND mp.transaction_date <= CAST(\$period_to AS DATE)
             SQL;
     }
@@ -493,7 +513,7 @@ final class ReportLinesSqlBuilder
     private function stockNetCte(): string
     {
         $st = self::mysql('stock_transactions');
-        $horizon = self::horizonPredicate('st', 'actual');
+        $horizon = self::horizonPredicate('st', 'actual', $this->horizonParameter);
 
         return <<<SQL
             SELECT st.farm_id, st.tracker_id, st.stock_class_uuid,

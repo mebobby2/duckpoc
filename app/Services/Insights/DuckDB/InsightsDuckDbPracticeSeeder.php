@@ -33,7 +33,7 @@ final class InsightsDuckDbPracticeSeeder
     public const string HORIZON = PortfolioScope::HORIZON;
     public const string TAG_GST_PAYMENT = 'gst_payment';
 
-    private const float GST_RATE = 0.15;
+    public const float GST_RATE = 0.15;
     private const int VALID_FROM = 1_700_000_000;
     private const int FIXED_POINT = 10_000;
 

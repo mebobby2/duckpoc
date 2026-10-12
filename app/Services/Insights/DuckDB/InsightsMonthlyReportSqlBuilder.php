@@ -30,9 +30,9 @@ abstract class InsightsMonthlyReportSqlBuilder
 
     private readonly ReportLinesSqlBuilder $reportLines;
 
-    public function __construct(int $farmId)
+    public function __construct(int $farmId, private readonly string $horizonParameter = 'horizon')
     {
-        $this->reportLines = new ReportLinesSqlBuilder([$farmId], $this->basis());
+        $this->reportLines = new ReportLinesSqlBuilder([$farmId], $this->basis(), $horizonParameter);
     }
 
     abstract protected function basis(): ReportBasis;
@@ -79,13 +79,15 @@ abstract class InsightsMonthlyReportSqlBuilder
 
     private function monthsCte(): string
     {
+        $horizon = "CAST(\${$this->horizonParameter} AS DATE)";
+
         return <<<SQL
             SELECT row_number() OVER (ORDER BY g.m) AS interval_index,
                    CAST(g.m AS DATE) AS month_start,
                    strftime(g.m, '%Y-%m') AS month,
                    CASE
-                       WHEN CAST(g.m + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) <= CAST(\$horizon AS DATE) THEN 'actuals'
-                       WHEN CAST(g.m AS DATE) > CAST(\$horizon AS DATE) THEN 'forecast'
+                       WHEN CAST(g.m + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) <= {$horizon} THEN 'actuals'
+                       WHEN CAST(g.m AS DATE) > {$horizon} THEN 'forecast'
                        ELSE 'actualsForecast'
                    END AS column_type
             FROM generate_series(CAST(date_trunc('month', CAST(\$period_from AS DATE)) AS TIMESTAMP), CAST(CAST(\$period_to AS DATE) AS TIMESTAMP), INTERVAL '1 month') AS g(m)

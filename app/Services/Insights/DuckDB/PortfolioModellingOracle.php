@@ -131,13 +131,16 @@ final class PortfolioModellingOracle
         $virtual = [];
 
         foreach ($this->mysql->select(
-            "SELECT mt.income_accountid, mp.transaction_date, mp.production, pr.price
+            "SELECT mt.income_accountid, mp.transaction_date, mp.type, mp.production, pr.price
              FROM milk_productions mp
              JOIN milk_trackers mt ON mt.id = mp.milk_tracker_id
              JOIN milk_tracker_prices pr ON pr.milk_tracker_id = mt.id AND pr.month = mp.transaction_date
              WHERE mp.farm_id = ? AND mp.production > 0 AND mp.budget_id = 0",
             [$farmId],
         ) as $m) {
+            if (!self::productionInScope($m, $scope)) {
+                continue;
+            }
             $paid = (new DateTimeImmutable((string) $m->transaction_date))->modify('+1 month')->modify('+19 days')->format('Y-m-d');
             if ($paid > $scope->horizon && $paid <= $periodTo) {
                 $virtual[] = [$paid, (string) $m->income_accountid, -((int) $m->production * (int) $m->price)];
@@ -314,13 +317,16 @@ final class PortfolioModellingOracle
         }
 
         foreach ($this->mysql->select(
-            "SELECT mt.income_accountid, mp.transaction_date, mp.production, pr.price
+            "SELECT mt.income_accountid, mp.transaction_date, mp.type, mp.production, pr.price
              FROM milk_productions mp
              JOIN milk_trackers mt ON mt.id = mp.milk_tracker_id
              JOIN milk_tracker_prices pr ON pr.milk_tracker_id = mt.id AND pr.month = mp.transaction_date
              WHERE mp.farm_id = ? AND mp.production > 0 AND mp.budget_id = 0",
             [$farmId],
         ) as $m) {
+            if (!self::productionInScope($m, $scope)) {
+                continue;
+            }
             $month = (string) $m->transaction_date;
             $monthEnd = (new DateTimeImmutable($month))->modify('last day of this month')->format('Y-m-d');
             if ($monthEnd > $scope->horizon && $month <= $periodTo) {
@@ -434,5 +440,13 @@ final class PortfolioModellingOracle
         }
 
         return $out;
+    }
+
+    /** Actual production to the horizon, forecast after it. */
+    private static function productionInScope(object $m, PortfolioScope $scope): bool
+    {
+        $date = (string) $m->transaction_date;
+
+        return ($date <= $scope->horizon && $m->type === 'actual') || ($date > $scope->horizon && $m->type === 'forecast');
     }
 }
