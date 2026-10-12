@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Services\Insights\DuckDB\HerdValuationSqlBuilder;
 use App\Services\Insights\DuckDB\InsightsCashFlowSqlBuilder;
+use App\Services\Insights\DuckDB\InsightsDuckDb;
 use App\Services\Insights\DuckDB\InsightsMonthlyReportSqlBuilder;
 use App\Services\Insights\DuckDB\InsightsProfitLossSqlBuilder;
+use App\Services\Insights\DuckDB\MilkProductionSqlBuilder;
 use App\Services\Insights\DuckDB\PlanComparisonSqlBuilder;
 use App\Services\Insights\DuckDB\ReportLinesSqlBuilder;
 use App\Services\Insights\ReportBasis;
@@ -82,5 +85,39 @@ final class InsightsDuckDbPlanComparisonTest extends TestCase
         $this->expectException(InvalidArgumentException::class);
 
         new PlanComparisonSqlBuilder(self::FARM_ID, ReportBasis::Cash, "2026-08' OR true --");
+    }
+
+    public function testMilkIncomeComesFromTheProfitAndLossAtBothHorizons(): void
+    {
+        $sql = (new MilkProductionSqlBuilder(self::FARM_ID))->build();
+
+        foreach ([PlanComparisonSqlBuilder::PLAN_HORIZON, PlanComparisonSqlBuilder::CURRENT_HORIZON] as $horizon) {
+            $shared = (new ReportLinesSqlBuilder([self::FARM_ID], ReportBasis::Accrual, $horizon))->ctes(ReportLinesSqlBuilder::periodWindow());
+            foreach (['scan', 'milk_vj', 'report_lines'] as $name) {
+                self::assertStringContainsString($shared[$name], $sql, "{$horizon}: milk income's {$name} is not the shared one");
+            }
+            self::assertStringContainsString("(transaction_date <= CAST(\${$horizon} AS DATE) AND type = 'actual')", $sql, "{$horizon}: kgMS by the horizon rule");
+        }
+        self::assertDoesNotMatchRegularExpression('/\$horizon\b/', $sql);
+    }
+
+    public function testHerdValuationUsesTheProfitAndLossLivestockRuleWithoutTheLake(): void
+    {
+        $sql = (new HerdValuationSqlBuilder(self::FARM_ID))->build();
+
+        foreach ([PlanComparisonSqlBuilder::PLAN_HORIZON, PlanComparisonSqlBuilder::CURRENT_HORIZON] as $horizon) {
+            $shared = (new ReportLinesSqlBuilder([self::FARM_ID], ReportBasis::Accrual, $horizon))->ctes(ReportLinesSqlBuilder::periodWindow());
+            foreach (['stock_net', 'stock_heads', 'stock_class_values'] as $name) {
+                self::assertStringContainsString($shared[$name], $sql, "{$horizon}: the valuation's {$name} is not the shared one");
+            }
+        }
+        self::assertStringNotContainsString(InsightsDuckDb::lines(), $sql, 'a herd valuation reads no journal lines');
+    }
+
+    public function testTheProfitAndLossValuesLivestockFromTheClassValues(): void
+    {
+        $ctes = (new ReportLinesSqlBuilder([self::FARM_ID], ReportBasis::Accrual))->ctes('');
+
+        self::assertStringContainsString('FROM stock_class_values', $ctes['stock_values']);
     }
 }

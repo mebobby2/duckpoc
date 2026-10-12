@@ -31,7 +31,7 @@ final class InsightsDuckDbSchema
 
         foreach (['practices', 'farms', 'farm_practice', 'farm_types', 'farms_operation_types', 'xero_accounts', 'categories',
             'category_xero_account', 'milk_trackers', 'milk_productions', 'milk_tracker_prices', 'stock_types', 'stock_classes',
-            'trackers', 'stock_transactions', 'stock_class_valuations', 'active_plans', 'plan_drifts'] as $table) {
+            'trackers', 'stock_transactions', 'stock_class_valuations', 'active_plans', 'plan_drifts', 'plan_notes'] as $table) {
             $db->statement("DROP TABLE IF EXISTS {$table}");
         }
 
@@ -162,6 +162,9 @@ final class InsightsDuckDbSchema
      * `plan_drifts` is the seeder's ground truth, what it did to each farm's
      * actuals, so a variance check can be scored against it. Figured has no
      * such table.
+     *
+     * `plan_notes` holds what the farmer or advisor has said matters, or
+     * explains, for plan status to weigh when judging the signals.
      */
     public function createPlanTables(): void
     {
@@ -177,6 +180,13 @@ final class InsightsDuckDbSchema
         $db->statement(<<<'SQL'
             CREATE TABLE IF NOT EXISTS plan_drifts (
                 farm_id INT PRIMARY KEY, kind VARCHAR(32) NOT NULL, description VARCHAR(255) NOT NULL
+            )
+            SQL);
+
+        $db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS plan_notes (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY, farm_id INT NOT NULL, author VARCHAR(16) NOT NULL,
+                note TEXT NOT NULL, created_at DATETIME NOT NULL, KEY (farm_id)
             )
             SQL);
     }

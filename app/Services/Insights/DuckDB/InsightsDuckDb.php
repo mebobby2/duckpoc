@@ -39,12 +39,13 @@ final class InsightsDuckDb
 
     /**
      * A DuckDB with the lake and the Insights MySQL database attached.
-     * Reports attach MySQL read-only; the seeder and the importer need to
-     * write through it.
+     * Reports attach both read-only, so any number of them, the MCP server
+     * included, can run at once; the seeder, the importer and the actuals
+     * advancer write, and need the others stopped.
      */
-    public static function connect(bool $writableMysql = false): DuckDB
+    public static function connect(bool $writable = false): DuckDB
     {
-        $db = (new DuckLakeConnectionFactory(config('duckdb')))->connect();
+        $db = (new DuckLakeConnectionFactory(config('duckdb')))->connect(readOnly: !$writable);
 
         $c = config('duckdb.app_database');
         $dsn = sprintf('host=%s port=%s user=%s password=%s database=%s', $c['host'], $c['port'], $c['username'], $c['password'], self::MYSQL_DATABASE);
@@ -52,7 +53,7 @@ final class InsightsDuckDb
             "ATTACH IF NOT EXISTS '%s' AS %s (TYPE mysql%s)",
             str_replace("'", "''", $dsn),
             self::MYSQL_ALIAS,
-            $writableMysql ? '' : ', READ_ONLY',
+            $writable ? '' : ', READ_ONLY',
         ));
 
         return $db;

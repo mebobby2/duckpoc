@@ -12,6 +12,8 @@ use InvalidArgumentException;
  * turns journals into report lines, on either basis, for any number of
  * farms. The DuckDB twin of the AlloyDB PoC's builder, rule for rule: same
  * steps, same order, same CTE names, so the two can be read side by side.
+ * One addition: the livestock value is kept by class (`stock_class_values`)
+ * before it is summed, so a herd valuation reads the same rule.
  *
  * Every consumer builds on these CTEs and adds only its own presentation:
  * the single-farm cash flow and profit and loss (InsightsMonthlyReportSqlBuilder)
@@ -90,6 +92,7 @@ final class ReportLinesSqlBuilder
                 'milk_vj' => $this->accrualMilkVjCte(),
                 'stock_net' => $this->stockNetCte(),
                 'stock_heads' => $this->stockHeadsCte(),
+                'stock_class_values' => $this->stockClassValuesCte(),
                 'stock_values' => $this->stockValuesCte(),
                 'valuation_vj' => $this->valuationVjCte(),
                 'report_lines' => $this->accrualReportLinesCte(),
@@ -112,6 +115,15 @@ final class ReportLinesSqlBuilder
             'gst_vj' => $this->gstVjCte(),
             'report_lines' => $this->reportLinesCte(),
         ];
+    }
+
+    /** A `report_window` body: every farm over the bound period. */
+    public static function periodWindow(): string
+    {
+        return <<<SQL
+            SELECT farm_id, CAST(\$period_from AS DATE) AS window_start, CAST(\$period_to AS DATE) AS window_end
+            FROM farm
+            SQL;
     }
 
     /** CTEs every later reader re-reads, so they run once. */
@@ -547,18 +559,28 @@ final class ReportLinesSqlBuilder
             SQL;
     }
 
-    private function stockValuesCte(): string
+    /** Each class's head at each month end, valued at its season's rate per head. */
+    private function stockClassValuesCte(): string
     {
         $v = self::mysql('stock_class_valuations');
 
         return <<<SQL
-            SELECT h.farm_id, h.ms, SUM(h.head * v.value_per_head) AS value
+            SELECT h.farm_id, h.tracker_id, h.stock_class_uuid, h.ms, h.head, v.value_per_head,
+                   h.head * v.value_per_head AS value
             FROM stock_heads h
             JOIN farm f ON f.farm_id = h.farm_id
             JOIN {$v} v
               ON v.farm_id = h.farm_id AND v.tracker_id = h.tracker_id AND v.stock_class_uuid = h.stock_class_uuid
              AND v.season = year(h.ms) + CASE WHEN month(h.ms) > f.fy_month THEN 1 ELSE 0 END
             WHERE {$this->farmFilter('v.farm_id')}
+            SQL;
+    }
+
+    private function stockValuesCte(): string
+    {
+        return <<<SQL
+            SELECT farm_id, ms, SUM(value) AS value
+            FROM stock_class_values
             GROUP BY 1, 2
             SQL;
     }

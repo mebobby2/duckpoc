@@ -35,7 +35,7 @@ class InsightsDuckDbSetupCommand extends Command
         $schema = new InsightsDuckDbSchema();
 
         try {
-            $db = InsightsDuckDb::connect(writableMysql: true);
+            $db = InsightsDuckDb::connect(writable: true);
             $schema->applyWriteTuning($db);
 
             if ($this->option('fresh')) {

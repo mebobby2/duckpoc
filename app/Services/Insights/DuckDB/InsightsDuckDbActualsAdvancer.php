@@ -14,9 +14,10 @@ use Saturio\DuckDB\DuckDB;
  * actuals that drift from that plan in known ways, so a plan-versus-actual
  * report has something real to find.
  *
- * Actuals are generated from the plan itself (each forecast event becomes one
- * to three real transactions, with noise), never from the seeder's hash
- * scaffolding, so any practice can be advanced however it was seeded. Each
+ * Actuals are generated from the plan itself (each forecast event becomes as
+ * many real transactions as its account had a year earlier, with the
+ * seeder's noise), never from the seeder's hash scaffolding, so any practice
+ * can be advanced however it was seeded. Each
  * farm gets one drift — on plan, a fertiliser price rise, a dry spell, a milk
  * price cut, a repairs blowout, or fertiliser applied a month early — and
  * `plan_drifts` records which, as the answer key.
@@ -232,8 +233,10 @@ final class InsightsDuckDbActualsAdvancer
     }
 
     /**
-     * The economic events between the horizons: each forecast event as one
-     * to three transactions, scaled by its farm's drift; October's
+     * The economic events between the horizons: each forecast event split
+     * into as many transactions as the account had in the same month last
+     * year, each with the seeder's noise, so the new months vary as much as
+     * the farm's history does, then scaled by the farm's drift; October's
      * fertiliser a month early on the timing farms; and the milk cheques for
      * the actual production.
      *
@@ -262,34 +265,46 @@ final class InsightsDuckDbActualsAdvancer
                 WHERE {$this->farms('tl.farm_id', $batch)} AND tl.basis = 'accrual' AND tl.type = 'forecast'
                   AND tl.date > DATE '{$this->planHorizon}' AND tl.date <= DATE '{$this->actualsTo}' + INTERVAL '1 month'
             ),
-            pieces AS (
-                SELECT p.*, 1 + CAST(hash(p.transaction_id) % 3 AS INTEGER) AS cnt,
-                       unnest(generate_series(1, 1 + CAST(hash(p.transaction_id) % 3 AS INTEGER))) AS k
-                FROM planned p
+            last_year AS (
+                SELECT tl.farm_id, tl.account_id, CAST(date_trunc('month', tl.date) AS DATE) AS m,
+                       count(DISTINCT tl.transaction_id) AS transactions
+                FROM {$this->lake} tl
+                JOIN account a ON a.farm_id = tl.farm_id AND a.accountid = tl.account_id
+                WHERE {$this->farms('tl.farm_id', $batch)} AND tl.basis = 'accrual' AND tl.type = 'actuals'
+                  AND tl.date > DATE '{$this->planHorizon}' - INTERVAL '1 year'
+                  AND tl.date <= DATE '{$this->actualsTo}' - INTERVAL '1 year'
+                GROUP BY 1, 2, 3
+            ),
+            months_events AS (
+                SELECT p.*, false AS early, CAST(p.m - INTERVAL '1 year' AS DATE) AS like_month FROM planned p
                 WHERE p.date <= DATE '{$this->actualsTo}'
+                UNION ALL
+                SELECT p.*, true, CAST(p.m - INTERVAL '1 month' - INTERVAL '1 year' AS DATE) FROM planned p
+                WHERE p.kind = 'timing' AND p.code = '{$fertiliser}' AND p.date > DATE '{$this->actualsTo}'
+            ),
+            pieces AS (
+                SELECT e.*, COALESCE(ly.transactions, 1) AS cnt, unnest(generate_series(1, COALESCE(ly.transactions, 1))) AS k
+                FROM months_events e
+                LEFT JOIN last_year ly ON ly.farm_id = e.farm_id AND ly.account_id = e.account_id AND ly.m = e.like_month
             ),
             scaled AS (
                 SELECT *,
                        CAST(CASE
+                           WHEN early THEN 1.0
                            WHEN kind = 'fertiliser_price' AND code = '{$fertiliser}' THEN 1.45
                            WHEN kind = 'drought' AND code = '{$feed}' AND m >= {$this->droughtFrom()} THEN 1.6
                            WHEN kind = 'repairs' AND code = '{$repairs}' THEN 2.2
                            ELSE 1.0
-                       END AS DOUBLE) / cnt * (0.85 + (hash(transaction_id * 17 + k) % 301) / 1000.0) AS factor
+                       END AS DOUBLE) / cnt * (0.5 + (hash(transaction_id * 17 + k) % 1000) / 1000.0) AS factor
                 FROM pieces
             ),
             account_events AS (
-                SELECT transaction_id + k AS txn_id, farm_id, account_id,
-                       CAST(m + CAST(hash(transaction_id * 31 + k) % 28 AS INTEGER) AS DATE) AS accrual_date,
+                SELECT CASE WHEN early THEN transaction_id - 100000000 + 500000 + k ELSE transaction_id + k END AS txn_id,
+                       farm_id, account_id,
+                       CAST(CASE WHEN early THEN m - INTERVAL '1 month' ELSE m END
+                            + CAST(hash(transaction_id * 31 + k) % 28 AS INTEGER) * INTERVAL '1 day' AS DATE) AS accrual_date,
                        CAST(round(net * factor) AS BIGINT) AS net, CAST(round(tax * factor) AS BIGINT) AS tax
                 FROM scaled
-            ),
-            early_events AS (
-                SELECT transaction_id - 100000000 + 10 AS txn_id, farm_id, account_id,
-                       CAST(m - INTERVAL '1 month' + CAST(4 + hash(transaction_id) % 20 AS INTEGER) * INTERVAL '1 day' AS DATE) AS accrual_date,
-                       net, tax
-                FROM planned
-                WHERE kind = 'timing' AND code = '{$fertiliser}' AND date > DATE '{$this->actualsTo}'
             ),
             milk_events AS (
                 SELECT CAST(p.farm_id AS BIGINT) * 10000000000
@@ -306,9 +321,6 @@ final class InsightsDuckDbActualsAdvancer
             )
             SELECT txn_id, farm_id, account_id, accrual_date, {$this->twentiethOfNextMonth('accrual_date')} AS cash_date, net, tax
             FROM account_events
-            UNION ALL
-            SELECT txn_id, farm_id, account_id, accrual_date, {$this->twentiethOfNextMonth('accrual_date')}, net, tax
-            FROM early_events
             UNION ALL
             SELECT txn_id, farm_id, account_id, accrual_date, CAST(accrual_date + 20 AS DATE),
                    -amount, CAST(round(-amount * {$gst}) AS BIGINT)

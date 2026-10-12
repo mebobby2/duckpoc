@@ -3,8 +3,10 @@
 namespace App\Providers;
 
 use App\Services\DuckLake\DuckLakeConnectionFactory;
+use App\Services\Insights\DuckDB\FarmPlan;
 use App\Services\Mongo\MongoConnectionFactory;
 use Illuminate\Support\ServiceProvider;
+use RuntimeException;
 use Saturio\DuckDB\DuckDB;
 
 class AppServiceProvider extends ServiceProvider
@@ -27,6 +29,10 @@ class AppServiceProvider extends ServiceProvider
         // measurement for that would flatter the engines it is compared
         // against.
         $this->app->singleton(MongoConnectionFactory::class);
+
+        $this->app->singleton(FarmPlan::class, fn () => FarmPlan::forFarm(
+            (int) (config('insights.mcp_farm') ?? throw new RuntimeException('Set INSIGHTS_MCP_FARM to the farm this server answers for.')),
+        ));
     }
 
     /**

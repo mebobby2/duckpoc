@@ -30,7 +30,7 @@ class InsightsDuckDbAdvanceActualsCommand extends Command
         try {
             $started = microtime(true);
             $advancer = new InsightsDuckDbActualsAdvancer(
-                InsightsDuckDb::connect(writableMysql: true),
+                InsightsDuckDb::connect(writable: true),
                 (int) $this->option('practice'),
                 PortfolioScope::HORIZON,
                 (string) $this->option('to'),

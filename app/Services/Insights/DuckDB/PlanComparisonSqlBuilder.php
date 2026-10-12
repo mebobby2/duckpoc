@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services\Insights\DuckDB;
 
 use App\Services\Insights\ReportBasis;
-use InvalidArgumentException;
 
 /**
  * One farm's season, plan against actuals, in one statement: the single-farm
@@ -27,19 +26,20 @@ final class PlanComparisonSqlBuilder
     public const string PLAN_HORIZON = 'plan_horizon';
     public const string CURRENT_HORIZON = 'current_horizon';
 
-    private const array COST_GROUPS = ['operating_expenses', 'non_operating_expenses'];
+    /** Report groups where spending more than planned is adverse; for everything else, less is. */
+    public const array COST_GROUPS = ['operating_expenses', 'non_operating_expenses'];
 
     /**
      * @param ?string $period only this period: `YTD`, `Season` or a month as `YYYY-MM`
+     * @param bool $withCategories false for the sections, calculations and balances alone
      */
     public function __construct(
         private readonly int $farmId,
         private readonly ReportBasis $basis,
         private readonly ?string $period = null,
+        private readonly bool $withCategories = true,
     ) {
-        if ($period !== null && preg_match('/^(YTD|Season|\d{4}-\d{2})$/', $period) !== 1) {
-            throw new InvalidArgumentException("A period is YTD, Season or YYYY-MM, not '{$period}'.");
-        }
+        PlanPeriod::condition($period, 'p.period');
     }
 
     public function build(): string
@@ -92,7 +92,9 @@ final class PlanComparisonSqlBuilder
             row_order(kind, field, row_order) AS (
                 VALUES {$this->rowOrder()}
             )
-            SELECT p.kind, p.field, p.label, p.category, p.period_type, p.period, p.column_type,
+            SELECT p.kind, p.field, p.label, p.category, p.period_type, p.period,
+                   CASE p.column_type WHEN 'actuals' THEN 'actual' WHEN 'forecast' THEN 'forecast'
+                                      WHEN 'actualsForecast' THEN 'part_actual' ELSE 'projected' END AS status,
                    round(p.plan, 2) AS plan, round(p.current, 2) AS current, round(p.current - p.plan, 2) AS variance,
                    CASE WHEN p.plan <> 0 THEN round(100 * (p.current - p.plan) / abs(p.plan), 1) END AS variance_pct,
                    CASE WHEN round(p.current - p.plan, 2) = 0 THEN 'none'
@@ -110,7 +112,9 @@ final class PlanComparisonSqlBuilder
 
     private function periodCondition(): string
     {
-        return $this->period === null ? 'true' : "p.period = '{$this->period}'";
+        $period = PlanPeriod::condition($this->period, 'p.period');
+
+        return $this->withCategories ? $period : "{$period} AND p.kind <> 'category'";
     }
 
     private function report(string $horizonParameter): InsightsMonthlyReportSqlBuilder

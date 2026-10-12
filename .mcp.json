@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "figured-farm-plan": {
+      "command": "docker",
+      "args": ["compose", "exec", "-T", "-e", "INSIGHTS_MCP_FARM=3009", "app-minio", "php", "artisan", "mcp:start", "farm-plan"]
+    }
+  }
+}

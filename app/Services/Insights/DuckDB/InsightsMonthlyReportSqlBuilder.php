@@ -58,7 +58,7 @@ abstract class InsightsMonthlyReportSqlBuilder
 
     public function build(): string
     {
-        $ctes = $this->reportLines->ctes($this->windowCte()) + [
+        $ctes = $this->reportLines->ctes(ReportLinesSqlBuilder::periodWindow()) + [
             'months' => $this->monthsCte(),
             'category_months' => $this->categoryMonthsCte(),
             'section_months' => $this->sectionMonthsCte(),
@@ -67,14 +67,6 @@ abstract class InsightsMonthlyReportSqlBuilder
         ];
 
         return ReportLinesSqlBuilder::statement($ctes, $this->finalSelect());
-    }
-
-    private function windowCte(): string
-    {
-        return <<<SQL
-            SELECT farm_id, CAST(\$period_from AS DATE) AS window_start, CAST(\$period_to AS DATE) AS window_end
-            FROM farm
-            SQL;
     }
 
     private function monthsCte(): string

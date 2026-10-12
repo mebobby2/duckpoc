@@ -25,7 +25,13 @@ final class DuckLakeConnectionFactory
     ) {
     }
 
-    public function connect(): DuckDB
+    /**
+     * @param bool $readOnly attach the lake read-only. A sqlite-driver catalog
+     *     is one DuckDB file that only one read-write process may hold, so a
+     *     long-running reader (the MCP server) attaches read-only to let others
+     *     attach alongside it.
+     */
+    public function connect(bool $readOnly = false): DuckDB
     {
         $db = DuckDB::create();
 
@@ -34,7 +40,7 @@ final class DuckLakeConnectionFactory
         $this->configureTempDirectory($db);
         $this->loadExtensions($db);
         $this->createStorageSecret($db);
-        $this->attachCatalog($db);
+        $this->attachCatalog($db, $readOnly);
         $this->attachAppDatabase($db);
 
         return $db;
@@ -253,17 +259,18 @@ final class DuckLakeConnectionFactory
         return preg_replace('/\.sqlite$/', '', $path).'.'.$this->storage().'.sqlite';
     }
 
-    private function attachCatalog(DuckDB $db): void
+    private function attachCatalog(DuckDB $db, bool $readOnly): void
     {
         $alias = $this->config['attached_alias'];
         $attachTarget = $this->catalogAttachString();
         $dataPath = $this->dataPath();
 
         $db->query(sprintf(
-            "ATTACH '%s' AS %s (DATA_PATH '%s')",
+            "ATTACH '%s' AS %s (DATA_PATH '%s'%s)",
             $this->escape($attachTarget),
             $alias,
             $this->escape($dataPath),
+            $readOnly ? ', READ_ONLY' : '',
         ));
     }
 

@@ -18,9 +18,9 @@ final class PlanComparisonQuery
     }
 
     /**
-     * @return list<array{kind: string, field: string, label: string, category: ?string, period_type: string, period: string, column_type: string, plan: float, current: float, variance: float, variance_pct: ?float, effect: string}>
+     * @return list<array{kind: string, field: string, label: string, category: ?string, period_type: string, period: string, status: string, plan: float, current: float, variance: float, variance_pct: ?float, effect: string}>
      */
-    public function run(ActivePlan $plan, ReportBasis $basis, ?string $period = null): array
+    public function run(ActivePlan $plan, ReportBasis $basis, ?string $period = null, bool $withCategories = true): array
     {
         [$from, $to] = $plan->period($basis);
         $bindings = [
@@ -40,12 +40,12 @@ final class PlanComparisonQuery
             'category' => $r['category'],
             'period_type' => (string) $r['period_type'],
             'period' => (string) $r['period'],
-            'column_type' => (string) $r['column_type'],
+            'status' => (string) $r['status'],
             'plan' => (float) $r['plan'],
             'current' => (float) $r['current'],
             'variance' => (float) $r['variance'],
             'variance_pct' => $r['variance_pct'] === null ? null : (float) $r['variance_pct'],
             'effect' => (string) $r['effect'],
-        ], DuckDbStatement::rows($this->db, (new PlanComparisonSqlBuilder($plan->farmId, $basis, $period))->build(), $bindings));
+        ], DuckDbStatement::rows($this->db, (new PlanComparisonSqlBuilder($plan->farmId, $basis, $period, $withCategories))->build(), $bindings));
     }
 }
