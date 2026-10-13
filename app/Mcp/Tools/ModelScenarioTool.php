@@ -30,8 +30,9 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
     changed_rows: every profit and loss and cash flow row the scenario moves, for the season.
     bank_by_month: month-end bank balance through the season on all three.
     booked: what each change books, by kind (purchase, trade_in, depreciation, loan_drawdown, loan_interest,
-    loan_principal, adjustment) and category: the months it runs, the amount this season and in all, and its GST.
-    change_no is the change's position in the list, from 1.
+    loan_principal, adjustment) and category: the months it runs, the amount this season and in all, and its GST
+    (positive: GST the farm claims back or no longer owes; negative: GST it owes). change_no is the change's
+    position in the list, from 1.
     assumptions: how Figured booked it; mention what matters to the answer.
     TEXT)]
 #[IsReadOnly]
