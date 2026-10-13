@@ -6,18 +6,22 @@ namespace App\Mcp\Servers;
 
 use App\Mcp\Prompts\PlanStatusUpdatePrompt;
 use App\Mcp\Tools\AddPlanNoteTool;
+use App\Mcp\Tools\AdoptScenarioTool;
 use App\Mcp\Tools\ComparePlanTool;
 use App\Mcp\Tools\GetFarmProfileTool;
 use App\Mcp\Tools\GetHerdValuationTool;
 use App\Mcp\Tools\GetMilkProductionTool;
 use App\Mcp\Tools\GetPlanStatusTool;
+use App\Mcp\Tools\ListScenariosTool;
+use App\Mcp\Tools\ModelScenarioTool;
+use App\Mcp\Tools\SaveScenarioTool;
 use Laravel\Mcp\Server;
 use Laravel\Mcp\Server\Attributes\Instructions;
 use Laravel\Mcp\Server\Attributes\Name;
 use Laravel\Mcp\Server\Attributes\Version;
 
 #[Name('Figured farm plan')]
-#[Version('0.1.0')]
+#[Version('0.2.0')]
 #[Instructions(<<<'MARKDOWN'
     Figured's model of one farm's active plan. Every number comes from Figured's own reports (profit and loss,
     cash flow, milk, livestock), computed live from the farm's ledger and production records: quote them rather
@@ -32,6 +36,10 @@ use Laravel\Mcp\Server\Attributes\Version;
     - For "how am I tracking?" or "give me an update", use get-plan-status and judge its evidence as the
       plan-status-update prompt describes; there are no built-in thresholds. When the farmer or advisor says what
       matters to them, or explains a variance, record it with add-plan-note.
+    - For "what if" questions (buying a tractor, feed costing more, selling stock early), describe the change to
+      model-scenario and let Figured work out the GST, timing, depreciation and loan; it returns plan, current and
+      scenario side by side. save-scenario keeps one as a draft; adopt-scenario writes it into the forecast, only
+      when the farmer explicitly says so. Milk price and production changes are not supported yet.
     MARKDOWN)]
 class FarmPlanServer extends Server
 {
@@ -42,6 +50,10 @@ class FarmPlanServer extends Server
         GetHerdValuationTool::class,
         GetPlanStatusTool::class,
         AddPlanNoteTool::class,
+        ModelScenarioTool::class,
+        SaveScenarioTool::class,
+        ListScenariosTool::class,
+        AdoptScenarioTool::class,
     ];
 
     protected array $prompts = [

@@ -34,7 +34,7 @@ final class InsightsDuckDbPracticeSeeder
     public const string TAG_GST_PAYMENT = 'gst_payment';
 
     public const float GST_RATE = 0.15;
-    private const int VALID_FROM = 1_700_000_000;
+    public const int VALID_FROM = 1_700_000_000;
     private const int FIXED_POINT = 10_000;
 
     /**
@@ -255,7 +255,7 @@ final class InsightsDuckDbPracticeSeeder
             INSERT INTO {$this->t('categories')} (_valid_from, farm_id, name, "group", non_operating, "order", system_category_name)
             SELECT DISTINCT {$vf}, farm_id, category, grp, CAST(grp LIKE 'non_operating%' AS INTEGER), 0, category FROM seed_plan
             UNION
-            SELECT {$vf}, farm_id, name, grp, 0, 0, name FROM seed_system_accounts
+            SELECT {$vf}, farm_id, name, grp, CAST(grp LIKE 'non_operating%' AS INTEGER), 0, name FROM seed_system_accounts
             SQL);
 
         $this->write(<<<SQL

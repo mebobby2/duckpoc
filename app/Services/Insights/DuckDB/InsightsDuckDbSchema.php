@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Insights\DuckDB;
 
+use App\Services\Insights\PracticeShape;
 use Saturio\DuckDB\DuckDB;
 
 /**
@@ -31,7 +32,8 @@ final class InsightsDuckDbSchema
 
         foreach (['practices', 'farms', 'farm_practice', 'farm_types', 'farms_operation_types', 'xero_accounts', 'categories',
             'category_xero_account', 'milk_trackers', 'milk_productions', 'milk_tracker_prices', 'stock_types', 'stock_classes',
-            'trackers', 'stock_transactions', 'stock_class_valuations', 'active_plans', 'plan_drifts', 'plan_notes'] as $table) {
+            'trackers', 'stock_transactions', 'stock_class_valuations', 'active_plans', 'plan_drifts', 'plan_notes', 'plan_scenarios',
+            'forecast_edit_lines'] as $table) {
             $db->statement("DROP TABLE IF EXISTS {$table}");
         }
 
@@ -165,6 +167,11 @@ final class InsightsDuckDbSchema
      *
      * `plan_notes` holds what the farmer or advisor has said matters, or
      * explains, for plan status to weigh when judging the signals.
+     *
+     * `plan_scenarios` holds the what-ifs saved for a farm, as the changes
+     * the farmer described; an adopted one's journal lines are in
+     * `forecast_edit_lines`, the PoC's stand-in for writing them to Figured's
+     * forecast, which current-side reports read beside the lake's forecast.
      */
     public function createPlanTables(): void
     {
@@ -189,6 +196,68 @@ final class InsightsDuckDbSchema
                 note TEXT NOT NULL, created_at DATETIME NOT NULL, KEY (farm_id)
             )
             SQL);
+
+        $db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS plan_scenarios (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY, farm_id INT NOT NULL, name VARCHAR(255) NOT NULL,
+                changes JSON NOT NULL, status VARCHAR(16) NOT NULL, created_at DATETIME NOT NULL,
+                adopted_at DATETIME NULL, KEY (farm_id)
+            )
+            SQL);
+
+        $db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS forecast_edit_lines (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY, scenario_id BIGINT NOT NULL, farm_id INT NOT NULL,
+                basis VARCHAR(8) NOT NULL, date DATE NOT NULL, account_id VARCHAR(64) NOT NULL,
+                net_amount BIGINT NOT NULL, tax_amount BIGINT NOT NULL, KEY (farm_id), KEY (scenario_id)
+            )
+            SQL);
+    }
+
+    /**
+     * Gives every farm any system account its chart is missing, the way the
+     * seeder writes them (same ids), for charts seeded before the account
+     * was added to PracticeShape.
+     *
+     * @return int accounts added
+     */
+    public function addMissingSystemAccounts(): int
+    {
+        $db = InsightsDuckDb::mysql();
+        $validFrom = InsightsDuckDbPracticeSeeder::VALID_FROM;
+        $hash = "MD5(CONCAT(f.id, '-', ?))";
+        $seedUuid = "CONCAT(SUBSTR({$hash}, 1, 8), '-', SUBSTR({$hash}, 9, 4), '-', SUBSTR({$hash}, 13, 4), '-', SUBSTR({$hash}, 17, 4), '-', SUBSTR({$hash}, 21, 12))";
+
+        $added = 0;
+        foreach (PracticeShape::SYSTEM_ACCOUNTS as [$code, $name, $class, $type, $system, $group]) {
+            $added += $db->affectingStatement(
+                "INSERT INTO xero_accounts (_valid_from, farm_id, accountid, code, name, class, type, system_account)
+                 SELECT ?, f.id, {$seedUuid}, ?, ?, ?, ?, ?
+                 FROM farms f
+                 WHERE f._valid_to IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM xero_accounts xa WHERE xa.farm_id = f.id AND xa.code = ? AND xa._valid_to IS NULL)",
+                [$validFrom, ...array_fill(0, 5, $code), $code, $name, $class, $type, $system, $code],
+            );
+            $db->statement(
+                "INSERT INTO categories (_valid_from, farm_id, name, `group`, non_operating, `order`, system_category_name)
+                 SELECT ?, f.id, ?, ?, ?, 0, ?
+                 FROM farms f
+                 WHERE f._valid_to IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM categories c WHERE c.farm_id = f.id AND c.name = ? AND c.milk_tracker_id IS NULL AND c._valid_to IS NULL)",
+                [$validFrom, $name, $group, (int) str_starts_with($group, 'non_operating'), $name, $name],
+            );
+            $db->statement(
+                'INSERT INTO category_xero_account (category_id, xero_account_id, farm_id)
+                 SELECT c.id, xa.accountid, xa.farm_id
+                 FROM xero_accounts xa
+                 JOIN categories c ON c.farm_id = xa.farm_id AND c.name = ? AND c.milk_tracker_id IS NULL AND c._valid_to IS NULL
+                 WHERE xa.code = ? AND xa._valid_to IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM category_xero_account cxa WHERE cxa.farm_id = xa.farm_id AND cxa.xero_account_id = xa.accountid)',
+                [$name, $code],
+            );
+        }
+
+        return $added;
     }
 
     /**

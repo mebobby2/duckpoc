@@ -30,9 +30,12 @@ abstract class InsightsMonthlyReportSqlBuilder
 
     private readonly ReportLinesSqlBuilder $reportLines;
 
-    public function __construct(int $farmId, private readonly string $horizonParameter = 'horizon')
-    {
-        $this->reportLines = new ReportLinesSqlBuilder([$farmId], $this->basis(), $horizonParameter);
+    public function __construct(
+        int $farmId,
+        private readonly string $horizonParameter = 'horizon',
+        ForecastEdits $edits = ForecastEdits::None,
+    ) {
+        $this->reportLines = new ReportLinesSqlBuilder([$farmId], $this->basis(), $horizonParameter, $edits);
     }
 
     abstract protected function basis(): ReportBasis;

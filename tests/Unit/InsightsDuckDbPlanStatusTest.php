@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Mcp\Prompts\PlanStatusUpdatePrompt;
+use App\Services\Insights\DuckDB\ForecastEdits;
 use App\Services\Insights\DuckDB\PlanComparisonSqlBuilder;
 use App\Services\Insights\DuckDB\PlanHeadlineSqlBuilder;
 use App\Services\Insights\DuckDB\PlanSignalsSqlBuilder;
@@ -31,8 +32,8 @@ final class InsightsDuckDbPlanStatusTest extends TestCase
     {
         $sql = (new PlanSignalsSqlBuilder(self::FARM_ID, self::PEERS))->build();
 
-        foreach ([PlanComparisonSqlBuilder::PLAN_HORIZON, PlanComparisonSqlBuilder::CURRENT_HORIZON] as $horizon) {
-            $shared = (new ReportLinesSqlBuilder(self::PEERS, ReportBasis::Accrual, $horizon))->ctes('');
+        foreach ([PlanComparisonSqlBuilder::PLAN_HORIZON => ForecastEdits::None, PlanComparisonSqlBuilder::CURRENT_HORIZON => ForecastEdits::Adopted] as $horizon => $edits) {
+            $shared = (new ReportLinesSqlBuilder(self::PEERS, ReportBasis::Accrual, $horizon, $edits))->ctes('');
             foreach (['scan', 'milk_vj', 'stock_class_values', 'valuation_vj', 'report_lines'] as $name) {
                 self::assertStringContainsString($shared[$name], $sql, "{$horizon}: the signals' {$name} is not the shared one");
             }

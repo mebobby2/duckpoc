@@ -52,6 +52,11 @@ use InvalidArgumentException;
  * `$opening_before`. The horizon is `$horizon` unless the consumer names
  * another parameter, which is how one statement holds the same report at two
  * horizons: the plan as it stood, and actuals to date.
+ *
+ * A report can also read changes to the forecast made since the plan was
+ * agreed (ForecastEdits): the adopted scenarios' lines, and a proposed
+ * scenario bound as `$scenario`. They join the ledger as forecast lines, so
+ * every rule above applies to them unchanged.
  */
 final class ReportLinesSqlBuilder
 {
@@ -70,11 +75,15 @@ final class ReportLinesSqlBuilder
         array $farmIds,
         public readonly ReportBasis $basis = ReportBasis::Cash,
         private readonly string $horizonParameter = 'horizon',
+        private readonly ForecastEdits $edits = ForecastEdits::None,
     ) {
         if ($farmIds === []) {
             throw new InvalidArgumentException('A report needs at least one farm.');
         }
         $this->farmIds = array_values(array_map('intval', $farmIds));
+        if ($edits === ForecastEdits::AdoptedAndProposed && count($this->farmIds) !== 1) {
+            throw new InvalidArgumentException('A proposed scenario is one farm\'s.');
+        }
     }
 
     /**
@@ -88,6 +97,7 @@ final class ReportLinesSqlBuilder
                 'farm' => $this->farmCte(),
                 'report_window' => $reportWindowBody,
                 'accounts' => $this->accountsCte(),
+                ...$this->forecastEdits()->ctes(),
                 'scan' => $this->accrualScanCte(),
                 'milk_vj' => $this->accrualMilkVjCte(),
                 'stock_net' => $this->stockNetCte(),
@@ -103,6 +113,7 @@ final class ReportLinesSqlBuilder
             'farm' => $this->farmCte(),
             'report_window' => $reportWindowBody,
             'accounts' => $this->accountsCte(),
+            ...$this->forecastEdits()->ctes(),
             'scan' => $this->scanCte(),
             'opening' => $this->openingCte(),
             'milk_vj' => $this->milkVjCte(),
@@ -115,6 +126,27 @@ final class ReportLinesSqlBuilder
             'gst_vj' => $this->gstVjCte(),
             'report_lines' => $this->reportLinesCte(),
         ];
+    }
+
+    /**
+     * The forecast edits on their own, without a report: what a proposed
+     * scenario books, before it is shown in a report or adopted.
+     *
+     * @return array<string, string> name => body, in dependency order
+     */
+    public function editCtes(string $reportWindowBody): array
+    {
+        return [
+            'farm' => $this->farmCte(),
+            'report_window' => $reportWindowBody,
+            'accounts' => $this->accountsCte(),
+            ...$this->forecastEdits()->ctes(),
+        ];
+    }
+
+    private function forecastEdits(): ForecastEditsSqlBuilder
+    {
+        return new ForecastEditsSqlBuilder($this, $this->edits, $this->horizon(), $this->farmIds[0]);
     }
 
     /** A `report_window` body: every farm over the bound period. */
@@ -237,6 +269,23 @@ final class ReportLinesSqlBuilder
                 FROM {$lines} tl
                 WHERE {$where}
                   AND tl.type = 'forecast' AND tl.date > {$this->horizon()}
+            {$this->editedLedger($basis)}
+            SQL;
+    }
+
+    private function editedLedger(string $basis): string
+    {
+        if ($this->edits === ForecastEdits::None) {
+            return '';
+        }
+
+        return <<<SQL
+                UNION ALL
+                SELECT fe.farm_id, fe.date, fe.month, fe.account_id, fe.tag, fe.net_amount
+                FROM forecast_edits fe
+                WHERE fe.basis = '{$basis}'
+                  AND fe.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
+                  AND fe.date > {$this->horizon()}
             SQL;
     }
 

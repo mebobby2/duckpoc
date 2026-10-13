@@ -20,6 +20,11 @@ use App\Services\Insights\ReportBasis;
  *
  * Variance is current minus plan, in display sign. Its effect is adverse
  * when costs rise or anything else falls.
+ *
+ * The current side includes the scenarios the farm has adopted since the
+ * plan was agreed; the plan never does. With a scenario, a third side is
+ * the current one plus the proposed changes, and each row also carries the
+ * scenario's amount and its change from current.
  */
 final class PlanComparisonSqlBuilder
 {
@@ -38,52 +43,66 @@ final class PlanComparisonSqlBuilder
         private readonly ReportBasis $basis,
         private readonly ?string $period = null,
         private readonly bool $withCategories = true,
+        private readonly bool $withScenario = false,
     ) {
         PlanPeriod::condition($period, 'p.period');
     }
 
     public function build(): string
     {
-        $plan = $this->report(self::PLAN_HORIZON)->build();
-        $current = $this->report(self::CURRENT_HORIZON)->build();
-        $costs = implode(', ', array_map(static fn (string $g): string => "'{$g}'", self::COST_GROUPS));
+        $sides = [
+            'plan' => $this->report(self::PLAN_HORIZON, ForecastEdits::None),
+            'current' => $this->report(self::CURRENT_HORIZON, ForecastEdits::Adopted),
+        ];
+        if ($this->withScenario) {
+            $sides['scenario'] = $this->report(self::CURRENT_HORIZON, ForecastEdits::AdoptedAndProposed);
+        }
+
+        $reports = implode(",\n", array_map(
+            static fn (string $side, InsightsMonthlyReportSqlBuilder $report): string => "{$side}_report AS (\n{$report->build()}\n)",
+            array_keys($sides),
+            $sides,
+        ));
+        $versions = implode("\n    UNION ALL\n    ", array_map(static fn (string $side): string => "SELECT '{$side}' AS side, * FROM {$side}_report", array_keys($sides)));
+        $byMonth = implode(",\n           ", array_map(static fn (string $side): string => "COALESCE(SUM(amount) FILTER (WHERE side = '{$side}'), 0) AS {$side}", array_keys($sides)));
+        $byPeriod = implode(', ', array_map(static fn (string $side): string => "m.{$side}", array_keys($sides)));
+        $toDate = implode(",\n           ", array_map(static fn (string $side): string => <<<SQL
+            CASE WHEN m.kind = 'balance' AND m.field = 'opening' THEN arg_min(m.{$side}, m.interval_index)
+                            WHEN m.kind = 'balance' AND m.field = 'closing' THEN arg_max(m.{$side}, m.interval_index)
+                            ELSE SUM(m.{$side}) END
+            SQL, array_keys($sides)));
+        $scenario = $this->withScenario
+            ? sprintf(
+                ",\n       round(p.scenario, 2) AS scenario, round(p.scenario - p.current, 2) AS scenario_change,\n       %s AS scenario_effect",
+                $this->effect('p.current', 'p.scenario'),
+            )
+            : '';
 
         return <<<SQL
             WITH
-            plan_report AS (
-            {$plan}
-            ),
-            current_report AS (
-            {$current}
+            {$reports},
+            versions AS (
+                {$versions}
             ),
             column_types AS (
                 SELECT DISTINCT interval_index, column_type FROM current_report
             ),
             months AS (
-                SELECT COALESCE(c.kind, p.kind) AS kind, COALESCE(c.field, p.field) AS field,
-                       COALESCE(c.label, p.label) AS label, COALESCE(c.category, p.category) AS category,
-                       COALESCE(c.interval_index, p.interval_index) AS interval_index, COALESCE(c.month, p.month) AS month,
-                       COALESCE(p.amount, 0) AS plan, COALESCE(c.amount, 0) AS current
-                FROM plan_report p
-                FULL JOIN current_report c
-                  ON c.kind = p.kind AND c.field = p.field AND c.category IS NOT DISTINCT FROM p.category
-                 AND c.interval_index = p.interval_index
+                SELECT kind, field, any_value(label) AS label, category, interval_index, any_value(month) AS month,
+                       {$byMonth}
+                FROM versions
+                GROUP BY kind, field, category, interval_index
             ),
             periods AS (
                 SELECT m.kind, m.field, m.label, m.category,
                        CASE WHEN t.column_type = 'total' THEN 'season' ELSE 'month' END AS period_type,
                        CASE WHEN t.column_type = 'total' THEN 'Season' ELSE m.month END AS period,
-                       t.column_type, m.plan, m.current
+                       t.column_type, {$byPeriod}
                 FROM months m
                 JOIN column_types t ON t.interval_index = m.interval_index
                 UNION ALL
                 SELECT m.kind, m.field, m.label, m.category, 'ytd', 'YTD', 'actuals',
-                       CASE WHEN m.kind = 'balance' AND m.field = 'opening' THEN arg_min(m.plan, m.interval_index)
-                            WHEN m.kind = 'balance' AND m.field = 'closing' THEN arg_max(m.plan, m.interval_index)
-                            ELSE SUM(m.plan) END,
-                       CASE WHEN m.kind = 'balance' AND m.field = 'opening' THEN arg_min(m.current, m.interval_index)
-                            WHEN m.kind = 'balance' AND m.field = 'closing' THEN arg_max(m.current, m.interval_index)
-                            ELSE SUM(m.current) END
+                       {$toDate}
                 FROM months m
                 JOIN column_types t ON t.interval_index = m.interval_index
                 WHERE t.column_type = 'actuals'
@@ -97,16 +116,29 @@ final class PlanComparisonSqlBuilder
                                       WHEN 'actualsForecast' THEN 'part_actual' ELSE 'projected' END AS status,
                    round(p.plan, 2) AS plan, round(p.current, 2) AS current, round(p.current - p.plan, 2) AS variance,
                    CASE WHEN p.plan <> 0 THEN round(100 * (p.current - p.plan) / abs(p.plan), 1) END AS variance_pct,
-                   CASE WHEN round(p.current - p.plan, 2) = 0 THEN 'none'
-                        WHEN (p.current > p.plan) <> (p.kind IN ('category', 'section') AND p.field IN ({$costs})) THEN 'favourable'
-                        ELSE 'adverse'
-                   END AS effect,
-                   o.row_order
+                   {$this->effect('p.plan', 'p.current')} AS effect,
+                   o.row_order{$scenario}
             FROM periods p
             JOIN row_order o ON o.kind = (CASE WHEN p.kind = 'category' THEN 'section' ELSE p.kind END) AND o.field = p.field
             WHERE {$this->periodCondition()}
             ORDER BY CASE p.period_type WHEN 'month' THEN 0 WHEN 'ytd' THEN 1 ELSE 2 END, p.period,
                      o.row_order, p.kind = 'section', p.category
+            SQL;
+    }
+
+    /**
+     * Whether moving from one amount to another helps the farm: adverse when
+     * costs rise or anything else falls.
+     */
+    private function effect(string $from, string $to): string
+    {
+        $costs = implode(', ', array_map(static fn (string $g): string => "'{$g}'", self::COST_GROUPS));
+
+        return <<<SQL
+            CASE WHEN round({$to} - {$from}, 2) = 0 THEN 'none'
+                        WHEN ({$to} > {$from}) <> (p.kind IN ('category', 'section') AND p.field IN ({$costs})) THEN 'favourable'
+                        ELSE 'adverse'
+                   END
             SQL;
     }
 
@@ -117,11 +149,11 @@ final class PlanComparisonSqlBuilder
         return $this->withCategories ? $period : "{$period} AND p.kind <> 'category'";
     }
 
-    private function report(string $horizonParameter): InsightsMonthlyReportSqlBuilder
+    private function report(string $horizonParameter, ForecastEdits $edits = ForecastEdits::None): InsightsMonthlyReportSqlBuilder
     {
         return match ($this->basis) {
-            ReportBasis::Cash => new InsightsCashFlowSqlBuilder($this->farmId, $horizonParameter),
-            ReportBasis::Accrual => new InsightsProfitLossSqlBuilder($this->farmId, $horizonParameter),
+            ReportBasis::Cash => new InsightsCashFlowSqlBuilder($this->farmId, $horizonParameter, $edits),
+            ReportBasis::Accrual => new InsightsProfitLossSqlBuilder($this->farmId, $horizonParameter, $edits),
         };
     }
 

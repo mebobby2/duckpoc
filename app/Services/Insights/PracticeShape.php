@@ -101,8 +101,10 @@ final class PracticeShape
     ];
 
     /**
-     * The accounts only the double entry writes to. [code, name, class, type,
-     * system account, category group].
+     * The accounts no seeded event posts to: the double entry's, and
+     * depreciation, which only a forecast's journals write. [code, name,
+     * class, type, system account, category group]; the category is named
+     * after the account.
      */
     public const array SYSTEM_ACCOUNTS = [
         'bank' => ['090', 'Farm Cheque Account', 'ASSET', 'BANK', null, 'bank'],
@@ -110,6 +112,7 @@ final class PracticeShape
         'gst_payments' => ['821', 'GST Payments / Refunds', 'LIABILITY', 'CURRLIAB', 'GSTPAYMENTS', 'gst'],
         'payables' => ['810', 'Accounts Payable', 'LIABILITY', 'CURRLIAB', 'CREDITORS', 'liabilities'],
         'opening' => ['980', 'Opening Balances', 'EQUITY', 'EQUITY', null, 'equity_movements'],
+        'depreciation' => ['750', 'Depreciation', 'EXPENSE', 'DEPRECIATN', null, 'non_operating_expenses'],
     ];
 
     /** Milk supplies by size band: one for a small farm, more as it grows. */

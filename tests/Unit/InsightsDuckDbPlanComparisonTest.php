@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
+use App\Services\Insights\DuckDB\ForecastEdits;
 use App\Services\Insights\DuckDB\HerdValuationSqlBuilder;
 use App\Services\Insights\DuckDB\InsightsCashFlowSqlBuilder;
 use App\Services\Insights\DuckDB\InsightsDuckDb;
@@ -45,8 +46,8 @@ final class InsightsDuckDbPlanComparisonTest extends TestCase
     {
         $sql = (new PlanComparisonSqlBuilder(self::FARM_ID, $basis))->build();
 
-        foreach ([PlanComparisonSqlBuilder::PLAN_HORIZON, PlanComparisonSqlBuilder::CURRENT_HORIZON] as $horizon) {
-            self::assertStringContainsString((new $singleFarm(self::FARM_ID, $horizon))->build(), $sql, "the {$horizon} side is not the single-farm report");
+        foreach ([PlanComparisonSqlBuilder::PLAN_HORIZON => ForecastEdits::None, PlanComparisonSqlBuilder::CURRENT_HORIZON => ForecastEdits::Adopted] as $horizon => $edits) {
+            self::assertStringContainsString((new $singleFarm(self::FARM_ID, $horizon, $edits))->build(), $sql, "the {$horizon} side is not the single-farm report");
         }
         self::assertDoesNotMatchRegularExpression('/\$horizon\b/', $sql, 'neither side falls back to the default horizon');
     }
