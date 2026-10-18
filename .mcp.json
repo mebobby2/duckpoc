@@ -1,8 +1,12 @@
 {
   "mcpServers": {
-    "figured-farm-plan": {
+    "figured-farm-3031": {
       "command": "docker",
-      "args": ["compose", "exec", "-T", "-e", "INSIGHTS_MCP_FARM=3009", "app-minio", "php", "artisan", "mcp:start", "farm-plan"]
+      "args": ["compose", "exec", "-T", "-e", "INSIGHTS_MCP_FARM=3031", "app-minio", "php", "artisan", "mcp:start", "farm-plan"]
+    },
+    "figured-farm-3024": {
+      "command": "docker",
+      "args": ["compose", "exec", "-T", "-e", "INSIGHTS_MCP_FARM=3024", "app-minio", "php", "artisan", "mcp:start", "farm-plan"]
     }
   }
 }

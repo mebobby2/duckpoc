@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace Tests\Unit;
 
 use App\Mcp\Prompts\PlanStatusUpdatePrompt;
-use App\Services\Insights\DuckDB\ForecastEdits;
 use App\Services\Insights\DuckDB\PlanComparisonSqlBuilder;
 use App\Services\Insights\DuckDB\PlanHeadlineSqlBuilder;
 use App\Services\Insights\DuckDB\PlanSignalsSqlBuilder;
+use App\Services\Insights\DuckDB\ReportComparisonSqlBuilder;
 use App\Services\Insights\DuckDB\ReportLinesSqlBuilder;
 use App\Services\Insights\ReportBasis;
 use InvalidArgumentException;
@@ -32,8 +32,9 @@ final class InsightsDuckDbPlanStatusTest extends TestCase
     {
         $sql = (new PlanSignalsSqlBuilder(self::FARM_ID, self::PEERS))->build();
 
-        foreach ([PlanComparisonSqlBuilder::PLAN_HORIZON => ForecastEdits::None, PlanComparisonSqlBuilder::CURRENT_HORIZON => ForecastEdits::Adopted] as $horizon => $edits) {
-            $shared = (new ReportLinesSqlBuilder(self::PEERS, ReportBasis::Accrual, $horizon, $edits))->ctes('');
+        foreach ([PlanComparisonSqlBuilder::budget(), PlanComparisonSqlBuilder::current()] as $side) {
+            $horizon = $side->horizonParameter;
+            $shared = (new ReportLinesSqlBuilder(self::PEERS, ReportBasis::Accrual, $horizon, $side->edits, overdraftInterest: true))->ctes('');
             foreach (['scan', 'milk_vj', 'stock_class_values', 'valuation_vj', 'report_lines'] as $name) {
                 self::assertStringContainsString($shared[$name], $sql, "{$horizon}: the signals' {$name} is not the shared one");
             }
@@ -45,7 +46,11 @@ final class InsightsDuckDbPlanStatusTest extends TestCase
     {
         $sql = (new PlanSignalsSqlBuilder(self::FARM_ID, self::PEERS))->build();
 
-        self::assertSame(1, substr_count($sql, 'CASE WHEN farm_id = '.self::FARM_ID.' THEN CAST($period_from AS DATE)'));
+        [$plan, $current] = explode('current_side AS (', $sql, 2);
+        $history = 'CASE WHEN farm_id = '.self::FARM_ID.' THEN CAST($period_from AS DATE)';
+
+        self::assertStringContainsString($history, $plan);
+        self::assertStringNotContainsString($history, $current);
     }
 
     public function testSignalsRankWithoutCuttingAnythingOff(): void
@@ -66,10 +71,13 @@ final class InsightsDuckDbPlanStatusTest extends TestCase
 
     public function testTheHeadlineIsBothPlanComparisons(): void
     {
-        $sql = (new PlanHeadlineSqlBuilder(self::FARM_ID))->build();
+        $sides = [PlanComparisonSqlBuilder::current(), PlanComparisonSqlBuilder::budget('plan')];
+        $sql = (new PlanHeadlineSqlBuilder(self::FARM_ID, $sides))->build();
 
-        self::assertStringContainsString((new PlanComparisonSqlBuilder(self::FARM_ID, ReportBasis::Accrual, withCategories: false))->build(), $sql);
-        self::assertStringContainsString((new PlanComparisonSqlBuilder(self::FARM_ID, ReportBasis::Cash, withCategories: false))->build(), $sql);
+        foreach (ReportBasis::cases() as $basis) {
+            self::assertStringContainsString((new ReportComparisonSqlBuilder(self::FARM_ID, $basis, $sides, withCategories: false))->build(), $sql, $basis->value);
+        }
+        self::assertStringContainsString('arg_min(period, plan) AS plan_month', $sql);
     }
 
     public function testTheJudgementGuidanceIsTheSameForPromptsAndTools(): void

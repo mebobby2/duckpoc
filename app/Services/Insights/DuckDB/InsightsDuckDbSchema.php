@@ -33,7 +33,7 @@ final class InsightsDuckDbSchema
         foreach (['practices', 'farms', 'farm_practice', 'farm_types', 'farms_operation_types', 'xero_accounts', 'categories',
             'category_xero_account', 'milk_trackers', 'milk_productions', 'milk_tracker_prices', 'stock_types', 'stock_classes',
             'trackers', 'stock_transactions', 'stock_class_valuations', 'active_plans', 'plan_drifts', 'plan_notes', 'plan_scenarios',
-            'forecast_edit_lines'] as $table) {
+            'forecast_edit_lines', 'forecast_snapshots', 'farm_enterprises', 'bank_facilities'] as $table) {
             $db->statement("DROP TABLE IF EXISTS {$table}");
         }
 
@@ -53,7 +53,7 @@ final class InsightsDuckDbSchema
                 timezone VARCHAR(64) NOT NULL DEFAULT 'Pacific/Auckland',
                 financial_year_end_day TINYINT NOT NULL, financial_year_end_month TINYINT NOT NULL,
                 sales_tax_basis VARCHAR(16) NOT NULL DEFAULT 'PAYMENTS', sales_tax_period VARCHAR(16) NOT NULL DEFAULT 'TWOMONTHS',
-                product VARCHAR(8) NOT NULL DEFAULT 'ff',
+                product VARCHAR(8) NOT NULL DEFAULT 'ff', area_ha DECIMAL(10, 2) NULL,
                 PRIMARY KEY (id, _valid_from)
             )
             SQL);
@@ -108,7 +108,7 @@ final class InsightsDuckDbSchema
                 id INT NOT NULL, _valid_from BIGINT NOT NULL, _valid_to BIGINT NULL, farm_id INT NOT NULL,
                 name VARCHAR(255) NOT NULL, company VARCHAR(32) NOT NULL, production_measure VARCHAR(16) NOT NULL DEFAULT 'kgms',
                 payment_method VARCHAR(16) NOT NULL DEFAULT 'deferred', season_start_month TINYINT NOT NULL DEFAULT 6,
-                income_accountid VARCHAR(64) NOT NULL,
+                income_accountid VARCHAR(64) NOT NULL, enterprise VARCHAR(32) NULL,
                 PRIMARY KEY (id, _valid_from), KEY (farm_id)
             )
             SQL);
@@ -131,6 +131,7 @@ final class InsightsDuckDbSchema
             CREATE TABLE trackers (
                 id INT NOT NULL, _valid_from BIGINT NOT NULL, _valid_to BIGINT NULL, uuid CHAR(36) NOT NULL,
                 farm_id INT NOT NULL, name VARCHAR(255) NOT NULL, tracker_number INT NOT NULL, stock_type_uuid CHAR(36) NOT NULL,
+                enterprise VARCHAR(32) NULL,
                 PRIMARY KEY (id, _valid_from), KEY (farm_id)
             )
             SQL);
@@ -172,6 +173,16 @@ final class InsightsDuckDbSchema
      * the farmer described; an adopted one's journal lines are in
      * `forecast_edit_lines`, the PoC's stand-in for writing them to Figured's
      * forecast, which current-side reports read beside the lake's forecast.
+     * Adopted and withdrawn times make the edits bitemporal: a version of the
+     * forecast as known at a time reads the edits adopted by then and not yet
+     * withdrawn.
+     *
+     * `forecast_snapshots` are those versions, named: the forecast as it
+     * stood at a time, with actuals to a date. Each active plan's budget is
+     * one, kind `budget`.
+     *
+     * `farm_enterprises` lists a farm's enterprises and the hectares each
+     * farms; `bank_facilities` its overdraft limit and rate.
      */
     public function createPlanTables(): void
     {
@@ -201,17 +212,108 @@ final class InsightsDuckDbSchema
             CREATE TABLE IF NOT EXISTS plan_scenarios (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY, farm_id INT NOT NULL, name VARCHAR(255) NOT NULL,
                 changes JSON NOT NULL, status VARCHAR(16) NOT NULL, created_at DATETIME NOT NULL,
-                adopted_at DATETIME NULL, KEY (farm_id)
+                adopted_at DATETIME(6) NULL, withdrawn_at DATETIME(6) NULL, KEY (farm_id)
             )
             SQL);
 
         $db->statement(<<<'SQL'
             CREATE TABLE IF NOT EXISTS forecast_edit_lines (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY, scenario_id BIGINT NOT NULL, farm_id INT NOT NULL,
+                change_no INT NULL, kind VARCHAR(16) NULL, enterprise VARCHAR(32) NULL,
                 basis VARCHAR(8) NOT NULL, date DATE NOT NULL, account_id VARCHAR(64) NOT NULL,
                 net_amount BIGINT NOT NULL, tax_amount BIGINT NOT NULL, KEY (farm_id), KEY (scenario_id)
             )
             SQL);
+
+        $db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS forecast_snapshots (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY, farm_id INT NOT NULL, name VARCHAR(255) NOT NULL,
+                kind VARCHAR(16) NOT NULL, actuals_to DATE NOT NULL, taken_at DATETIME(6) NOT NULL, KEY (farm_id)
+            )
+            SQL);
+
+        $db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS farm_enterprises (
+                farm_id INT NOT NULL, enterprise VARCHAR(32) NOT NULL, area_ha DECIMAL(10, 2) NOT NULL,
+                PRIMARY KEY (farm_id, enterprise)
+            )
+            SQL);
+
+        $db->statement(<<<'SQL'
+            CREATE TABLE IF NOT EXISTS bank_facilities (
+                farm_id INT PRIMARY KEY, overdraft_limit BIGINT NOT NULL, rate_pct DECIMAL(6, 3) NOT NULL
+            )
+            SQL);
+    }
+
+    /**
+     * Brings a database set up before the reporting tools for the head of
+     * product's scenarios up to their shape, without touching any row:
+     * columns added where missing, new tables created, every active plan
+     * given its budget snapshot. Safe to re-run.
+     */
+    public function upgradeMySql(): void
+    {
+        $db = InsightsDuckDb::mysql();
+        $this->createPlanTables();
+
+        $columns = [
+            ['farms', 'area_ha', 'DECIMAL(10, 2) NULL'],
+            ['trackers', 'enterprise', 'VARCHAR(32) NULL'],
+            ['milk_trackers', 'enterprise', 'VARCHAR(32) NULL'],
+            ['plan_scenarios', 'withdrawn_at', 'DATETIME(6) NULL'],
+            ['forecast_edit_lines', 'change_no', 'INT NULL'],
+            ['forecast_edit_lines', 'kind', 'VARCHAR(16) NULL'],
+            ['forecast_edit_lines', 'enterprise', 'VARCHAR(32) NULL'],
+        ];
+        foreach ($columns as [$table, $column, $definition]) {
+            $exists = $db->selectOne(
+                'SELECT count(*) AS n FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?',
+                [$table, $column],
+            )->n;
+            if ((int) $exists === 0) {
+                $db->statement("ALTER TABLE {$table} ADD COLUMN {$column} {$definition}");
+            }
+        }
+
+        // Adopting, withdrawing and snapshotting can fall in the same second;
+        // their order decides what a snapshot holds, so they keep microseconds.
+        foreach ([['plan_scenarios', 'adopted_at', 'NULL'], ['plan_scenarios', 'withdrawn_at', 'NULL'], ['forecast_snapshots', 'taken_at', 'NOT NULL']] as [$table, $column, $null]) {
+            $precision = $db->selectOne(
+                'SELECT datetime_precision AS p FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?',
+                [$table, $column],
+            )->p;
+            if ((int) $precision !== 6) {
+                $db->statement("ALTER TABLE {$table} MODIFY COLUMN {$column} DATETIME(6) {$null}");
+            }
+        }
+
+        $this->addBudgetSnapshots();
+    }
+
+    /** Each active plan's budget: the forecast as agreed, actuals to the plan horizon, before any change was adopted. */
+    public function addBudgetSnapshots(): void
+    {
+        InsightsDuckDb::mysql()->statement(
+            "INSERT INTO forecast_snapshots (farm_id, name, kind, actuals_to, taken_at)
+             SELECT ap.farm_id, 'Budget', 'budget', ap.plan_horizon, ap.plan_horizon + INTERVAL 1 DAY
+             FROM active_plans ap
+             WHERE NOT EXISTS (SELECT 1 FROM forecast_snapshots fs WHERE fs.farm_id = ap.farm_id AND fs.kind = 'budget')",
+        );
+    }
+
+    /** Adds the lake columns later phases need; the lake must be attached writable. */
+    public function upgradeLake(DuckDB $db): void
+    {
+        $lake = config('duckdb.attached_alias');
+        $s = InsightsDuckDb::LAKE_SCHEMA;
+        $has = iterator_to_array($db->query(
+            "SELECT count(*) FROM duckdb_columns() WHERE database_name = '{$lake}' AND schema_name = '{$s}'
+               AND table_name = 'transaction_lines' AND column_name = 'enterprise'",
+        )->rows())[0][0] ?? 0;
+        if ((int) (string) $has === 0) {
+            $db->query("ALTER TABLE {$lake}.{$s}.transaction_lines ADD COLUMN enterprise VARCHAR");
+        }
     }
 
     /**
@@ -282,7 +384,8 @@ final class InsightsDuckDbSchema
                 account_id     VARCHAR,
                 net_amount     BIGINT,
                 tax_amount     BIGINT,
-                tag            VARCHAR
+                tag            VARCHAR,
+                enterprise     VARCHAR
             )
             SQL);
         $db->query("ALTER TABLE {$lake}.{$s}.transaction_lines SET PARTITIONED BY (basis, year(date))");

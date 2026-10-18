@@ -54,9 +54,23 @@ use InvalidArgumentException;
  * horizons: the plan as it stood, and actuals to date.
  *
  * A report can also read changes to the forecast made since the plan was
- * agreed (ForecastEdits): the adopted scenarios' lines, and a proposed
- * scenario bound as `$scenario`. They join the ledger as forecast lines, so
+ * agreed (ForecastEdits): the adopted scenarios' lines, as known now or at a
+ * time, and a proposed scenario. They join the ledger as forecast lines, so
  * every rule above applies to them unchanged.
+ *
+ * Three more options, each off unless asked for:
+ *
+ *   - overdraft interest: Figured's budget overdraft interest, charged each
+ *     forecast month on the overdrawn cash balance at the farm's facility
+ *     rate, as a virtual journal on both bases (OverdraftSqlBuilder's
+ *     recurrence, verified against Figured, run per farm). On accrual it
+ *     needs the cash position, so it embeds the cash report's own lines,
+ *     and binds `$opening_before` like a cash report;
+ *   - an enterprise: only lines tracked to it (or to none, for
+ *     UNALLOCATED). Every line keeps its enterprise: the ledger's tracking,
+ *     milk to its supply's enterprise, the livestock valuation to its mob's;
+ *   - balance sheet accounts (accrual only): every account's lines, not just
+ *     the profit and loss's, for the position.
  */
 final class ReportLinesSqlBuilder
 {
@@ -65,8 +79,15 @@ final class ReportLinesSqlBuilder
 
     private const string TAG_GST_PAYMENT = 'gst_payment';
 
+    /** The enterprise filter for whole-farm lines, tracked to no enterprise. */
+    public const string UNALLOCATED = 'Unallocated';
+
+    public const string OVERDRAFT_INTEREST = 'Overdraft Interest';
+
     /** @var non-empty-list<int> */
     private readonly array $farmIds;
+
+    private readonly ForecastEdits $edits;
 
     /**
      * @param list<int> $farmIds
@@ -75,14 +96,21 @@ final class ReportLinesSqlBuilder
         array $farmIds,
         public readonly ReportBasis $basis = ReportBasis::Cash,
         private readonly string $horizonParameter = 'horizon',
-        private readonly ForecastEdits $edits = ForecastEdits::None,
+        ?ForecastEdits $edits = null,
+        private readonly bool $overdraftInterest = false,
+        private readonly ?string $enterprise = null,
+        private readonly bool $balanceSheetAccounts = false,
     ) {
         if ($farmIds === []) {
             throw new InvalidArgumentException('A report needs at least one farm.');
         }
         $this->farmIds = array_values(array_map('intval', $farmIds));
-        if ($edits === ForecastEdits::AdoptedAndProposed && count($this->farmIds) !== 1) {
+        $this->edits = $edits ?? ForecastEdits::none();
+        if ($this->edits->proposal !== null && count($this->farmIds) !== 1) {
             throw new InvalidArgumentException('A proposed scenario is one farm\'s.');
+        }
+        if ($balanceSheetAccounts && $basis !== ReportBasis::Accrual) {
+            throw new InvalidArgumentException('Balance sheet accounts are read on accrual.');
         }
     }
 
@@ -105,6 +133,7 @@ final class ReportLinesSqlBuilder
                 'stock_class_values' => $this->stockClassValuesCte(),
                 'stock_values' => $this->stockValuesCte(),
                 'valuation_vj' => $this->valuationVjCte(),
+                ...$this->overdraftCtes($reportWindowBody),
                 'report_lines' => $this->accrualReportLinesCte(),
             ];
         }
@@ -124,6 +153,7 @@ final class ReportLinesSqlBuilder
             'gst_window_net' => $this->gstWindowNetCte(),
             'gst_predicted' => $this->gstPredictedCte(),
             'gst_vj' => $this->gstVjCte(),
+            ...$this->overdraftCtes($reportWindowBody),
             'report_lines' => $this->reportLinesCte(),
         ];
     }
@@ -147,6 +177,85 @@ final class ReportLinesSqlBuilder
     private function forecastEdits(): ForecastEditsSqlBuilder
     {
         return new ForecastEditsSqlBuilder($this, $this->edits, $this->horizon(), $this->farmIds[0]);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function overdraftCtes(string $reportWindowBody): array
+    {
+        return $this->overdraftInterest ? ['overdraft_vj' => $this->overdraftVjCte($reportWindowBody)] : [];
+    }
+
+    /**
+     * Figured's budget overdraft interest, per farm with a facility: each
+     * forecast month, interest at the facility's rate on the month's closing
+     * cash balance less the interest already charged, when that is
+     * overdrawn. The balance it charges against comes from the cash report's
+     * own lines (embedded, so the profit and loss charges the same amount),
+     * which is why it is a recurrence and not a running sum; see
+     * OverdraftSqlBuilder for the rule and its check against Figured.
+     */
+    private function overdraftVjCte(string $reportWindowBody): string
+    {
+        $cash = new self($this->farmIds, ReportBasis::Cash, $this->horizonParameter, $this->edits);
+        $ctes = [];
+        foreach ($cash->ctes($reportWindowBody) as $name => $body) {
+            $ctes[] = "{$name} AS (\n{$body}\n)";
+        }
+        $cashCtes = implode(",\n", $ctes);
+        $facilities = self::mysql('bank_facilities');
+        $category = self::OVERDRAFT_INTEREST;
+
+        return <<<SQL
+            WITH RECURSIVE
+            {$cashCtes},
+            od_months AS (
+                SELECT w.farm_id, CAST(g.m AS DATE) AS ms, row_number() OVER (PARTITION BY w.farm_id ORDER BY g.m) AS n
+                FROM report_window w
+                CROSS JOIN LATERAL generate_series(CAST(date_trunc('month', w.window_start) AS TIMESTAMP), CAST(w.window_end AS TIMESTAMP), INTERVAL '1 month') AS g(m)
+            ),
+            od_movement AS (
+                SELECT farm_id, CAST(date_trunc('month', date) AS DATE) AS ms, SUM(-amount) AS net
+                FROM report_lines
+                GROUP BY 1, 2
+            ),
+            od_closing AS (
+                SELECT m.farm_id, m.n, CAST(f.rate_pct AS DOUBLE) / 100 / 12 AS monthly_rate,
+                       CAST(m.ms + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) AS month_end,
+                       CAST(o.opening_balance AS DOUBLE) + SUM(CAST(COALESCE(v.net, 0) AS DOUBLE)) OVER (PARTITION BY m.farm_id ORDER BY m.n) AS closing
+                FROM od_months m
+                JOIN {$facilities} f ON f.farm_id = m.farm_id
+                JOIN opening o ON o.farm_id = m.farm_id
+                LEFT JOIN od_movement v ON v.farm_id = m.farm_id AND v.ms = m.ms
+            ),
+            od_accrual AS (
+                SELECT farm_id, 0 AS n, CAST(0 AS DOUBLE) AS cum, CAST(0 AS DOUBLE) AS accrued
+                FROM (SELECT DISTINCT farm_id FROM od_closing)
+                UNION ALL
+                SELECT c.farm_id, c.n,
+                       a.cum + CASE WHEN c.month_end > {$this->horizon()} AND c.closing - a.cum < 0 THEN -(c.closing - a.cum) * c.monthly_rate ELSE 0 END,
+                       CASE WHEN c.month_end > {$this->horizon()} AND c.closing - a.cum < 0 THEN -(c.closing - a.cum) * c.monthly_rate ELSE 0 END
+                FROM od_accrual a
+                JOIN od_closing c ON c.farm_id = a.farm_id AND c.n = a.n + 1
+            )
+            SELECT c.farm_id, acc.accountid AS account_id, c.month_end AS date, CAST(trunc(a.accrued) AS BIGINT) AS amount,
+                   CAST(NULL AS VARCHAR) AS enterprise
+            FROM od_accrual a
+            JOIN od_closing c ON c.farm_id = a.farm_id AND c.n = a.n
+            JOIN accounts acc ON acc.farm_id = c.farm_id AND acc.category = '{$category}'
+            WHERE trunc(a.accrued) <> 0
+            SQL;
+    }
+
+    /** Only the lines of the chosen enterprise, when one is chosen. */
+    private function enterpriseCondition(string $column): string
+    {
+        return match ($this->enterprise) {
+            null => 'true',
+            self::UNALLOCATED => "{$column} IS NULL",
+            default => "{$column} = '".str_replace("'", "''", $this->enterprise)."'",
+        };
     }
 
     /** A `report_window` body: every farm over the bound period. */
@@ -260,12 +369,12 @@ final class ReportLinesSqlBuilder
             SQL;
 
         return <<<SQL
-                SELECT tl.farm_id, tl.date, tl.month, tl.account_id, tl.tag, tl.net_amount
+                SELECT tl.farm_id, tl.date, tl.month, tl.account_id, tl.tag, tl.net_amount, tl.enterprise
                 FROM {$lines} tl
                 WHERE {$where}
                   AND tl.type = 'actuals' AND tl.date <= {$this->horizon()}
                 UNION ALL
-                SELECT tl.farm_id, tl.date, tl.month, tl.account_id, tl.tag, tl.net_amount
+                SELECT tl.farm_id, tl.date, tl.month, tl.account_id, tl.tag, tl.net_amount, tl.enterprise
                 FROM {$lines} tl
                 WHERE {$where}
                   AND tl.type = 'forecast' AND tl.date > {$this->horizon()}
@@ -275,13 +384,13 @@ final class ReportLinesSqlBuilder
 
     private function editedLedger(string $basis): string
     {
-        if ($this->edits === ForecastEdits::None) {
+        if (!$this->edits->any()) {
             return '';
         }
 
         return <<<SQL
                 UNION ALL
-                SELECT fe.farm_id, fe.date, fe.month, fe.account_id, fe.tag, fe.net_amount
+                SELECT fe.farm_id, fe.date, fe.month, fe.account_id, fe.tag, fe.net_amount, fe.enterprise
                 FROM forecast_edits fe
                 WHERE fe.basis = '{$basis}'
                   AND fe.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
@@ -309,11 +418,12 @@ final class ReportLinesSqlBuilder
                        CASE WHEN tl.tag = '{$tag}' THEN tl.date ELSE tl.month END AS date,
                        tl.account_id,
                        CASE WHEN tl.tag = '{$tag}' THEN tl.tag END AS tag,
+                       tl.enterprise,
                        CAST(SUM(tl.net_amount) AS BIGINT) AS amount
                 FROM (
             {$this->ledger('cash')}
                 ) tl
-                GROUP BY 1, 2, 3, 4
+                GROUP BY 1, 2, 3, 4, 5
             ) g
             WHERE g.account_id NOT IN (SELECT accountid FROM accounts WHERE account_type = 'BANK')
             SQL;
@@ -349,7 +459,7 @@ final class ReportLinesSqlBuilder
         return <<<SQL
             SELECT mp.farm_id, mp.account_id,
                    CAST(mp.transaction_date + {$offset} AS DATE) AS date,
-                   -mp.value AS amount
+                   -mp.value AS amount, mp.enterprise
             FROM {$this->pricedMilkProduction()} mp
             WHERE CAST(mp.transaction_date + {$offset} AS DATE) > {$this->horizon()}
               AND CAST(mp.transaction_date + {$offset} AS DATE) <= CAST(\$period_to AS DATE)
@@ -439,29 +549,31 @@ final class ReportLinesSqlBuilder
     private function gstVjCte(): string
     {
         return <<<SQL
-            SELECT farm_id, account_id, date, amount FROM gst_predicted WHERE amount <> 0
+            SELECT farm_id, account_id, date, amount, CAST(NULL AS VARCHAR) AS enterprise FROM gst_predicted WHERE amount <> 0
             UNION ALL
-            SELECT st.farm_id, g.gst_id, st.date, -st.amount FROM gst_settlements st JOIN gst_accounts g ON g.farm_id = st.farm_id
+            SELECT st.farm_id, g.gst_id, st.date, -st.amount, NULL FROM gst_settlements st JOIN gst_accounts g ON g.farm_id = st.farm_id
             UNION ALL
-            SELECT st.farm_id, g.payments_id, st.date, st.amount FROM gst_settlements st JOIN gst_accounts g ON g.farm_id = st.farm_id
+            SELECT st.farm_id, g.payments_id, st.date, st.amount, NULL FROM gst_settlements st JOIN gst_accounts g ON g.farm_id = st.farm_id
             SQL;
     }
 
     private function reportLinesCte(): string
     {
         return <<<SQL
-            SELECT l.farm_id, l.date, l.account_id, l.amount, a.grp, a.category
+            SELECT l.farm_id, l.date, l.account_id, l.amount, a.grp, a.category, l.enterprise
             FROM (
-                SELECT farm_id, date, account_id, amount FROM scan
+                SELECT farm_id, date, account_id, amount, enterprise FROM scan
                 UNION ALL
-                SELECT farm_id, date, account_id, amount FROM milk_vj
+                SELECT farm_id, date, account_id, amount, enterprise FROM milk_vj
                 UNION ALL
-                SELECT farm_id, date, account_id, amount FROM gst_vj
+                SELECT farm_id, date, account_id, amount, enterprise FROM gst_vj
+                {$this->overdraftUnion()}
             ) l
             JOIN accounts a ON a.farm_id = l.farm_id AND a.accountid = l.account_id
             JOIN report_window w ON w.farm_id = l.farm_id
             WHERE a.account_type <> 'BANK'
               AND l.date BETWEEN CAST(date_trunc('month', w.window_start) AS DATE) AND w.window_end
+              AND {$this->enterpriseCondition('l.enterprise')}
             SQL;
     }
 
@@ -470,21 +582,40 @@ final class ReportLinesSqlBuilder
         return implode(', ', array_map(static fn (string $g): string => "'{$g}'", ReportBasis::PROFIT_AND_LOSS_GROUPS));
     }
 
-    /** Accrual lake lines on profit and loss accounts, summed to (farm, month, account). */
+    /**
+     * Accrual lake lines on profit and loss accounts (or, for the balance
+     * sheet, every account but the bank and payables), summed to (farm,
+     * month, account, enterprise).
+     */
     private function accrualScanCte(): string
     {
-        $groups = self::profitAndLossGroups();
-
         return <<<SQL
             SELECT g.* FROM (
-                SELECT tl.farm_id, tl.month AS date, tl.account_id, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
+                SELECT tl.farm_id, tl.month AS date, tl.account_id, tl.enterprise, CAST(SUM(tl.net_amount) AS BIGINT) AS amount
                 FROM (
             {$this->ledger('accrual')}
                 ) tl
-                GROUP BY tl.farm_id, tl.month, tl.account_id
+                GROUP BY tl.farm_id, tl.month, tl.account_id, tl.enterprise
             ) g
-            WHERE g.account_id NOT IN (SELECT accountid FROM accounts WHERE grp NOT IN ({$groups}))
+            WHERE g.account_id NOT IN (SELECT accountid FROM accounts WHERE NOT ({$this->accrualAccounts()}))
             SQL;
+    }
+
+    /** Which accounts an accrual report reads, as a condition on `accounts`. */
+    private function accrualAccounts(string $alias = ''): string
+    {
+        $a = $alias === '' ? '' : "{$alias}.";
+
+        return $this->balanceSheetAccounts
+            ? "{$a}account_type <> 'BANK' AND {$a}system_account IS DISTINCT FROM 'CREDITORS'"
+            : "{$a}grp IN (".self::profitAndLossGroups().')';
+    }
+
+    private function overdraftUnion(): string
+    {
+        return $this->overdraftInterest
+            ? 'UNION ALL SELECT farm_id, date, account_id, amount, enterprise FROM overdraft_vj'
+            : '';
     }
 
     /**
@@ -517,7 +648,7 @@ final class ReportLinesSqlBuilder
             SQL, $months);
 
         $trackers = self::mysqlQuery(<<<SQL
-            SELECT id, income_accountid FROM milk_trackers
+            SELECT id, income_accountid, enterprise FROM milk_trackers
             WHERE {$this->farmFilter('farm_id')} AND _valid_to IS NULL
             SQL);
 
@@ -531,7 +662,7 @@ final class ReportLinesSqlBuilder
 
         return <<<SQL
             (
-                SELECT p.farm_id, mt.income_accountid AS account_id, p.transaction_date,
+                SELECT p.farm_id, mt.income_accountid AS account_id, p.transaction_date, mt.enterprise,
                        CAST(p.production AS BIGINT) * pr.price AS value
                 FROM {$production} p
                 JOIN {$trackers} mt ON mt.id = p.milk_tracker_id
@@ -564,7 +695,7 @@ final class ReportLinesSqlBuilder
         return <<<SQL
             SELECT mp.farm_id, mp.account_id,
                    mp.transaction_date AS date,
-                   -mp.value AS amount
+                   -mp.value AS amount, mp.enterprise
             FROM {$this->pricedMilkProduction()} mp
             WHERE CAST(mp.transaction_date + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) > {$this->horizon()}
               AND mp.transaction_date <= CAST(\$period_to AS DATE)
@@ -625,21 +756,27 @@ final class ReportLinesSqlBuilder
             SQL;
     }
 
+    /** The herd's value at each month end, by the enterprise each mob belongs to. */
     private function stockValuesCte(): string
     {
+        $trackers = self::mysql('trackers');
+
         return <<<SQL
-            SELECT farm_id, ms, SUM(value) AS value
-            FROM stock_class_values
-            GROUP BY 1, 2
+            SELECT v.farm_id, t.enterprise, v.ms, SUM(v.value) AS value
+            FROM stock_class_values v
+            LEFT JOIN (
+                SELECT id, enterprise FROM {$trackers} WHERE {$this->farmFilter('farm_id')} AND _valid_to IS NULL
+            ) t ON t.id = v.tracker_id
+            GROUP BY 1, 2, 3
             SQL;
     }
 
     private function valuationVjCte(): string
     {
         return <<<SQL
-            SELECT v.farm_id, a.accountid AS account_id, v.ms AS date, CAST(round(-(v.value - v.previous)) AS BIGINT) AS amount
+            SELECT v.farm_id, a.accountid AS account_id, v.ms AS date, CAST(round(-(v.value - v.previous)) AS BIGINT) AS amount, v.enterprise
             FROM (
-                SELECT farm_id, ms, value, LAG(value) OVER (PARTITION BY farm_id ORDER BY ms) AS previous
+                SELECT farm_id, enterprise, ms, value, LAG(value) OVER (PARTITION BY farm_id, enterprise ORDER BY ms) AS previous
                 FROM stock_values
             ) v
             JOIN accounts a ON a.farm_id = v.farm_id AND a.category = 'Livestock Valuation Change'
@@ -649,21 +786,21 @@ final class ReportLinesSqlBuilder
 
     private function accrualReportLinesCte(): string
     {
-        $groups = self::profitAndLossGroups();
-
         return <<<SQL
-            SELECT l.farm_id, l.date, l.account_id, l.amount, a.grp, a.category
+            SELECT l.farm_id, l.date, l.account_id, l.amount, a.grp, a.category, l.enterprise
             FROM (
-                SELECT farm_id, date, account_id, amount FROM scan
+                SELECT farm_id, date, account_id, amount, enterprise FROM scan
                 UNION ALL
-                SELECT farm_id, date, account_id, amount FROM milk_vj
+                SELECT farm_id, date, account_id, amount, enterprise FROM milk_vj
                 UNION ALL
-                SELECT farm_id, date, account_id, amount FROM valuation_vj
+                SELECT farm_id, date, account_id, amount, enterprise FROM valuation_vj
+                {$this->overdraftUnion()}
             ) l
             JOIN accounts a ON a.farm_id = l.farm_id AND a.accountid = l.account_id
             JOIN report_window w ON w.farm_id = l.farm_id
-            WHERE a.grp IN ({$groups})
+            WHERE {$this->accrualAccounts('a')}
               AND l.date BETWEEN CAST(date_trunc('month', w.window_start) AS DATE) AND w.window_end
+              AND {$this->enterpriseCondition('l.enterprise')}
             SQL;
     }
 }

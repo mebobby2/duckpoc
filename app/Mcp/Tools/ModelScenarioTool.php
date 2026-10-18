@@ -19,16 +19,17 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 #[Name('model-scenario')]
 #[Description(<<<'TEXT'
     What if: how a change the farmer is considering would move the plan. Describe the change (buying an asset,
-    with any trade-in and loan; or more or less income or cost in a category for some months); Figured books it
-    into the forecast the way it books any forecast, runs its own profit and loss and cash flow, and returns the
-    result beside the plan and where the farm is heading now. Do not work out GST, payment timing, loan
-    repayments or depreciation yourself: they are in the result. Nothing is saved.
+    with any trade-in and loan; or more or less income or cost in a category, or one enterprise's share of it,
+    for some months), or name a saved scenario_id; Figured books it into the forecast the way it books any
+    forecast, runs its own profit and loss and cash flow, and returns the result beside where the farm is heading
+    now and the budget. Do not work out GST, payment timing, loan repayments, depreciation or overdraft interest
+    yourself: they are in the result. Nothing is saved.
 
-    headline: operating surplus, net profit, bank balance and the season's lowest month-end bank balance, each
-    with plan, current, scenario and change (scenario - current), and for the lowest balance the month it falls
-    in on each side.
-    changed_rows: every profit and loss and cash flow row the scenario moves, for the season.
-    bank_by_month: month-end bank balance through the season on all three.
+    headline: operating surplus, net profit, bank balance and the season's lowest month-end bank balance, with
+    values for scenario, current and budget, and vs (scenario minus each) with its effect; for the lowest balance,
+    the month it falls in on each side.
+    changed_rows: every profit and loss and cash flow row the scenario moves, for the season (same shape).
+    bank_by_month: month-end bank balance through the season on all three, and the change from current.
     booked: what each change books, by kind (purchase, trade_in, depreciation, loan_drawdown, loan_interest,
     loan_principal, adjustment) and category: the months it runs, the amount this season and in all, and its GST
     (positive: GST the farm claims back or no longer owes; negative: GST it owes). change_no is the change's
@@ -43,7 +44,10 @@ class ModelScenarioTool extends Tool
     public function handle(Request $request, FarmPlan $plan): Response
     {
         try {
-            $result = $plan->modelScenario($request->get('changes'));
+            $result = $plan->modelScenario(
+                $request->get('changes'),
+                $request->get('scenario_id') === null ? null : (int) $request->get('scenario_id'),
+            );
         } catch (InvalidArgumentException $e) {
             return Response::error($e->getMessage());
         }
@@ -56,6 +60,9 @@ class ModelScenarioTool extends Tool
 
     public function schema(JsonSchema $schema): array
     {
-        return ['changes' => $this->changesSchema($schema)];
+        return [
+            'changes' => $this->changesSchema($schema, required: false),
+            'scenario_id' => $schema->integer()->description('A saved draft scenario to model instead of changes.'),
+        ];
     }
 }

@@ -33,11 +33,15 @@ use InvalidArgumentException;
  * far outside normal variation it is (1 - e^(-z²/2): a third at one spread,
  * nearly all at three). It is an ordering, not a cut-off.
  *
- * Current includes every peer's adopted scenarios, as the comparison's does.
+ * The plan side is the budget, current the forecast as it stands, adopted
+ * scenarios included, as in the comparison; both carry forecast overdraft
+ * interest, which is a line of the profit and loss like any other.
  *
- * Binds the plan and current horizons, `$season_from`, `$period_to` (the
- * season's end) and `$period_from`, the start of the history: the farm's
- * window reaches back that far on the plan side, its peers' do not.
+ * Binds the plan and current horizons, when the budget was agreed,
+ * `$season_from`, `$period_to` (the season's end), `$period_from`, the
+ * start of the history (the farm's window reaches back that far on the plan
+ * side, its peers' do not), and `$opening_before`, the season's start, for
+ * the overdraft interest's cash position.
  */
 final class PlanSignalsSqlBuilder
 {
@@ -61,8 +65,10 @@ final class PlanSignalsSqlBuilder
     public function build(): string
     {
         $profitAndLoss = new InsightsProfitLossSqlBuilder($this->farmId);
-        $plan = $this->side(PlanComparisonSqlBuilder::PLAN_HORIZON, ForecastEdits::None, $profitAndLoss, withHistory: true);
-        $current = $this->side(PlanComparisonSqlBuilder::CURRENT_HORIZON, ForecastEdits::Adopted, $profitAndLoss, withHistory: false);
+        $budget = PlanComparisonSqlBuilder::budget();
+        $now = PlanComparisonSqlBuilder::current();
+        $plan = $this->side($budget->horizonParameter, $budget->edits, $profitAndLoss, withHistory: true);
+        $current = $this->side($now->horizonParameter, $now->edits, $profitAndLoss, withHistory: false);
         $planHorizon = 'CAST($'.PlanComparisonSqlBuilder::PLAN_HORIZON.' AS DATE)';
         $currentHorizon = 'CAST($'.PlanComparisonSqlBuilder::CURRENT_HORIZON.' AS DATE)';
         $seasonFrom = 'CAST($'.self::SEASON_FROM.' AS DATE)';
@@ -193,7 +199,7 @@ final class PlanSignalsSqlBuilder
             FROM scored s
             JOIN section_labels sl ON sl.grp = s.grp
             LEFT JOIN peers p ON p.level = s.level AND p.grp = s.grp AND p.category IS NOT DISTINCT FROM s.category
-            ORDER BY attention DESC NULLS LAST, abs(s.variance_since) DESC, s.level, row
+            ORDER BY attention DESC NULLS LAST, round(abs(s.variance_since), 2) DESC, s.level, row
             {$limit}
             SQL;
     }
@@ -217,7 +223,7 @@ final class PlanSignalsSqlBuilder
         $fp = self::FIXED_POINT;
 
         return ReportLinesSqlBuilder::statement(
-            (new ReportLinesSqlBuilder($this->peerFarmIds, ReportBasis::Accrual, $horizonParameter, $edits))->ctes($window),
+            (new ReportLinesSqlBuilder($this->peerFarmIds, ReportBasis::Accrual, $horizonParameter, $edits, overdraftInterest: true))->ctes($window),
             <<<SQL
                 SELECT farm_id, CAST(date_trunc('month', date) AS DATE) AS month, grp, category,
                        CAST(SUM(amount) AS DOUBLE) / {$fp} * (CASE grp {$signs} END) AS amount

@@ -15,9 +15,10 @@ use Laravel\Mcp\Server\Tool;
 
 #[Name('adopt-scenario')]
 #[Description(<<<'TEXT'
-    Writes a saved scenario into the farm's forecast in Figured: from then on every report's current side
-    (compare-plan, get-plan-status) includes it. The agreed plan does not change, so the scenario will show as a
-    variance against the plan, and a plan note records that it was chosen. It cannot be undone here.
+    Writes a saved scenario into the farm's forecast in Figured: from then on the current forecast in every report
+    (get-report, get-plan-status, get-cash-outlook, get-position) includes it. The budget does not change, so the
+    scenario will show as a variance against it, and a plan note records that it was chosen. withdraw-scenario
+    takes it back out; snapshots taken while it was in keep it.
 
     Only call this when the farmer has explicitly said to update their forecast with this scenario, after seeing
     its effect; set confirmed to true to say they have.
@@ -31,7 +32,7 @@ class AdoptScenarioTool extends Tool
         }
 
         try {
-            $adopted = $plan->adoptScenario((int) $request->get('scenario_id'));
+            $adopted = $plan->adoptScenario((int) $request->get('scenario_id'), $this->author($request));
         } catch (InvalidArgumentException $e) {
             return Response::error($e->getMessage());
         }
@@ -44,6 +45,12 @@ class AdoptScenarioTool extends Tool
         return [
             'scenario_id' => $schema->integer()->required()->description('From save-scenario or list-scenarios.'),
             'confirmed' => $schema->boolean()->required()->description('true only when the farmer has said to update the forecast.'),
+            'author' => $schema->string()->enum(['farmer', 'advisor'])->default('farmer')->description('Who asked for it.'),
         ];
+    }
+
+    private function author(Request $request): string
+    {
+        return $request->get('author') === 'advisor' ? 'advisor' : 'farmer';
     }
 }

@@ -12,7 +12,8 @@ use InvalidArgumentException;
  *
  *   - `account`: a category's forecast over a run of months, the way Magic
  *     Planner's account overrides take it: `values` (one for every month, or
- *     one per month) added or replacing, or a `percentage` change;
+ *     one per month) added or replacing, or a `percentage` change; on one
+ *     enterprise's share of the category if it names one;
  *   - `asset_purchase`: buying an asset in a month, with an optional trade-in
  *     and loan, and depreciation at a diminishing-value rate.
  *
@@ -38,8 +39,9 @@ final readonly class ScenarioChanges
      * @param string $first the first forecast month, YYYY-MM
      * @param string $last the season's last month, YYYY-MM
      * @param list<string> $categories the categories this farm's forecast can change
+     * @param list<string> $enterprises the farm's enterprises
      */
-    public static function fromInput(mixed $changes, string $first, string $last, array $categories): self
+    public static function fromInput(mixed $changes, string $first, string $last, array $categories, array $enterprises = []): self
     {
         if (!is_array($changes) || !array_is_list($changes) || $changes === []) {
             throw new InvalidArgumentException('changes must be a list of at least one change.');
@@ -55,7 +57,7 @@ final readonly class ScenarioChanges
                 throw new InvalidArgumentException("{$at} must be an object.");
             }
             $normalised[] = match ($change['type'] ?? null) {
-                'account' => self::account($change, $at, $categories, $first, $last),
+                'account' => self::account($change, $at, $categories, $enterprises, $first, $last),
                 'asset_purchase' => self::assetPurchase($change, $at, $first, $last),
                 default => throw new InvalidArgumentException("{$at}.type must be account or asset_purchase."),
             };
@@ -93,20 +95,25 @@ final readonly class ScenarioChanges
                 default => ($c['application_mode'] === 'replace' ? 'set month by month' : 'changed month by month'),
             };
 
-            return sprintf('%s %s, %s', $c['category'], $how, $months);
+            return sprintf('%s%s %s, %s', $c['enterprise'] === null ? '' : $c['enterprise'].' ', $c['category'], $how, $months);
         }, $this->changes));
     }
 
     /**
      * @param array<string, mixed> $c
      * @param list<string> $categories
+     * @param list<string> $enterprises
      * @return array<string, mixed>
      */
-    private static function account(array $c, string $at, array $categories, string $first, string $last): array
+    private static function account(array $c, string $at, array $categories, array $enterprises, string $first, string $last): array
     {
         $category = $c['category'] ?? null;
         if (!is_string($category) || !in_array($category, $categories, true)) {
             throw new InvalidArgumentException(sprintf('%s.category must be one of: %s.', $at, implode(', ', $categories)));
+        }
+        $enterprise = $c['enterprise'] ?? null;
+        if ($enterprise !== null && !in_array($enterprise, $enterprises, true)) {
+            throw new InvalidArgumentException(sprintf('%s.enterprise must be one of this farm\'s: %s.', $at, $enterprises === [] ? 'none recorded' : implode(', ', $enterprises)));
         }
         $start = self::month($c['start_month'] ?? null, "{$at}.start_month", $first, $last);
         $end = self::month($c['end_month'] ?? $start, "{$at}.end_month", $first, $last);
@@ -142,6 +149,7 @@ final readonly class ScenarioChanges
         return [
             'type' => 'account',
             'category' => $category,
+            'enterprise' => $enterprise,
             'start_month' => $start,
             'end_month' => $end,
             'values' => $values === null ? null : array_map('floatval', $values),

@@ -24,6 +24,11 @@ use Saturio\DuckDB\DuckDB;
  * Lines are written a batch of farms at a time, each batch sorted by farm,
  * month and account, so every lake file covers a narrow farm range whose
  * statistics let a portfolio's scan skip the files of other practices.
+ *
+ * Each transaction's account line carries the enterprise it is tracked to
+ * (PracticeShape::ENTERPRISE_ACCOUNTS), the ledger opens with the farm's
+ * land, plant and term loan as well as its bank balance, and each farm gets
+ * its enterprises' hectares and an overdraft facility.
  */
 final class InsightsDuckDbPracticeSeeder
 {
@@ -51,10 +56,28 @@ final class InsightsDuckDbPracticeSeeder
         private readonly int $firstFarmId,
         private readonly int $farmCount,
         private readonly int $farmsPerBatch = 50,
+        private readonly ?array $typeMix = null,
     ) {
         if ($firstFarmId < 1 || $farmCount < 1 || $firstFarmId + $farmCount > 900_000) {
             throw new InvalidArgumentException('Farm ids must fit the transaction id layout: 1 to 899,999.');
         }
+        if ($typeMix !== null && array_sum($typeMix) !== 100) {
+            throw new InvalidArgumentException('A farm type mix\'s shares must add up to 100.');
+        }
+    }
+
+    /**
+     * PracticeShape's type mix, with this practice's shares if it was given
+     * its own.
+     *
+     * @return list<array{0: string, 1: int, 2: string, 3: int}>
+     */
+    private function typeMix(): array
+    {
+        return array_map(
+            fn (array $t): array => [$t[0], $this->typeMix === null ? $t[1] : (int) ($this->typeMix[$t[0]] ?? 0), $t[2], $t[3]],
+            PracticeShape::TYPE_MIX,
+        );
     }
 
     private bool $writeDimensions = true;
@@ -111,7 +134,7 @@ final class InsightsDuckDbPracticeSeeder
             $progress(sprintf('lines for farms %d-%d: %s in %.1f s', $lo, $hi, number_format($written), microtime(true) - $started));
         }
 
-        foreach (['seed_farm_profile', 'seed_plan', 'seed_system_accounts', 'seed_milk_trackers', 'seed_milk_productions', 'seed_milk_prices', 'seed_events'] as $table) {
+        foreach (['seed_farm_profile', 'seed_plan', 'seed_system_accounts', 'seed_enterprise_accounts', 'seed_milk_trackers', 'seed_milk_productions', 'seed_milk_prices', 'seed_events'] as $table) {
             $this->db->query("DROP TABLE IF EXISTS {$table}");
         }
 
@@ -120,8 +143,8 @@ final class InsightsDuckDbPracticeSeeder
 
     private function profiles(): void
     {
-        $typeCase = $this->bucketCase('hash(g * 7919) % 100', PracticeShape::TYPE_MIX, 0);
-        $fyCase = $this->bucketCase('hash(g * 7919) % 100', PracticeShape::TYPE_MIX, 3);
+        $typeCase = $this->bucketCase('hash(g * 7919) % 100', $this->typeMix(), 0);
+        $fyCase = $this->bucketCase('hash(g * 7919) % 100', $this->typeMix(), 3);
         $bandCase = $this->bucketCase('hash(g * 104729) % 100', PracticeShape::SIZE_BANDS, 0);
         $txnCase = $this->bucketCase('hash(g * 104729) % 100', PracticeShape::SIZE_BANDS, 2);
         $scaleCase = $this->bucketCase('hash(g * 104729) % 100', PracticeShape::SIZE_BANDS, 3);
@@ -155,10 +178,28 @@ final class InsightsDuckDbPracticeSeeder
             PracticeShape::TYPE_MIX,
         ));
 
+        $enterprises = $this->enterpriseAreas();
+        $limit = PracticeShape::OVERDRAFT_LIMIT;
+        $rate = PracticeShape::OVERDRAFT_RATE_PCT;
+
         $this->write(<<<SQL
-            INSERT INTO {$this->t('farms')} (id, _valid_from, uuid, name, practice_id, region_primary, financial_year_end_day, financial_year_end_month)
-            SELECT farm_id, {$vf}, seed_uuid('farm-' || farm_id), (CASE farm_type {$names} END) || farm_id,
-                   {$this->practiceId}, region, CASE fy_end_month WHEN 5 THEN 31 ELSE 30 END, fy_end_month
+            INSERT INTO {$this->t('farms')} (id, _valid_from, uuid, name, practice_id, region_primary, financial_year_end_day, financial_year_end_month, area_ha)
+            SELECT p.farm_id, {$vf}, seed_uuid('farm-' || p.farm_id), (CASE p.farm_type {$names} END) || p.farm_id,
+                   {$this->practiceId}, p.region, CASE p.fy_end_month WHEN 5 THEN 31 ELSE 30 END, p.fy_end_month,
+                   (SELECT round(SUM(e.ha) * p.scale, 1) FROM ({$enterprises}) e(farm_type, enterprise, ha) WHERE e.farm_type = p.farm_type)
+            FROM seed_farm_profile p
+            SQL);
+
+        $this->write(<<<SQL
+            INSERT INTO {$this->t('farm_enterprises')} (farm_id, enterprise, area_ha)
+            SELECT p.farm_id, e.enterprise, round(e.ha * p.scale, 1)
+            FROM seed_farm_profile p
+            JOIN ({$enterprises}) e(farm_type, enterprise, ha) ON e.farm_type = p.farm_type
+            SQL);
+
+        $this->write(<<<SQL
+            INSERT INTO {$this->t('bank_facilities')} (farm_id, overdraft_limit, rate_pct)
+            SELECT farm_id, CAST(round({$limit} * scale, -4) AS BIGINT), {$rate}
             FROM seed_farm_profile
             SQL);
 
@@ -211,15 +252,34 @@ final class InsightsDuckDbPracticeSeeder
                 VALUES {$plan}
             ),
             chosen AS (
-                SELECT p.farm_id, t.*
+                SELECT p.farm_id, p.farm_type, t.*
                 FROM seed_farm_profile p
                 JOIN template t ON list_contains(t.farm_types, p.farm_type) OR list_contains(t.farm_types, '*')
             )
-            SELECT c.farm_id, c.account_index, c.code, c.name, c.class, c.type, c.system_account, c.grp, c.category,
+            SELECT c.farm_id, c.farm_type, c.account_index, c.code, c.name, c.class, c.type, c.system_account, c.grp, c.category,
                    seed_uuid(c.farm_id || '-' || c.code) AS accountid,
                    c.share / SUM(c.share) OVER (PARTITION BY c.farm_id) AS share,
                    c.monthly, c.taxable
             FROM chosen c
+            SQL);
+
+        $tracked = [];
+        foreach (PracticeShape::ENTERPRISE_ACCOUNTS as $farmType => $accounts) {
+            foreach ($accounts as $code => $shares) {
+                $from = 0;
+                $ordinal = 0;
+                foreach ($shares as $enterprise => $share) {
+                    $tracked[] = sprintf('(%s, %s, %s, %d, %d, %d, %d)', $this->quote($farmType), $this->quote((string) $code),
+                        $this->quote($enterprise), ++$ordinal, $share, $from, $from + $share);
+                    $from += $share;
+                }
+            }
+        }
+        $trackedValues = implode(', ', $tracked);
+
+        $this->db->query(<<<SQL
+            CREATE OR REPLACE TEMP TABLE seed_enterprise_accounts AS
+            SELECT * FROM (VALUES {$trackedValues}) t(farm_type, code, enterprise, ordinal, share, bucket_from, bucket_to)
             SQL);
 
         $system = [];
@@ -290,11 +350,12 @@ final class InsightsDuckDbPracticeSeeder
         $curveTotal = array_sum(PracticeShape::MILK_CURVE);
         $kgms = PracticeShape::MEDIUM_FARM_KGMS;
         $price = PracticeShape::MILK_PRICE;
+        $milkEnterprise = PracticeShape::MILK_ENTERPRISE;
         $horizon = self::HORIZON;
 
         $this->db->query(<<<SQL
             CREATE OR REPLACE TEMP TABLE seed_milk_trackers AS
-            SELECT CAST(farm_id * 100 + k AS INTEGER) AS id, farm_id, 'Milk supply ' || k AS name,
+            SELECT CAST(farm_id * 100 + k AS INTEGER) AS id, farm_id, 'Milk supply ' || k AS name, '{$milkEnterprise}' AS enterprise,
                    {$companies}[CAST(1 + hash(CAST(farm_id AS BIGINT) * 101 + k) % {$companyCount} AS BIGINT)] AS company,
                    seed_uuid(farm_id || '-milk-' || k) AS income_accountid,
                    count(*) OVER (PARTITION BY farm_id) AS trackers
@@ -307,8 +368,8 @@ final class InsightsDuckDbPracticeSeeder
             SQL);
 
         $this->write(<<<SQL
-            INSERT INTO {$this->t('milk_trackers')} (id, _valid_from, farm_id, name, company, income_accountid)
-            SELECT id, {$vf}, farm_id, name, company, income_accountid FROM seed_milk_trackers
+            INSERT INTO {$this->t('milk_trackers')} (id, _valid_from, farm_id, name, company, income_accountid, enterprise)
+            SELECT id, {$vf}, farm_id, name, company, income_accountid, enterprise FROM seed_milk_trackers
             SQL);
 
         $this->write(<<<SQL
@@ -416,8 +477,9 @@ final class InsightsDuckDbPracticeSeeder
             SQL);
 
         $this->write(<<<SQL
-            INSERT INTO {$this->t('trackers')} (id, _valid_from, uuid, farm_id, name, tracker_number, stock_type_uuid)
-            SELECT id, {$vf}, seed_uuid('tracker-' || farm_id || '-' || mob), farm_id, name, mob, seed_uuid('stock-type-' || stock_type)
+            INSERT INTO {$this->t('trackers')} (id, _valid_from, uuid, farm_id, name, tracker_number, stock_type_uuid, enterprise)
+            SELECT id, {$vf}, seed_uuid('tracker-' || farm_id || '-' || mob), farm_id, name, mob, seed_uuid('stock-type-' || stock_type),
+                   {$this->mobEnterpriseCase('name')}
             FROM seed_trackers
             SQL);
 
@@ -500,7 +562,7 @@ final class InsightsDuckDbPracticeSeeder
                 FROM ({$this->months()})
             ),
             actual_base AS (
-                SELECT pl.farm_id, pl.accountid, pl.class, pl.taxable, pl.account_index, pl.monthly, fp.scale, se.m, se.mi, se.factor,
+                SELECT pl.farm_id, pl.farm_type, pl.code, pl.accountid, pl.class, pl.taxable, pl.account_index, pl.monthly, fp.scale, se.m, se.mi, se.factor,
                        CAST(greatest(1, round(fp.txns_per_month * pl.share)) AS INTEGER) AS cnt
                 FROM seed_plan pl
                 JOIN seed_farm_profile fp ON fp.farm_id = pl.farm_id
@@ -511,29 +573,38 @@ final class InsightsDuckDbPracticeSeeder
                 SELECT *, unnest(generate_series(1, cnt)) AS k FROM actual_base
             ),
             actual AS (
-                SELECT farm_id, accountid, class, taxable, 'actuals' AS type,
-                       CAST(farm_id AS BIGINT) * 10000000000 + mi * 100000000 + account_index * 1000000 + k AS txn_id,
-                       CAST(m + CAST(hash(CAST(farm_id AS BIGINT) * 1000003 + mi * 1009 + account_index * 101 + k) % 28 AS INTEGER) AS DATE) AS accrual_date,
-                       CAST(round(monthly * scale * factor / cnt
-                             * (0.5 + (hash(CAST(farm_id AS BIGINT) * 7 + mi * 13 + account_index * 17 + k * 19) % 1000) / 1000.0)
-                             * {$fp}) AS BIGINT) AS amount
-                FROM actual_k
+                SELECT a.farm_id, a.accountid, a.class, a.taxable, 'actuals' AS type,
+                       CAST(a.farm_id AS BIGINT) * 10000000000 + a.mi * 100000000 + a.account_index * 1000000 + a.k AS txn_id,
+                       CAST(a.m + CAST(hash(CAST(a.farm_id AS BIGINT) * 1000003 + a.mi * 1009 + a.account_index * 101 + a.k) % 28 AS INTEGER) AS DATE) AS accrual_date,
+                       CAST(round(a.monthly * a.scale * a.factor / a.cnt
+                             * (0.5 + (hash(CAST(a.farm_id AS BIGINT) * 7 + a.mi * 13 + a.account_index * 17 + a.k * 19) % 1000) / 1000.0)
+                             * {$fp}) AS BIGINT) AS amount,
+                       ea.enterprise
+                FROM actual_k a
+                LEFT JOIN seed_enterprise_accounts ea
+                  ON ea.farm_type = a.farm_type AND ea.code = a.code
+                 AND hash(CAST(a.farm_id AS BIGINT) * 3 + a.mi * 7 + a.account_index * 11 + a.k * 13) % 100 >= ea.bucket_from
+                 AND hash(CAST(a.farm_id AS BIGINT) * 3 + a.mi * 7 + a.account_index * 11 + a.k * 13) % 100 < ea.bucket_to
             ),
             forecast AS (
                 SELECT pl.farm_id, pl.accountid, pl.class, pl.taxable, 'forecast' AS type,
-                       CAST(pl.farm_id AS BIGINT) * 10000000000 + se.mi * 100000000 + pl.account_index * 1000000 AS txn_id,
+                       CAST(pl.farm_id AS BIGINT) * 10000000000 + se.mi * 100000000 + pl.account_index * 1000000
+                           + COALESCE(ea.ordinal, 0) * 1000 AS txn_id,
                        CAST(se.m + 14 AS DATE) AS accrual_date,
-                       CAST(round(pl.monthly * fp.scale * se.factor * {$fp}) AS BIGINT) AS amount
+                       CAST(round(pl.monthly * fp.scale * se.factor * COALESCE(ea.share, 100) / 100.0 * {$fp}) AS BIGINT) AS amount,
+                       ea.enterprise
                 FROM seed_plan pl
                 JOIN seed_farm_profile fp ON fp.farm_id = pl.farm_id
                 CROSS JOIN months se
+                LEFT JOIN seed_enterprise_accounts ea ON ea.farm_type = pl.farm_type AND ea.code = pl.code
                 WHERE se.m > DATE '{$horizon}' AND pl.farm_id BETWEEN {$lo} AND {$hi}
             ),
             milk AS (
                 SELECT mt.farm_id, mt.income_accountid AS accountid, 'REVENUE' AS class, true AS taxable, 'actuals' AS type,
                        CAST(mt.farm_id AS BIGINT) * 10000000000 + se.mi * 100000000 + (90 + mt.id % 100) * 1000000 AS txn_id,
                        CAST(se.m + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) AS accrual_date,
-                       CAST(mp.production AS BIGINT) * pr.price AS amount
+                       CAST(mp.production AS BIGINT) * pr.price AS amount,
+                       mt.enterprise
                 FROM seed_milk_trackers mt
                 JOIN seed_milk_productions mp ON mp.milk_tracker_id = mt.id
                 JOIN seed_milk_prices pr ON pr.milk_tracker_id = mt.id AND pr.month = mp.m
@@ -550,13 +621,14 @@ final class InsightsDuckDbPracticeSeeder
         $before = $this->count("SELECT count(*) FROM {$lake} WHERE farm_id BETWEEN {$lo} AND {$hi}");
 
         $this->db->query(<<<SQL
-            INSERT INTO {$lake} (transaction_id, farm_id, type, basis, date, month, account_id, net_amount, tax_amount, tag)
+            INSERT INTO {$lake} (transaction_id, farm_id, type, basis, date, month, account_id, net_amount, tax_amount, tag, enterprise)
             WITH sa AS (
                 SELECT farm_id,
                        max(accountid) FILTER (WHERE role = 'bank') AS bank,
                        max(accountid) FILTER (WHERE role = 'gst') AS gst,
                        max(accountid) FILTER (WHERE role = 'payables') AS payables,
-                       max(accountid) FILTER (WHERE role = 'opening') AS equity
+                       max(accountid) FILTER (WHERE role = 'opening') AS equity,
+                       max(accountid) FILTER (WHERE role = 'land') AS land
                 FROM seed_system_accounts
                 WHERE farm_id BETWEEN {$lo} AND {$hi}
                 GROUP BY farm_id
@@ -571,19 +643,20 @@ final class InsightsDuckDbPracticeSeeder
             ),
             legs AS (
                 SELECT txn_id, farm_id, type, gst, unnest([
-                    {'basis': 'cash',    'date': cash_date,    'account_id': accountid, 'net_amount': net,           'tax_amount': tax},
-                    {'basis': 'cash',    'date': cash_date,    'account_id': gst,       'net_amount': tax,           'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'cash',    'date': cash_date,    'account_id': bank,      'net_amount': -(net + tax),  'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': accrual_date, 'account_id': accountid, 'net_amount': net,           'tax_amount': tax},
-                    {'basis': 'accrual', 'date': accrual_date, 'account_id': gst,       'net_amount': tax,           'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': accrual_date, 'account_id': payables,  'net_amount': -(net + tax),  'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': cash_date,    'account_id': payables,  'net_amount': net + tax,     'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': cash_date,    'account_id': bank,      'net_amount': -(net + tax),  'tax_amount': CAST(0 AS BIGINT)}
+                    {'basis': 'cash',    'date': cash_date,    'account_id': accountid, 'net_amount': net,           'tax_amount': tax,              'enterprise': enterprise},
+                    {'basis': 'cash',    'date': cash_date,    'account_id': gst,       'net_amount': tax,           'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'cash',    'date': cash_date,    'account_id': bank,      'net_amount': -(net + tax),  'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': accrual_date, 'account_id': accountid, 'net_amount': net,           'tax_amount': tax,              'enterprise': enterprise},
+                    {'basis': 'accrual', 'date': accrual_date, 'account_id': gst,       'net_amount': tax,           'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': accrual_date, 'account_id': payables,  'net_amount': -(net + tax),  'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': cash_date,    'account_id': payables,  'net_amount': net + tax,     'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': cash_date,    'account_id': bank,      'net_amount': -(net + tax),  'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)}
                 ]) AS leg
                 FROM ev
             ),
             event_lines AS (
-                SELECT txn_id, farm_id, type, leg.basis, leg.date, leg.account_id, leg.net_amount, leg.tax_amount, CAST(NULL AS VARCHAR) AS tag
+                SELECT txn_id, farm_id, type, leg.basis, leg.date, leg.account_id, leg.net_amount, leg.tax_amount, CAST(NULL AS VARCHAR) AS tag,
+                       leg.enterprise
                 FROM legs
                 WHERE NOT (leg.account_id = gst AND leg.net_amount = 0)
             ),
@@ -591,13 +664,28 @@ final class InsightsDuckDbPracticeSeeder
                 SELECT CAST(p.farm_id AS BIGINT) * 10000000000 AS txn_id, p.farm_id, 'actuals' AS type, b.basis, DATE '{$opening}' AS date,
                        unnest([sa.bank, sa.equity]) AS account_id,
                        unnest([o.balance, -o.balance]) AS net_amount,
-                       CAST(0 AS BIGINT) AS tax_amount, CAST(NULL AS VARCHAR) AS tag
+                       CAST(0 AS BIGINT) AS tax_amount, CAST(NULL AS VARCHAR) AS tag, CAST(NULL AS VARCHAR) AS enterprise
                 FROM seed_farm_profile p
                 JOIN sa ON sa.farm_id = p.farm_id
                 CROSS JOIN (VALUES ('cash'), ('accrual')) b(basis)
                 CROSS JOIN LATERAL (
                     SELECT CAST(round(p.scale * 150000 * 10000 * ((hash(CAST(p.farm_id AS BIGINT) * 3) % 1000) / 1000.0 - 0.2)) AS BIGINT) AS balance
                 ) o
+            ),
+            position_lines AS (
+                SELECT CAST(p.farm_id AS BIGINT) * 10000000000 + 1 AS txn_id, p.farm_id, 'actuals' AS type, b.basis, DATE '{$opening}' AS date,
+                       unnest([sa.land, seed_uuid(p.farm_id || '-710'), seed_uuid(p.farm_id || '-800'), sa.equity]) AS account_id,
+                       unnest([v.land, v.plant, -v.loan, v.loan - v.land - v.plant]) AS net_amount,
+                       CAST(0 AS BIGINT) AS tax_amount, CAST(NULL AS VARCHAR) AS tag, CAST(NULL AS VARCHAR) AS enterprise
+                FROM seed_farm_profile p
+                JOIN sa ON sa.farm_id = p.farm_id
+                CROSS JOIN (VALUES ('cash'), ('accrual')) b(basis)
+                CROSS JOIN LATERAL (
+                    SELECT CAST(round(({$this->openingPositionCase('p.farm_type', 0)}) * n * {$fp}, -6) AS BIGINT) AS land,
+                           CAST(round(({$this->openingPositionCase('p.farm_type', 1)}) * n * {$fp}, -6) AS BIGINT) AS plant,
+                           CAST(round(({$this->openingPositionCase('p.farm_type', 2)}) * n * {$fp}, -6) AS BIGINT) AS loan
+                    FROM (SELECT p.scale * (0.9 + (hash(CAST(p.farm_id AS BIGINT) * 5) % 200) / 1000.0) AS n)
+                ) v
             ),
             gst_monthly AS (
                 SELECT farm_id, 'cash' AS basis, CAST(date_trunc('month', cash_date) AS DATE) AS ms, SUM(tax) AS net
@@ -631,15 +719,16 @@ final class InsightsDuckDbPracticeSeeder
                        r.farm_id, 'actuals' AS type, r.basis, r.pay_date AS date,
                        unnest([sa.gst, sa.bank]) AS account_id,
                        unnest([CAST(-r.net AS BIGINT), CAST(r.net AS BIGINT)]) AS net_amount,
-                       CAST(0 AS BIGINT) AS tax_amount, '{$tag}' AS tag
+                       CAST(0 AS BIGINT) AS tax_amount, '{$tag}' AS tag, CAST(NULL AS VARCHAR) AS enterprise
                 FROM gst_returns r
                 JOIN sa ON sa.farm_id = r.farm_id
                 WHERE r.net <> 0
             ),
             all_lines AS (
-                SELECT * FROM event_lines UNION ALL SELECT * FROM opening_lines UNION ALL SELECT * FROM gst_lines
+                SELECT * FROM event_lines UNION ALL SELECT * FROM opening_lines UNION ALL SELECT * FROM position_lines
+                UNION ALL SELECT * FROM gst_lines
             )
-            SELECT txn_id, farm_id, type, basis, date, CAST(date_trunc('month', date) AS DATE), account_id, net_amount, tax_amount, tag
+            SELECT txn_id, farm_id, type, basis, date, CAST(date_trunc('month', date) AS DATE), account_id, net_amount, tax_amount, tag, enterprise
             FROM all_lines
             ORDER BY farm_id, date_trunc('month', date), account_id
             SQL);
@@ -647,6 +736,44 @@ final class InsightsDuckDbPracticeSeeder
         $this->db->query('DROP TABLE IF EXISTS seed_events');
 
         return $this->count("SELECT count(*) FROM {$lake} WHERE farm_id BETWEEN {$lo} AND {$hi}") - $before;
+    }
+
+    /** One of PracticeShape::OPENING_POSITION's amounts for the farm type, in dollars. */
+    private function openingPositionCase(string $farmType, int $column): string
+    {
+        $cases = [];
+        foreach (PracticeShape::OPENING_POSITION as $type => $amounts) {
+            $cases[] = sprintf('WHEN %s THEN %d', $this->quote($type), $amounts[$column]);
+        }
+
+        return "CASE {$farmType} ".implode(' ', $cases).' ELSE 0 END';
+    }
+
+    /** The enterprise a mob belongs to, by its tracker name. */
+    private function mobEnterpriseCase(string $name): string
+    {
+        $cases = [];
+        foreach (PracticeShape::MOB_ENTERPRISES as $mob => $enterprise) {
+            $cases[] = sprintf('WHEN %s THEN %s', $this->quote($mob), $this->quote($enterprise));
+        }
+
+        return "CASE {$name} ".implode(' ', $cases).' END';
+    }
+
+    /**
+     * Each farm type's enterprises and their hectares on a medium farm, as
+     * a VALUES list of (farm_type, enterprise, ha).
+     */
+    private function enterpriseAreas(): string
+    {
+        $rows = [];
+        foreach (PracticeShape::ENTERPRISES as $type => $enterprises) {
+            foreach ($enterprises as $enterprise => $ha) {
+                $rows[] = sprintf('(%s, %s, %d)', $this->quote($type), $this->quote($enterprise), $ha);
+            }
+        }
+
+        return 'VALUES '.implode(', ', $rows);
     }
 
     /** The months of the seed window, or of a narrower range, as a one-column `m` subquery of dates. */

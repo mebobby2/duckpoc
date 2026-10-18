@@ -22,16 +22,7 @@ final class PlanComparisonQuery
      */
     public function run(ActivePlan $plan, ReportBasis $basis, ?string $period = null, bool $withCategories = true): array
     {
-        [$from, $to] = $plan->period($basis);
-        $bindings = [
-            PlanComparisonSqlBuilder::PLAN_HORIZON => $plan->planHorizon,
-            PlanComparisonSqlBuilder::CURRENT_HORIZON => $plan->actualsTo,
-            'period_from' => $from,
-            'period_to' => $to,
-        ];
-        if ($basis === ReportBasis::Cash) {
-            $bindings['opening_before'] = $from;
-        }
+        $bindings = $plan->seasonBindings();
 
         return array_map(static fn (array $r): array => [
             'kind' => (string) $r['kind'],

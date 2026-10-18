@@ -14,9 +14,11 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 
 #[Name('get-farm-profile')]
 #[Description(<<<'TEXT'
-    The farm this server answers for: name, farm type, region and balance date; its active plan (the season it
-    covers, the date the plan was agreed at, and how far actuals have come in); and its milk supplies and
-    livestock mobs with the tracker ids the other tools take. Call this first.
+    The farm this server answers for: name, farm type, region, balance date, area in hectares, its enterprises
+    (and the hectares each farms), and its overdraft limit and rate; its active plan (the season it covers, the
+    date the budget was agreed at, and how far actuals have come in); the seasons the ledger covers; the saved
+    snapshots of the forecast, with the version name each is compared as; and its milk supplies and livestock
+    mobs with the tracker ids the other tools take. Call this first.
     TEXT)]
 #[IsReadOnly]
 class GetFarmProfileTool extends Tool

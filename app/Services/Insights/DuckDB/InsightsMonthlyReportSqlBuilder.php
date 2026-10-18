@@ -30,12 +30,17 @@ abstract class InsightsMonthlyReportSqlBuilder
 
     private readonly ReportLinesSqlBuilder $reportLines;
 
+    /**
+     * @param ?string $enterprise only this enterprise's lines (profit and loss only), or ReportLinesSqlBuilder::UNALLOCATED
+     */
     public function __construct(
         int $farmId,
         private readonly string $horizonParameter = 'horizon',
-        ForecastEdits $edits = ForecastEdits::None,
+        ?ForecastEdits $edits = null,
+        bool $overdraftInterest = false,
+        ?string $enterprise = null,
     ) {
-        $this->reportLines = new ReportLinesSqlBuilder([$farmId], $this->basis(), $horizonParameter, $edits);
+        $this->reportLines = new ReportLinesSqlBuilder([$farmId], $this->basis(), $horizonParameter, $edits, $overdraftInterest, $enterprise);
     }
 
     abstract protected function basis(): ReportBasis;
@@ -59,7 +64,11 @@ abstract class InsightsMonthlyReportSqlBuilder
     /** Whether the report carries an opening and closing bank balance. */
     abstract protected function withBalances(): bool;
 
-    public function build(): string
+    /**
+     * @param bool $fixedPoint amounts in the ledger's fixed point, unrounded,
+     *     for a caller that adds them up further and rounds once at the end
+     */
+    public function build(bool $fixedPoint = false): string
     {
         $ctes = $this->reportLines->ctes(ReportLinesSqlBuilder::periodWindow()) + [
             'months' => $this->monthsCte(),
@@ -69,7 +78,7 @@ abstract class InsightsMonthlyReportSqlBuilder
             'balances' => $this->balancesCte(),
         ];
 
-        return ReportLinesSqlBuilder::statement($ctes, $this->finalSelect());
+        return ReportLinesSqlBuilder::statement($ctes, $this->finalSelect($fixedPoint));
     }
 
     private function monthsCte(): string
@@ -168,8 +177,11 @@ abstract class InsightsMonthlyReportSqlBuilder
             SQL;
     }
 
-    private function finalSelect(): string
+    private function finalSelect(bool $fixedPoint): string
     {
+        $money = fn (string $amount): string => $fixedPoint
+            ? "CAST({$amount} AS DOUBLE)"
+            : 'round(CAST('.$amount.' AS DOUBLE) / '.self::FIXED_POINT.', 2)';
         $fp = self::FIXED_POINT;
 
         $rows = [];
@@ -188,24 +200,24 @@ abstract class InsightsMonthlyReportSqlBuilder
         return <<<SQL
             SELECT kind, field, label, category, interval_index, month, column_type, amount FROM (
                 SELECT 'category' AS kind, c.grp AS field, c.grp AS label, c.category, m.interval_index, m.month, m.column_type,
-                       round(CAST(c.amount AS DOUBLE) / {$fp}, 2) AS amount
+                       {$money('c.amount')} AS amount
                 FROM category_months c
                 JOIN months m ON m.month_start = c.month_start
                 UNION ALL
                 SELECT 'category', c.grp, c.grp, c.category, (SELECT max(interval_index) + 1 FROM months), 'Total', 'total',
-                       round(CAST(SUM(c.amount) AS DOUBLE) / {$fp}, 2)
+                       {$money('SUM(c.amount)')}
                 FROM category_months c
                 GROUP BY c.grp, c.category
                 UNION ALL
                 SELECT v.kind, v.field, v.label, CAST(NULL AS VARCHAR), b.interval_index, b.month, b.column_type,
-                       round(CAST(v.amount AS DOUBLE) / {$fp}, 2)
+                       {$money('v.amount')}
                 FROM balances b
                 CROSS JOIN LATERAL (VALUES
                     {$values}
                 ) AS v(kind, field, label, amount)
                 UNION ALL
                 SELECT v.kind, v.field, v.label, CAST(NULL AS VARCHAR), (SELECT max(interval_index) + 1 FROM months), 'Total', 'total',
-                       round(CAST(v.amount AS DOUBLE) / {$fp}, 2)
+                       {$money('v.amount')}
                 FROM (
                     SELECT {$this->totalColumns()}
                     FROM balances b

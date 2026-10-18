@@ -76,7 +76,7 @@ final class AlloyDbInsightsImporter
             $lo = $batch[0];
             $hi = end($batch);
             $this->db->query(<<<SQL
-                INSERT INTO {$lines}
+                INSERT INTO {$lines} (transaction_id, farm_id, type, basis, date, month, account_id, net_amount, tax_amount, tag)
                 SELECT transaction_id, farm_id, type, basis, date, month, account_id, net_amount, tax_amount, tag
                 FROM {$this->pgLines()}
                 WHERE farm_id BETWEEN {$lo} AND {$hi}

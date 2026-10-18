@@ -39,7 +39,7 @@ class PlanStatusUpdatePrompt extends Prompt
           month-end balance, not the year-to-date gap alone.
         - The notes are the farmer's and advisor's own priorities and context: follow them, even over the ranking.
         - Quote the tools' numbers with their period. Do not invent figures or do more than simple sums. If the
-          evidence is unclear, say what you would check, for example with compare-plan or get-milk-production.
+          evidence is unclear, say what you would check, for example with get-report or get-milk-production.
         TEXT;
 
     private const array AUDIENCES = [

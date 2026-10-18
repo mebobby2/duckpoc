@@ -18,6 +18,7 @@ class InsightsDuckDbSetupCommand extends Command
         {--from-alloydb : Copy the AlloyDB PoC\'s practices, row for row}
         {--seed-practice= : Generate a practice in DuckDB with this id}
         {--farms=250 : Farms in the generated practice}
+        {--mix= : The practice\'s own farm type mix, e.g. dairy:40,sheep_beef:20,mixed:30,arable:10 (shares add up to 100)}
         {--first-farm= : Id of the generated practice\'s first farm; practices must not overlap}
         {--batch=50 : Farms per sorted lake insert; the sorted output is held in memory, ~15M lines at 50}
         {--lines-from= : Resume a stopped --seed-practice run: MySQL rows and earlier farms\' lines are in, carry on from this farm id}';
@@ -57,7 +58,7 @@ class InsightsDuckDbSetupCommand extends Command
                 $farms = (int) $this->option('farms');
                 $this->info(sprintf('Seeding practice %d: %s farms from id %d…', (int) $practice, number_format($farms), (int) $first));
                 $started = microtime(true);
-                $counts = (new InsightsDuckDbPracticeSeeder($db, (int) $practice, (int) $first, $farms, (int) $this->option('batch')))
+                $counts = (new InsightsDuckDbPracticeSeeder($db, (int) $practice, (int) $first, $farms, (int) $this->option('batch'), $this->typeMix()))
                     ->seed(
                         fn (string $line) => $this->line(sprintf('  [%6.1f s] %s', microtime(true) - $started, $line)),
                         $this->option('lines-from') === null ? null : (int) $this->option('lines-from'),
@@ -74,5 +75,24 @@ class InsightsDuckDbSetupCommand extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    /**
+     * @return ?array<string, int>
+     */
+    private function typeMix(): ?array
+    {
+        $mix = $this->option('mix');
+        if ($mix === null) {
+            return null;
+        }
+
+        $shares = [];
+        foreach (explode(',', (string) $mix) as $part) {
+            [$type, $share] = array_pad(explode(':', trim($part)), 2, null);
+            $shares[$type] = (int) $share;
+        }
+
+        return $shares;
     }
 }

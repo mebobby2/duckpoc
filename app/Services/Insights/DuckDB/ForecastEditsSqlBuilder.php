@@ -7,8 +7,9 @@ namespace App\Services\Insights\DuckDB;
 /**
  * Changes to the forecast as journal lines, in the lake's shape, for the
  * shared report SQL to read alongside the forecast: the scenarios the farm
- * has adopted (stored lines), and one proposed scenario (generated here
- * from the changes bound as `$scenario`).
+ * has adopted (stored lines), as things stand or as they stood at a time,
+ * and one proposed scenario (generated here from the changes bound to the
+ * proposal's parameter).
  *
  * A proposed change is booked the way Figured books a forecast, so every
  * rule downstream applies to it unchanged:
@@ -23,8 +24,12 @@ namespace App\Services\Insights\DuckDB;
  *     and optionally a table loan: drawn when the purchase is paid, repaid
  *     monthly, each repayment split into interest and principal.
  *
+ * Account changes keep the forecast's enterprise split, or go to one
+ * enterprise when the change names it; asset purchases and loans are
+ * whole-farm.
+ *
  * Every line is dated after the horizon, so the report treats it as
- * forecast; the plan side never includes any of it.
+ * forecast; the budget, as agreed before any change, includes none of it.
  */
 final class ForecastEditsSqlBuilder
 {
@@ -66,12 +71,12 @@ final class ForecastEditsSqlBuilder
      */
     public function ctes(): array
     {
-        if ($this->edits === ForecastEdits::None) {
+        if (!$this->edits->any()) {
             return [];
         }
 
         $ctes = ['adopted_edits' => $this->adoptedCte()];
-        if ($this->edits === ForecastEdits::AdoptedAndProposed) {
+        if ($this->edits->proposal !== null) {
             $ctes += [
                 'edit_changes' => $this->changesCte(),
                 'edit_forecast' => $this->forecastCte(),
@@ -112,20 +117,34 @@ final class ForecastEditsSqlBuilder
             SQL;
     }
 
+    /**
+     * The adopted scenarios' lines in the forecast as known: adopted by then
+     * and not withdrawn by then, or, as things stand, adopted and not
+     * withdrawn. None when the report reads no adopted edits.
+     */
     private function adoptedCte(): string
     {
-        $table = InsightsDuckDb::table('forecast_edit_lines');
+        $lines = InsightsDuckDb::table('forecast_edit_lines');
+        $scenarios = InsightsDuckDb::table('plan_scenarios');
+        $known = match (true) {
+            !$this->edits->adopted => 'false',
+            $this->edits->knownAt === null => 's.withdrawn_at IS NULL',
+            default => "s.adopted_at <= CAST(\${$this->edits->knownAt} AS TIMESTAMP)
+                  AND (s.withdrawn_at IS NULL OR s.withdrawn_at > CAST(\${$this->edits->knownAt} AS TIMESTAMP))",
+        };
 
         return <<<SQL
-            SELECT farm_id, basis, CAST(date AS DATE) AS date, account_id, net_amount, tax_amount
-            FROM {$table}
-            WHERE {$this->lines->farmFilter('farm_id')}
+            SELECT e.farm_id, e.basis, CAST(e.date AS DATE) AS date, e.account_id, e.net_amount, e.tax_amount, e.enterprise
+            FROM {$lines} e
+            JOIN {$scenarios} s ON s.id = e.scenario_id
+            WHERE {$this->lines->farmFilter('e.farm_id')} AND s.adopted_at IS NOT NULL
+              AND {$known}
             SQL;
     }
 
     private function changesCte(): string
     {
-        $proposal = self::PROPOSAL;
+        $proposal = $this->edits->proposal;
 
         return <<<SQL
             SELECT generate_subscripts(changes, 1) AS change_no, unnest(changes) AS c
@@ -144,22 +163,22 @@ final class ForecastEditsSqlBuilder
         $farm = $this->proposalFarmId;
 
         return <<<SQL
-            SELECT l.account_id, l.month,
+            SELECT l.account_id, l.month, l.enterprise,
                    COALESCE(SUM(l.net_amount) FILTER (WHERE l.forecast), 0) AS net,
                    bool_or(l.tax_amount <> 0) AS taxed
             FROM (
-                SELECT tl.account_id, tl.month, tl.net_amount, tl.tax_amount,
+                SELECT tl.account_id, tl.month, tl.enterprise, tl.net_amount, tl.tax_amount,
                        tl.type = 'forecast' AND tl.date > {$this->horizon} AS forecast
                 FROM {$lake} tl
                 WHERE {$this->lines->farmFilter('tl.farm_id')}
                   AND tl.basis = 'accrual'
                   AND tl.date BETWEEN CAST(\$period_from AS DATE) AND CAST(\$period_to AS DATE)
                 UNION ALL
-                SELECT account_id, CAST(date_trunc('month', date) AS DATE), net_amount, tax_amount, date > {$this->horizon}
+                SELECT account_id, CAST(date_trunc('month', date) AS DATE), enterprise, net_amount, tax_amount, date > {$this->horizon}
                 FROM adopted_edits
                 WHERE farm_id = {$farm} AND basis = 'accrual'
             ) l
-            GROUP BY l.account_id, l.month
+            GROUP BY l.account_id, l.month, l.enterprise
             SQL;
     }
 
@@ -180,7 +199,7 @@ final class ForecastEditsSqlBuilder
     private function accountMonthsCte(): string
     {
         return <<<'SQL'
-            SELECT p.change_no, p.c->>'category' AS category,
+            SELECT p.change_no, p.c->>'category' AS category, p.c->>'enterprise' AS enterprise,
                    COALESCE(p.c->>'application_mode', 'add') AS mode,
                    CAST(p.c->>'percentage' AS DOUBLE) AS pct,
                    CAST(p.c->'values' AS DOUBLE[]) AS vals,
@@ -195,17 +214,23 @@ final class ForecastEditsSqlBuilder
             SQL;
     }
 
-    /** Each change's month on each of its category's accounts, with what that account already forecasts, in dollars as spoken. */
+    /**
+     * Each change's month on each of its category's accounts and their
+     * enterprises (only the one the change names, if it names one), with
+     * what each already forecasts, in dollars as spoken.
+     */
     private function accountLinesCte(): string
     {
         return <<<'SQL'
             SELECT m.change_no, m.ms, m.mode, m.pct,
                    CASE WHEN len(m.vals) = 1 THEN m.vals[1] ELSE m.vals[m.i] END AS value,
                    a.account_id, a.sign, a.taxable,
+                   CASE WHEN f.account_id IS NULL THEN m.enterprise ELSE f.enterprise END AS enterprise,
                    COALESCE(f.net, 0) * a.sign / 10000.0 AS base
             FROM edit_account_months m
             JOIN edit_accounts a ON a.category = m.category
             LEFT JOIN edit_forecast f ON f.account_id = a.account_id AND f.month = m.ms
+                 AND (m.enterprise IS NULL OR f.enterprise = m.enterprise)
             SQL;
     }
 
@@ -284,35 +309,35 @@ final class ForecastEditsSqlBuilder
             FROM (
                 SELECT change_no, 'adjustment' AS kind, account_id, CAST(NULL AS VARCHAR) AS contra_id,
                        CAST(ms + {$incurred} AS DATE) AS accrual_date, CAST(ms + {$paid} AS DATE) AS cash_date,
-                       {$adjustment} AS net, taxable, 'payables' AS settlement
+                       {$adjustment} AS net, taxable, 'payables' AS settlement, enterprise
                 FROM (
                     SELECT *, SUM(base) OVER (PARTITION BY change_no, ms) AS category_base,
                            count(*) OVER (PARTITION BY change_no, ms) AS category_accounts
                     FROM edit_account_lines
                 )
                 UNION ALL
-                SELECT change_no, 'purchase', asset_id, NULL, incurred, paid, {$this->cents('cost')}, taxable, 'payables'
+                SELECT change_no, 'purchase', asset_id, NULL, incurred, paid, {$this->cents('cost')}, taxable, 'payables', NULL
                 FROM edit_assets
                 UNION ALL
-                SELECT change_no, 'trade_in', asset_id, NULL, incurred, paid, -{$this->cents('trade_in')}, taxable, 'payables'
+                SELECT change_no, 'trade_in', asset_id, NULL, incurred, paid, -{$this->cents('trade_in')}, taxable, 'payables', NULL
                 FROM edit_assets
                 WHERE trade_in > 0
                 UNION ALL
                 SELECT a.change_no, 'depreciation', a.depreciation_id, a.asset_id,
                        CAST(d.m + INTERVAL '1 month' - INTERVAL '1 day' AS DATE), NULL,
-                       {$this->cents('a.cost * a.depreciation_rate / 12')}, false, 'journal'
+                       {$this->cents('a.cost * a.depreciation_rate / 12')}, false, 'journal', NULL
                 FROM edit_assets a
                 CROSS JOIN LATERAL generate_series(CAST(a.ms AS TIMESTAMP), CAST(CAST(\$period_to AS DATE) AS TIMESTAMP), INTERVAL '1 month') AS d(m)
                 WHERE a.depreciation_rate > 0
                 UNION ALL
-                SELECT change_no, 'loan_drawdown', loan_id, NULL, paid, paid, -{$this->cents('loan')}, false, 'direct'
+                SELECT change_no, 'loan_drawdown', loan_id, NULL, paid, paid, -{$this->cents('loan')}, false, 'direct', NULL
                 FROM edit_assets
                 WHERE loan > 0
                 UNION ALL
-                SELECT change_no, 'loan_interest', interest_id, NULL, date, date, {$this->cents('interest')}, false, 'direct'
+                SELECT change_no, 'loan_interest', interest_id, NULL, date, date, {$this->cents('interest')}, false, 'direct', NULL
                 FROM edit_repayments
                 UNION ALL
-                SELECT change_no, 'loan_principal', loan_id, NULL, date, date, {$this->cents('payment')} - {$this->cents('interest')}, false, 'direct'
+                SELECT change_no, 'loan_principal', loan_id, NULL, date, date, {$this->cents('payment')} - {$this->cents('interest')}, false, 'direct', NULL
                 FROM edit_repayments
             ) e
             WHERE e.net <> 0
@@ -325,24 +350,24 @@ final class ForecastEditsSqlBuilder
         return <<<SQL
             SELECT e.change_no, e.kind, s.gst, unnest(CASE e.settlement
                 WHEN 'payables' THEN [
-                    {'basis': 'cash',    'date': e.cash_date,    'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': e.tax},
-                    {'basis': 'cash',    'date': e.cash_date,    'account_id': s.gst,        'net_amount': e.tax,             'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'cash',    'date': e.cash_date,    'account_id': s.bank,       'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': e.tax},
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': s.gst,        'net_amount': e.tax,             'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': s.payables,   'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.cash_date,    'account_id': s.payables,   'net_amount': e.net + e.tax,     'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.cash_date,    'account_id': s.bank,       'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT)}
+                    {'basis': 'cash',    'date': e.cash_date,    'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': e.tax,              'enterprise': e.enterprise},
+                    {'basis': 'cash',    'date': e.cash_date,    'account_id': s.gst,        'net_amount': e.tax,             'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'cash',    'date': e.cash_date,    'account_id': s.bank,       'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': e.tax,              'enterprise': e.enterprise},
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': s.gst,        'net_amount': e.tax,             'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': s.payables,   'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': e.cash_date,    'account_id': s.payables,   'net_amount': e.net + e.tax,     'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': e.cash_date,    'account_id': s.bank,       'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)}
                 ]
                 WHEN 'direct' THEN [
-                    {'basis': 'cash',    'date': e.cash_date,    'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'cash',    'date': e.cash_date,    'account_id': s.bank,       'net_amount': -e.net,            'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': s.bank,       'net_amount': -e.net,            'tax_amount': CAST(0 AS BIGINT)}
+                    {'basis': 'cash',    'date': e.cash_date,    'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': CAST(0 AS BIGINT), 'enterprise': e.enterprise},
+                    {'basis': 'cash',    'date': e.cash_date,    'account_id': s.bank,       'net_amount': -e.net,            'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': CAST(0 AS BIGINT), 'enterprise': e.enterprise},
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': s.bank,       'net_amount': -e.net,            'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)}
                 ]
                 ELSE [
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.contra_id,  'net_amount': -e.net,            'tax_amount': CAST(0 AS BIGINT)}
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': CAST(0 AS BIGINT), 'enterprise': e.enterprise},
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.contra_id,  'net_amount': -e.net,            'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)}
                 ]
             END) AS leg
             FROM edit_events e
@@ -358,10 +383,11 @@ final class ForecastEditsSqlBuilder
 
     private function forecastEditsCte(): string
     {
-        $proposed = $this->edits === ForecastEdits::AdoptedAndProposed
+        $proposed = $this->edits->proposal !== null
             ? <<<SQL
                 UNION ALL
-                SELECT {$this->proposalFarmId}, leg.basis, leg.date, leg.account_id, leg.net_amount, leg.tax_amount, 'proposed'
+                SELECT {$this->proposalFarmId}, leg.basis, leg.date, leg.account_id, leg.net_amount, leg.tax_amount, leg.enterprise,
+                       'proposed', change_no, kind
                 FROM edit_legs
                 WHERE NOT (leg.account_id = gst AND leg.net_amount = 0)
                 SQL
@@ -369,9 +395,10 @@ final class ForecastEditsSqlBuilder
 
         return <<<SQL
             SELECT farm_id, basis, date, CAST(date_trunc('month', date) AS DATE) AS month, account_id,
-                   CAST(NULL AS VARCHAR) AS tag, net_amount, tax_amount, source
+                   CAST(NULL AS VARCHAR) AS tag, net_amount, tax_amount, enterprise, source, change_no, kind
             FROM (
-                SELECT farm_id, basis, date, account_id, net_amount, tax_amount, 'adopted' AS source
+                SELECT farm_id, basis, date, account_id, net_amount, tax_amount, enterprise,
+                       'adopted' AS source, CAST(NULL AS BIGINT) AS change_no, CAST(NULL AS VARCHAR) AS kind
                 FROM adopted_edits
             {$proposed}
             )

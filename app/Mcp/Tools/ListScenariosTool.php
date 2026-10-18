@@ -14,8 +14,9 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 
 #[Name('list-scenarios')]
 #[Description(<<<'TEXT'
-    The farm's saved scenarios: drafts, and those adopted into the forecast, with their changes. To see a
-    draft's effect again, pass its changes to model-scenario.
+    The farm's saved scenarios: drafts, those adopted into the forecast, and those withdrawn from it, with their
+    changes and when. To see a draft's effect again, pass its scenario_id to model-scenario, or compare drafts side
+    by side with get-report versions [current, scenario:N, scenario:M].
     TEXT)]
 #[IsReadOnly]
 class ListScenariosTool extends Tool

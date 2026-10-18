@@ -10,15 +10,17 @@ use Illuminate\JsonSchema\Types\Type;
 
 trait TakesScenarioChanges
 {
-    private function changesSchema(JsonSchema $schema): Type
+    private function changesSchema(JsonSchema $schema, bool $required = true): Type
     {
         $month = static fn (string $what): Type => $schema->string()->pattern('^\d{4}-\d{2}$')->description($what);
 
-        return $schema->array()->min(1)->max(20)->required()->items($schema->anyOf([
+        return $schema->array()->min(1)->max(20)->required($required)->items($schema->anyOf([
             $schema->object([
                 'type' => $schema->string()->enum(['account'])->required(),
                 'category' => $schema->string()->required()
-                    ->description('The income or cost category as compare-plan names it, e.g. Repairs, Fertiliser, Wages, Livestock Sales, Capital Purchases.'),
+                    ->description('The income or cost category as get-report names it, e.g. Repairs, Fertiliser, Wages, Livestock Sales, Capital Purchases.'),
+                'enterprise' => $schema->string()
+                    ->description('Only this enterprise\'s share of the category, e.g. Cropping. Default: every enterprise, in proportion.'),
                 'start_month' => $month('First month changed, YYYY-MM; a forecast month (after actuals_to).')->required(),
                 'end_month' => $month('Last month changed, YYYY-MM (default: the start month).'),
                 'values' => $schema->array()->items($schema->number())

@@ -192,9 +192,9 @@ final class InsightsDuckDbActualsAdvancer
         $before = $this->forecastCount($batch);
 
         $this->db->query(<<<SQL
-            INSERT INTO {$this->lake} (transaction_id, farm_id, type, basis, date, month, account_id, net_amount, tax_amount, tag)
+            INSERT INTO {$this->lake} (transaction_id, farm_id, type, basis, date, month, account_id, net_amount, tax_amount, tag, enterprise)
             SELECT tl.transaction_id + {$copy}, tl.farm_id, 'forecast', tl.basis, tl.date, tl.month,
-                   tl.account_id, tl.net_amount, tl.tax_amount, tl.tag
+                   tl.account_id, tl.net_amount, tl.tax_amount, tl.tag, tl.enterprise
             FROM {$this->lake} tl
             WHERE {$this->farms('tl.farm_id', $batch)} AND tl.basis = 'cash' AND tl.type = 'actuals'
               AND tl.date > DATE '{$this->planHorizon}' AND tl.tag IS NULL
@@ -258,7 +258,7 @@ final class InsightsDuckDbActualsAdvancer
             ),
             planned AS (
                 SELECT tl.transaction_id, tl.farm_id, tl.account_id, a.code, tl.date, tl.net_amount AS net, tl.tax_amount AS tax,
-                       CAST(date_trunc('month', tl.date) AS DATE) AS m, d.kind
+                       CAST(date_trunc('month', tl.date) AS DATE) AS m, d.kind, tl.enterprise
                 FROM {$this->lake} tl
                 JOIN account a ON a.farm_id = tl.farm_id AND a.accountid = tl.account_id
                 JOIN adv_drift d ON d.farm_id = tl.farm_id
@@ -303,7 +303,7 @@ final class InsightsDuckDbActualsAdvancer
                        farm_id, account_id,
                        CAST(CASE WHEN early THEN m - INTERVAL '1 month' ELSE m END
                             + CAST(hash(transaction_id * 31 + k) % 28 AS INTEGER) * INTERVAL '1 day' AS DATE) AS accrual_date,
-                       CAST(round(net * factor) AS BIGINT) AS net, CAST(round(tax * factor) AS BIGINT) AS tax
+                       CAST(round(net * factor) AS BIGINT) AS net, CAST(round(tax * factor) AS BIGINT) AS tax, enterprise
                 FROM scaled
             ),
             milk_events AS (
@@ -312,18 +312,19 @@ final class InsightsDuckDbActualsAdvancer
                            + (90 + p.milk_tracker_id % 100) * 1000000 AS txn_id,
                        p.farm_id, mt.income_accountid AS account_id,
                        CAST(p.m + INTERVAL '1 month' - INTERVAL '1 day' AS DATE) AS accrual_date,
-                       CAST(round(p.production * pr.price * CASE WHEN d.kind = 'milk_price' THEN 0.88 ELSE 1 END) AS BIGINT) AS amount
+                       CAST(round(p.production * pr.price * CASE WHEN d.kind = 'milk_price' THEN 0.88 ELSE 1 END) AS BIGINT) AS amount,
+                       mt.enterprise
                 FROM adv_production p
                 JOIN adv_drift d ON d.farm_id = p.farm_id
                 JOIN {$this->t('milk_trackers')} mt ON mt.id = p.milk_tracker_id AND mt._valid_to IS NULL
                 JOIN {$this->t('milk_tracker_prices')} pr ON pr.milk_tracker_id = p.milk_tracker_id AND pr.month = p.m
                 WHERE {$this->farms('mt.farm_id', $batch)} AND p.production > 0
             )
-            SELECT txn_id, farm_id, account_id, accrual_date, {$this->twentiethOfNextMonth('accrual_date')} AS cash_date, net, tax
+            SELECT txn_id, farm_id, account_id, accrual_date, {$this->twentiethOfNextMonth('accrual_date')} AS cash_date, net, tax, enterprise
             FROM account_events
             UNION ALL
             SELECT txn_id, farm_id, account_id, accrual_date, CAST(accrual_date + 20 AS DATE),
-                   -amount, CAST(round(-amount * {$gst}) AS BIGINT)
+                   -amount, CAST(round(-amount * {$gst}) AS BIGINT), enterprise
             FROM milk_events
             SQL);
     }
@@ -341,24 +342,24 @@ final class InsightsDuckDbActualsAdvancer
         $before = $this->actualCount($batch);
 
         $this->db->query(<<<SQL
-            INSERT INTO {$this->lake} (transaction_id, farm_id, type, basis, date, month, account_id, net_amount, tax_amount, tag)
+            INSERT INTO {$this->lake} (transaction_id, farm_id, type, basis, date, month, account_id, net_amount, tax_amount, tag, enterprise)
             WITH sa AS ({$this->systemAccounts($batch)}),
             legs AS (
                 SELECT e.txn_id, e.farm_id, sa.gst, unnest([
-                    {'basis': 'cash',    'date': e.cash_date,    'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': e.tax},
-                    {'basis': 'cash',    'date': e.cash_date,    'account_id': sa.gst,       'net_amount': e.tax,             'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'cash',    'date': e.cash_date,    'account_id': sa.bank,      'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': e.tax},
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': sa.gst,       'net_amount': e.tax,             'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': sa.payables,  'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.cash_date,    'account_id': sa.payables,  'net_amount': e.net + e.tax,     'tax_amount': CAST(0 AS BIGINT)},
-                    {'basis': 'accrual', 'date': e.cash_date,    'account_id': sa.bank,      'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT)}
+                    {'basis': 'cash',    'date': e.cash_date,    'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': e.tax,              'enterprise': e.enterprise},
+                    {'basis': 'cash',    'date': e.cash_date,    'account_id': sa.gst,       'net_amount': e.tax,             'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'cash',    'date': e.cash_date,    'account_id': sa.bank,      'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': e.account_id, 'net_amount': e.net,             'tax_amount': e.tax,              'enterprise': e.enterprise},
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': sa.gst,       'net_amount': e.tax,             'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': e.accrual_date, 'account_id': sa.payables,  'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': e.cash_date,    'account_id': sa.payables,  'net_amount': e.net + e.tax,     'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)},
+                    {'basis': 'accrual', 'date': e.cash_date,    'account_id': sa.bank,      'net_amount': -(e.net + e.tax),  'tax_amount': CAST(0 AS BIGINT), 'enterprise': CAST(NULL AS VARCHAR)}
                 ]) AS leg
                 FROM adv_events e
                 JOIN sa ON sa.farm_id = e.farm_id
             )
             SELECT txn_id, farm_id, 'actuals', leg.basis, leg.date, CAST(date_trunc('month', leg.date) AS DATE),
-                   leg.account_id, leg.net_amount, leg.tax_amount, CAST(NULL AS VARCHAR)
+                   leg.account_id, leg.net_amount, leg.tax_amount, CAST(NULL AS VARCHAR), leg.enterprise
             FROM legs
             WHERE NOT (leg.account_id = gst AND leg.net_amount = 0)
             ORDER BY farm_id, date_trunc('month', leg.date), leg.account_id
@@ -480,6 +481,8 @@ final class InsightsDuckDbActualsAdvancer
             INSERT INTO {$this->t('active_plans')} (farm_id, name, season, plan_horizon, actuals_to)
             SELECT farm_id, '{$name}', {$season}, DATE '{$this->planHorizon}', DATE '{$this->actualsTo}' FROM adv_drift
             SQL);
+
+        (new InsightsDuckDbSchema())->addBudgetSnapshots();
     }
 
     /**
